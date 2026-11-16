@@ -8,6 +8,7 @@
 #
 # Uses: tmux/src/tmux-3.8.tar.gz   the official tmux 3.8 source
 #       tmux/afc-tmux-3.8.patch    the fleet's changes (thin scrollbar, header-click position, hover)
+#                                  and upstream's fix for pane output drawing over an open menu
 #       tmux/deps/*.deb            libevent-dev, libncurses-dev, bison, m4 (Ubuntu 24.04, amd64);
 #                                  unpacked into a temporary folder, never installed on the system
 #       tmux/SHA256SUMS            checked before anything is built

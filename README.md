@@ -55,7 +55,7 @@ Moved here: 2026-11-16, on the Kubuntu 24.04 workstation.
 | Alt+J | move this split: left, right, up, down, merge under a neighbour, own column |
 | Alt+H / Alt+U | minimise this split / bring a minimised one back |
 | Alt+Z | maximise this split to the whole tab, and back |
-| Alt+Q | close this split (asks first) |
+| Alt+Q | close this split (asks first, in a Yes / No pop-up in the centre) |
 | Alt+S / Alt+X | show another tab beside this one / send this pane to its own tab |
 | Alt+N / Alt+C | add a project folder as a new tab / plain terminal tab |
 | Ctrl+V | paste text or an image |
@@ -240,13 +240,14 @@ Not here, on purpose: sign-ins, other projects' chats and logs, and the built tm
 
 ## The tmux build
 
-The fleet runs tmux 3.8 with five small patches (`tmux/afc-tmux-3.8.patch`), installed in `~/.local/opt/tmux-3.8` with `~/.local/bin/tmux` pointing at it. Stock tmux will run the config but loses these:
+The fleet runs tmux 3.8 with one small patch file (`tmux/afc-tmux-3.8.patch`: five files of the fleet's own changes and two files of a fix taken from upstream tmux), installed in `~/.local/opt/tmux-3.8` with `~/.local/bin/tmux` pointing at it. Stock tmux will run the config but loses these:
 
 | Patch | Gives |
 |---|---|
 | `screen-redraw.c`, `window-copy.c` | a thin scrollbar slider (`@scrollbar-slider`) that stops short of the pane's bottom (`@scrollbar-bottom-margin`) |
 | `format.c` | the column and row of a click on a pane border, so the header buttons can be told apart |
 | `key-string.c`, `server-client.c` | mouse hover: `@mouse-hover on`, and bindable `MouseMoveStatus` / `MouseMoveBorder` / `MouseMovePane` |
+| `screen-write.c`, `window-visible.c` | menus that stay whole. In stock 3.8 an agent redrawing its lines paints over an open menu until the next status redraw. This is upstream tmux's own fix (commit `a21247a`, GitHub issue 5593), made after 3.8 and carried here unchanged; leave it out on the next tmux release |
 
 To build it, everything needed is in this folder: the official source (`tmux/src/tmux-3.8.tar.gz`), the patch, and the four build packages (`tmux/deps/`, Ubuntu 24.04 amd64; unpacked to a temporary folder, never installed). No download and no sudo:
 
