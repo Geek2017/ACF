@@ -1,0 +1,33 @@
+{
+  "experimental": {
+    "dynamicModelConfiguration": true
+  },
+  "modelConfigs": {
+    "modelDefinitions": {
+      "gemini-4-argon": {
+        "tier": "custom",
+        "family": "gemini-4",
+        "isPreview": false,
+        "isVisible": true,
+        "displayName": "gemini-4-argon",
+        "features": {}
+      },
+      "gemini-4-carbon": {
+        "tier": "custom",
+        "family": "gemini-4",
+        "isPreview": false,
+        "isVisible": true,
+        "displayName": "gemini-4-carbon",
+        "features": {}
+      },
+      "gemini-4-hydrogen": {
+        "tier": "custom",
+        "family": "gemini-4",
+        "isPreview": false,
+        "isVisible": true,
+        "displayName": "gemini-4-hydrogen",
+        "features": {}
+      }
+    }
+  }
+}

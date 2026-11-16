@@ -1,0 +1,4 @@
+# Optional: what the fleet's pane header and menus SHOW for an account, in place of its name.
+# One per line: <account name> <label>     e.g.   others  team
+# Empty by default, so every account shows under its own name (and its email in the menus).
+# Used by afc-bar and by `agents` (label_of / shown). The real name is unchanged everywhere else.

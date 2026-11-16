@@ -1,0 +1,11 @@
+[Unit]
+Description=autonice: lower CPU priority of background work (tests, builds, agents)
+
+[Service]
+ExecStart=%h/.local/bin/autonice
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=default.target

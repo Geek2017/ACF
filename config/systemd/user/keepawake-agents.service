@@ -1,0 +1,10 @@
+[Unit]
+Description=keepawake-agents: keep the screen awake while an AI agent is running
+
+[Service]
+ExecStart=%h/.local/bin/keepawake-agents
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

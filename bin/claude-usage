@@ -1,0 +1,185 @@
+#!/usr/bin/env -S python3 -I
+"""claude-usage — plan usage (session / weekly / per-model) for every Claude account in the fleet.
+
+  claude-usage                 table: account, email, session %, weekly %, model-scoped %, resets
+  claude-usage --short [ACCT]  one line for a status bar (ACCT = fleet name, or "claude main" from agents --who)
+  claude-usage --json [ACCT]   raw per-account JSON (cached response)
+  claude-usage --refresh ...   ignore the cache for this call
+
+Accounts: ~/.config/agents/accounts (<name> <Claude config dir>). Cache: $XDG_RUNTIME_DIR/claude-usage/<name>.json,
+TTL $CLAUDE_USAGE_TTL seconds (default 300). --short never blocks: a stale cache is printed and refreshed in the background.
+Exit 1 when no account could be read.
+"""
+import json, os, sys, time, subprocess, urllib.request, urllib.error
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+ACCOUNTS = os.environ.get("AGENTS_ACCOUNTS", f"{HOME}/.config/agents/accounts")
+CACHE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "claude-usage")
+TTL = int(os.environ.get("CLAUDE_USAGE_TTL", "300"))
+URL = "https://api.anthropic.com/api/oauth/usage"
+PROFILE = "https://api.anthropic.com/api/oauth/profile"
+
+def accounts():
+    out = []
+    try:
+        for line in open(ACCOUNTS):
+            parts = line.split()
+            if len(parts) >= 2 and not parts[0].startswith("#"):
+                out.append((parts[0], os.path.expanduser(parts[1])))
+    except FileNotFoundError:
+        out.append(("main", f"{HOME}/.claude"))
+    return out
+
+def email(cfg):
+    try:
+        a = json.load(open(f"{cfg}/.claude.json")).get("oauthAccount", {})
+        return a.get("emailAddress") or a.get("organizationName") or "?"
+    except Exception:
+        return None
+
+def token(cfg):
+    try:
+        o = json.load(open(f"{cfg}/.credentials.json"))["claudeAiOauth"]
+    except Exception:
+        return None, "not signed in"
+    if o.get("expiresAt", 0) / 1000 < time.time():
+        return None, "token expired (open claude on this account)"
+    return o["accessToken"], None
+
+def get(url, tok):
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}",
+                                               "anthropic-beta": "oauth-2025-04-20",
+                                               "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+
+def fetch(cfg):
+    tok, err = token(cfg)
+    if err:
+        return {"error": err}
+    try:
+        data = get(URL, tok)
+    except urllib.error.HTTPError as e:
+        return {"error": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"error": type(e).__name__}
+    # Who the token really belongs to. <config>/.claude.json's oauthAccount can be stale (left from an
+    # earlier login), so identity comes from the token, never from that file.
+    try:
+        prof = get(PROFILE, tok)
+        acc = prof.get("account") or {}
+        data["_email"] = acc.get("email")
+        data["_name"] = acc.get("full_name") or acc.get("display_name")
+        data["_org"] = (prof.get("organization") or {}).get("name")
+    except Exception:
+        data["_email"] = data["_name"] = data["_org"] = None
+    return data
+
+def cached(name, cfg, refresh=False, nonblocking=False):
+    os.makedirs(CACHE, exist_ok=True)
+    path = f"{CACHE}/{name}.json"
+    fresh = (not refresh) and os.path.exists(path) and time.time() - os.path.getmtime(path) < TTL
+    if fresh or (nonblocking and os.path.exists(path)):
+        if not fresh:  # stale but non-blocking: refresh for next time
+            subprocess.Popen([sys.executable, "-I", __file__, "--json", "--refresh", name],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            return json.load(open(path))
+        except Exception:
+            pass
+    data = fetch(cfg)
+    if not data.get("_email"): data["_email"] = email(cfg)   # fallback only (may be stale)
+    data["_at"] = time.time()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return data
+
+def summarize(d):
+    """-> dict(session, weekly, scoped=[(label, pct)], resets_session, resets_weekly, warn)"""
+    s = {"session": None, "weekly": None, "scoped": [], "rs": None, "rw": None, "warn": False}
+    for l in d.get("limits") or []:
+        k, p = l.get("kind"), l.get("percent")
+        if k == "session": s["session"], s["rs"] = p, l.get("resets_at")
+        elif k == "weekly_all": s["weekly"], s["rw"] = p, l.get("resets_at")
+        elif k == "weekly_scoped":
+            label = ((l.get("scope") or {}).get("model") or {}).get("display_name") or "scoped"
+            s["scoped"].append((label, p))
+        if l.get("severity") not in (None, "normal"): s["warn"] = True
+    if s["session"] is None and d.get("five_hour"):
+        s["session"], s["rs"] = d["five_hour"].get("utilization"), d["five_hour"].get("resets_at")
+    if s["weekly"] is None and d.get("seven_day"):
+        s["weekly"], s["rw"] = d["seven_day"].get("utilization"), d["seven_day"].get("resets_at")
+    if s["session"] is None: s["session"] = 0   # no open 5-hour window = nothing used in one
+    return s
+
+def when(iso):
+    if not iso: return "-"
+    try:
+        t = datetime.fromisoformat(iso).astimezone()
+        return t.strftime("%a %H:%M")
+    except Exception:
+        return iso
+
+def pct(p): return "-" if p is None else f"{p:.0f}%"
+
+def pick(arg, accts):
+    if not arg: 
+        try: want = open(f"{HOME}/.config/agents/account").read().split()[-1]
+        except Exception: want = None
+        want = want or accts[0][0]
+    else:
+        words = arg.split()      # accepts "claude main" from agents --who; "gemini acct1" / "codex acct1" are not Claude
+        if len(words) > 1 and words[0] != "claude": return []
+        want = words[-1]
+    for n, c in accts:
+        if n == want: return [(n, c)]
+    return [] if arg else accts[:1]   # a named pane that is not a Claude account (codex, gemini, shell): nothing
+
+def main(argv):
+    flags = {a for a in argv if a.startswith("--")}
+    args = [a for a in argv if not a.startswith("--")]
+    refresh = "--refresh" in flags
+    accts = accounts()
+    if not accts:
+        print("no accounts configured", file=sys.stderr); return 1
+
+    if "--short" in flags:
+        sel = pick(args[0] if args else None, accts)
+        if not sel: return 0
+        n, c = sel[0]
+        d = cached(n, c, refresh, nonblocking=True)
+        if d.get("error"): print(f"{n}: {d['error']}"); return 0
+        s = summarize(d)
+        bits = [f"S{pct(s['session'])}", f"W{pct(s['weekly'])}{'!' if (s['weekly'] or 0) >= 80 else ''}"]
+        bits += [f"{lab[:1]}{pct(p)}" for lab, p in s["scoped"]]
+        print(" ".join(bits)); return 0  # agents --who already shows the account name
+
+    sel = pick(args[0], accts) if args else accts
+    if "--json" in flags:
+        out = {n: cached(n, c, refresh) for n, c in sel}
+        print(json.dumps(out if len(out) > 1 else next(iter(out.values())), indent=2)); return 0
+
+    rows, ok = [], False
+    for n, c in sel:
+        d = cached(n, c, refresh)
+        em = d.get("_email") or "?"
+        nm = d.get("_name") or "?"
+        if d.get("error"):
+            rows.append((n, nm, em, d["error"], "", "", "", "")); continue
+        ok = True
+        s = summarize(d)
+        scoped = "  ".join(f"{lab} {pct(p)}" for lab, p in s["scoped"]) or "-"
+        rows.append((n, nm, em, pct(s["session"]), pct(s["weekly"]) + (" !" if s["warn"] else ""), scoped,
+                     when(s["rs"]), when(s["rw"])))
+    hdr = ("account", "name", "email", "session", "week", "model cap", "session resets", "week resets")
+    w = [max(len(str(r[i])) for r in rows + [hdr]) for i in range(len(hdr))]
+    for r in [hdr] + rows:
+        print("  ".join(str(v).ljust(w[i]) for i, v in enumerate(r)).rstrip())
+    return 0 if ok else 1
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

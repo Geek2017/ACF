@@ -1,0 +1,10 @@
+[Unit]
+Description=Run afc-logs every 15 minutes (it skips a turn when CPU or RAM is at 85% or more)
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

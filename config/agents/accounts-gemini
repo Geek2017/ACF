@@ -1,0 +1,7 @@
+# Gemini accounts for the fleet: <name> <GEMINI_CLI_HOME folder>. Gemini keeps its .gemini folder INSIDE that
+# folder; ~ is the default (~/.gemini). Add a line, then sign it in: agents --as gemini:<name>  and type /auth
+# A new home gets ~/.gemini/settings.json linked in (MCP servers, hooks, model), its own login and history.
+main     ~
+# off 2026-11-12, Google sign-in dropped for Gemini CLI (use Antigravity): acct1     ~/.gemini-homes/acct1
+# off 2026-11-12, Google sign-in dropped for Gemini CLI (use Antigravity): others   ~/.gemini-homes/others
+# off 2026-11-12, Google sign-in dropped for Gemini CLI (use Antigravity): company  ~/.gemini-homes/company

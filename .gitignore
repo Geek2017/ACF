@@ -1,0 +1,10 @@
+# ACF chat log (afc-logs): transcripts may hold private text
+logs/acf/
+
+# Machine data, kept out of the public repository: the names and folders of the other projects
+# this machine works on. The fleet recreates both lists by itself (agents --add, afc-logs run).
+# Delete these two lines to publish them.
+config/agents/projects
+config/agents/log-projects
+
+__pycache__/

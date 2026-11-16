@@ -1,0 +1,225 @@
+#!/bin/bash
+# autonice — lowers CPU (and disk) priority of background work, using
+# the rules in ~/.config/autonice/rules. Only ever LOWERS priority, only
+# for your own processes; anything not matched is left alone.
+# It also runs the slot gate: "gate" rules cap how many heavy jobs run at
+# once, pausing the extras until a slot frees (see jobq).
+#
+#   autonice            run the watcher (normally started by systemd)
+#   autonice --status   show which processes are currently lowered
+
+RULES="${AUTONICE_RULES:-$HOME/.config/autonice/rules}"
+INTERVAL="${AUTONICE_INTERVAL:-5}"
+# Hard CPU cap: matched processes are also moved into this group
+# (agents.slice, CPUQuota=300% = 3 cores). Children inherit it.
+POOL="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/agents.slice/agents-pool.service/cgroup.procs"
+# Slot gate state, shared with jobq.
+RUN="${JOBQ_RUN:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/jobq}"
+
+declare -A SLOTS KIDS HELD_FD HELD_START HELD_SLOT PAUSED
+
+load_rules() {
+    local c n p
+    PRIOS=(); PATS=(); GCLASS=(); GPATS=(); SLOTS=()
+    [ -f "$RULES" ] || return
+    while read -r prio pat; do
+        [[ -z "$prio" || "$prio" == \#* ]] && continue
+        case "$prio" in
+            slots) read -r c n <<< "$pat"; SLOTS[$c]=$n ;;
+            gate)  read -r c p <<< "$pat"; GCLASS+=("$c"); GPATS+=("$p") ;;
+            *)     PRIOS+=("$prio"); PATS+=("$pat") ;;
+        esac
+    done < "$RULES"
+    COMBINED=$(IFS='|'; echo "${PATS[*]}")
+    GCOMBINED=$(IFS='|'; echo "${GPATS[*]}")
+}
+
+if [ "$1" = "--status" ]; then
+    echo "Lowered-priority processes (NI > 0):"
+    ps -u "$USER" -o pid=,ni=,pcpu=,args= --sort=-pcpu \
+        | awk '$2 ~ /^[0-9]+$/ && $2 > 0' | cut -c1-140
+    echo
+    G="${POOL%/cgroup.procs}"
+    if [ -d "$G" ]; then
+        q=$(cut -d' ' -f1 "$G/../cpu.max"); p=$(cut -d' ' -f2 "$G/../cpu.max")
+        n=$(wc -l < "$G/cgroup.procs")
+        echo "Hard CPU cap: $n processes in the agents group, limit $((q * 100 / p))% (= $((q / p)) cores)"
+    else
+        echo "Hard CPU cap: agents group not running (systemctl --user start agents-pool)"
+    fi
+    echo
+    echo "Slot gate:"
+    jobq --status | sed 's/^/  /'
+    exit 0
+fi
+
+# --- Slot gate -------------------------------------------------------------
+
+start_time() {   # start_time <pid> -> kernel start time, to tell a pid apart from a reused one
+    local s
+    { read -r s < "/proc/$1/stat"; } 2>/dev/null || return 1
+    s=${s##*) }; s=($s); echo "${s[19]}"
+}
+
+tree() {   # tree <pid> -> the pid and all its descendants (from this pass's KIDS map)
+    local out=("$1") i=0 c
+    while [ $i -lt ${#out[@]} ]; do
+        for c in ${KIDS[${out[$i]}]}; do out+=("$c"); done
+        ((i++))
+    done
+    echo "${out[@]}"
+}
+
+take_slot() {   # take_slot <pid> <class>: lock a free slot on the job's behalf
+    local pid=$1 class=$2 k fd start
+    # Already gone (a short job that ended before this pass): nothing to hold.
+    # Holding for it would record an empty start time, which a gone process
+    # also reads as, and the slot would never be freed.
+    start=$(start_time "$pid") || return 0
+    for ((k = 1; k <= ${SLOTS[$class]:-2}; k++)); do
+        exec {fd}>"$RUN/$class.$k"
+        if flock -n "$fd"; then
+            HELD_FD[$pid]=$fd; HELD_START[$pid]=$start; HELD_SLOT[$pid]=$class.$k
+            return 0
+        fi
+        exec {fd}>&-
+    done
+    return 1
+}
+
+drop_slot() {
+    local fd=${HELD_FD[$1]}
+    exec {fd}>&-
+    unset 'HELD_FD[$1]' 'HELD_START[$1]' 'HELD_SLOT[$1]'
+}
+
+resume() {   # resume <pid> <why>
+    kill -CONT $(tree "$1") 2>/dev/null
+    unset 'PAUSED[$1]'
+    echo "gate: resumed $1 ($2)"
+}
+
+told_to_quit() {   # a paused job whose owner asked it to stop (SIGHUP/INT/TERM pending)
+    local p
+    for p in $(awk '/^(ShdPnd|SigPnd):/ { print $2 }' "/proc/$1/status" 2>/dev/null); do
+        (( 0x$p & 0x4003 )) && return 0
+    done
+    return 1
+}
+
+save_state() {   # what jobq --status reads
+    local pid
+    for pid in "${!HELD_FD[@]}"; do
+        echo "$pid ${HELD_SLOT[$pid]} $(ps -o args= -p "$pid" | cut -c1-100)"
+    done > "$RUN/held"
+    for pid in "${!PAUSED[@]}"; do echo "$pid ${PAUSED[$pid]}"; done > "$RUN/paused"
+}
+
+gate_pass() {
+    local pid ppid uid tty args i a nested start class
+    local -A MATCH=() PARENT=() SEEN=()
+    local order=()
+    KIDS=()
+    mkdir -p "$RUN"
+
+    # Free the slots of jobs that have ended; forget paused jobs that are gone.
+    for pid in "${!HELD_FD[@]}"; do
+        [ -n "${HELD_START[$pid]}" ] && [ "$(start_time "$pid")" = "${HELD_START[$pid]}" ] || drop_slot "$pid"
+    done
+    for pid in "${!PAUSED[@]}"; do
+        read -r start class <<< "${PAUSED[$pid]}"
+        [ "$(start_time "$pid")" = "$start" ] || unset 'PAUSED[$pid]'
+    done
+
+    # One pass over all processes: build the family tree, note background
+    # (no terminal) processes of ours that match a gate rule, oldest first.
+    while read -r pid ppid uid tty args; do
+        PARENT[$pid]=$ppid; KIDS[$ppid]+="$pid "
+        [ ${#GPATS[@]} -gt 0 ] || continue
+        [[ "$uid" == "$UID" && "$tty" == "?" && "$args" =~ $GCOMBINED ]] || continue
+        for i in "${!GPATS[@]}"; do
+            if [[ "$args" =~ ${GPATS[$i]} ]]; then MATCH[$pid]=${GCLASS[$i]}; order+=("$pid"); break; fi
+        done
+    done < <(ps -e -o pid=,ppid=,uid=,tty=,args= --sort=start_time)
+
+    for pid in "${order[@]}"; do
+        # Children of a gated job ride on its slot.
+        a=${PARENT[$pid]}; nested=
+        while [ -n "$a" ] && [ "$a" -gt 1 ]; do
+            [ -n "${MATCH[$a]}" ] && { nested=1; break; }
+            a=${PARENT[$a]}
+        done
+        [ -n "$nested" ] && continue
+        # Started through jobq: it already holds its own slot.
+        grep -qsz '^JOBQ_SLOT=' "/proc/$pid/environ" && continue
+        SEEN[$pid]=1
+        [ -n "${HELD_FD[$pid]}" ] && continue
+
+        class=${MATCH[$pid]}
+        if [ -n "${PAUSED[$pid]}" ] && told_to_quit "$pid"; then
+            # Its owner gave up waiting and asked it to quit: let it run so it can.
+            resume "$pid" "asked to quit while paused"
+        elif take_slot "$pid" "$class"; then
+            [ -n "${PAUSED[$pid]}" ] && resume "$pid" "got slot ${HELD_SLOT[$pid]}"
+        else
+            # No free slot: pause it. Re-done every pass to catch children it forked meanwhile.
+            kill -STOP $(tree "$pid") 2>/dev/null
+            if [ -z "${PAUSED[$pid]}" ]; then
+                PAUSED[$pid]="$(start_time "$pid") $class"
+                echo "gate: paused $pid, all ${SLOTS[$class]:-2} $class slots busy: $(ps -o args= -p "$pid" | cut -c1-100)"
+            fi
+        fi
+    done
+
+    # Rules changed under a paused job: it is no longer gated, let it go.
+    for pid in "${!PAUSED[@]}"; do
+        [ -n "${SEEN[$pid]}" ] || resume "$pid" "no longer matches a gate rule"
+    done
+    save_state
+}
+
+# Fail open: if autonice stops, nothing stays frozen.
+on_exit() {
+    local pid
+    for pid in "${!PAUSED[@]}"; do resume "$pid" "autonice stopping"; done
+    save_state
+    exit 0
+}
+trap on_exit TERM INT
+
+# Jobs paused by a previous run of autonice are still ours to resume.
+if [ -f "$RUN/paused" ]; then
+    while read -r pid start class; do
+        [ "$(start_time "$pid")" = "$start" ] && PAUSED[$pid]="$start $class"
+    done < "$RUN/paused"
+fi
+
+while true; do
+    load_rules
+    if [ ${#PATS[@]} -gt 0 ]; then
+        # Pre-filter with one combined regex, then apply the first matching rule.
+        while read -r pid ni args; do
+            [[ "$ni" =~ ^-?[0-9]+$ ]] || continue
+            for i in "${!PATS[@]}"; do
+                if [[ "$args" =~ ${PATS[$i]} ]]; then
+                    prio=${PRIOS[$i]}
+                    if [ "$ni" -lt "$prio" ]; then
+                        renice -n "$prio" -p "$pid" >/dev/null 2>&1
+                        if [ "$prio" -ge 19 ]; then
+                            ionice -c3 -p "$pid" 2>/dev/null        # disk: idle only
+                        else
+                            ionice -c2 -n7 -p "$pid" 2>/dev/null    # disk: lowest normal
+                        fi
+                    fi
+                    # Hard cap: move into the capped agents group if not there yet.
+                    if [ -w "$POOL" ] && ! grep -q "/agents.slice/" "/proc/$pid/cgroup" 2>/dev/null; then
+                        echo "$pid" > "$POOL" 2>/dev/null
+                    fi
+                    break
+                fi
+            done
+        done < <(ps -u "$USER" -o pid=,ni=,args= | grep -E -- "$COMBINED")
+    fi
+    gate_pass
+    sleep "$INTERVAL" & wait $!
+done

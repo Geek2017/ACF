@@ -1,0 +1,12 @@
+[Unit]
+Description=Holder for the capped agents group (autonice moves agents into it)
+
+[Service]
+Slice=agents.slice
+ExecStart=/bin/sleep infinity
+# Stopping/restarting this holder must NOT kill the agents that were moved in.
+KillMode=process
+Restart=always
+
+[Install]
+WantedBy=default.target

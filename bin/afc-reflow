@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# afc-reflow: make Claude re-wrap its chat when its split changes width.
+#
+# In classic mode ("tui": "default", needed for the tmux scrollbar) Claude prints its chat like any
+# terminal program: text already on screen keeps the width it was printed at. So after a split is
+# maximised, minimised, closed, restored or dragged, a Claude pane that got wider kept its text in
+# the old narrow column with the rest of the pane empty (and one that got narrower showed broken
+# lines). Ctrl+L makes Claude redraw the whole chat at the pane's present width, which is what a
+# maximise button is expected to do. This presses it for every Claude pane in the tab whose width
+# changed.
+#
+# Usage: afc-reflow <window id>    (run by the window-layout-changed and window-resized hooks in
+#                                   ~/.tmux.conf; inside tmux)
+#        afc-reflow --note-all     record every pane's present width without redrawing anything
+#
+# It waits half a second and acts only on a width that held still for that long, so dragging a
+# border redraws once at the end, not at every step. The last width it dealt with is kept in the
+# pane option @rw. Only Claude panes are touched; a pane in copy mode is taken out of it first,
+# since the key would otherwise go to copy mode.
+t() { tmux "$@"; }
+FMT='#{pane_id} #{pane_pid} #{pane_width} #{alternate_on} #{pane_in_mode} #{@rw}'
+
+if [[ "${1:-}" == --note-all ]]; then
+  t list-panes -a -F '#{pane_id} #{pane_width}' | while read -r id w; do t set-option -p -t "$id" @rw "$w"; done
+  exit 0
+fi
+
+win=${1:?usage: afc-reflow <window id> | --note-all}
+before=$(t list-panes -t "$win" -F '#{pane_id}=#{pane_width}' 2>/dev/null) || exit 0
+sleep 0.5
+t list-panes -t "$win" -F "$FMT" 2>/dev/null | while read -r id pid w alt mode rw; do
+  [[ "$before" == *"$id=$w"* ]] || continue          # still moving: a later run will take it
+  [[ "$w" == "$rw" ]] && continue                    # nothing changed for this pane
+  t set-option -p -t "$id" @rw "$w"
+  [[ -n "$rw" ]] || continue                         # first time this pane is seen: only note it
+  [[ "$alt" == 0 ]] || continue                      # a full-screen program redraws itself
+  who=$("$HOME/.local/bin/agents" --who "$pid" 2>/dev/null | head -1)
+  [[ "$who" == claude* ]] || continue
+  [[ "$mode" == 1 ]] && t send-keys -t "$id" -X cancel
+  t send-keys -t "$id" C-l
+done
+exit 0

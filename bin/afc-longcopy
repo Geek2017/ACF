@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# afc-longcopy: copy a stretch of a pane's history that is longer than one screen.
+#   1st Ctrl+click  marks the start        2nd Ctrl+click  selects start..here and copies it
+#   further Ctrl+clicks move the end and copy again; Esc or q leaves, which forgets the start.
+# Usage: afc-longcopy <pane id>
+#   Called by the C-MouseDown1Pane binding in ~/.tmux.conf, from inside tmux (it talks to the
+#   server it was started from), after that binding has put the pane in copy mode and moved the
+#   cursor to the click. The start is kept in the pane option @lc_start as "<line> <column>";
+#   the pane-mode-changed hook in ~/.tmux.conf clears it when the pane leaves copy mode.
+#
+# Why not just keep tmux's own selection alive between the two clicks: a selection with both ends
+# scrolled off the screen is dropped by tmux, so the start would be lost as soon as it left the
+# view. Instead the selection is rebuilt from the saved start on every end click.
+pane=${1:?usage: afc-longcopy <pane id>}
+get() { tmux display-message -p -t "$pane" "$1"; }
+X() { tmux send-keys -X -t "$pane" "$@"; }
+
+[[ "$(get '#{pane_in_mode}')" == 1 ]] || exit 0
+
+# Where the click is, as a line of the whole history: a fresh, empty selection reports its own spot.
+X begin-selection
+read -r ey ex cy oy <<< "$(get '#{selection_start_y} #{selection_start_x} #{copy_cursor_y} #{scroll_position}')"
+[[ "$ey" =~ ^[0-9]+$ && "$ex" =~ ^[0-9]+$ && "$cy" =~ ^[0-9]+$ && "$oy" =~ ^[0-9]+$ ]] || exit 0
+
+start=$(tmux show-options -pqv -t "$pane" @lc_start)
+if [[ ! "$start" =~ ^[0-9]+\ [0-9]+$ ]]; then
+  tmux set-option -p -t "$pane" @lc_start "$ey $ex"
+  tmux display-message -d 3000 "Start set. Scroll to the end, then Ctrl+click there to copy everything in between."
+  exit 0
+fi
+read -r sy sx <<< "$start"
+
+hist=$(( ey - cy + oy ))    # lines of history above the last screen, in this copy-mode view
+
+# Put the cursor on <line> <column>. goto-line sets how far the view is scrolled up from the
+# bottom; the last few rows and the column are walked.
+go() {
+  local y=$1 x=$2 row off cx d
+  row=$(get '#{copy_cursor_y}')
+  off=$(( hist - y + row )); (( off < 0 )) && off=0; (( off > hist )) && off=$hist
+  X goto-line "$off"
+  read -r row off <<< "$(get '#{copy_cursor_y} #{scroll_position}')"
+  d=$(( y - (hist - off + row) ))
+  (( d > 0 )) && X -N "$d" cursor-down
+  (( d < 0 )) && X -N "$(( -d ))" cursor-up
+  cx=$(get '#{copy_cursor_x}')
+  d=$(( x - cx ))
+  (( d > 0 )) && X -N "$d" cursor-right
+  (( d < 0 )) && X -N "$(( -d ))" cursor-left
+  return 0
+}
+
+X clear-selection
+go "$sy" "$sx"
+X begin-selection
+go "$ey" "$ex"
+X copy-pipe-no-clear
+n=$(( ey >= sy ? ey - sy + 1 : sy - ey + 1 ))
+tmux display-message -d 3000 "Copied $n lines to the clipboard. Ctrl+click again to move the end, Esc to finish."

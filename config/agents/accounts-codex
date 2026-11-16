@@ -1,0 +1,7 @@
+# Codex accounts for the fleet: <name> <CODEX_HOME folder>. ~/.codex is the default.
+# Add a line, then sign it in: agents --as codex:<name> login
+# A new home gets ~/.codex/config.toml linked in (MCP servers, model), its own login and sessions.
+main     ~/.codex
+acct1     ~/.codex-acct1
+others   ~/.codex-others
+company  ~/.codex-company

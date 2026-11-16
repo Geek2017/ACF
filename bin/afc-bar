@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# afc-bar: the AFC status bars. Each pane's header, as one line:
+#   [C / 1] [C5-Opu H] [T:196k 20% $25.56] [S0% W7%]
+#   [LLM letter / account label] [model, effort] [T: tokens in this conversation, % of the model's window, cost]
+#   [plan limits]
+# and, for the bottom bar (--machine):  [C:12%|R:40%|F:4 1.0G/12G]
+#   CPU and RAM of the machine, then the fleet: panes running, memory / limit
+#   LLM letters match the split menu keys: C Claude, X Codex, G Gemini, A Antigravity.
+#   Model, effort and tokens: Claude panes get them from afc-statusline; Codex, Gemini and Antigravity
+#   panes from afc-agent-info (no dollar cost there). afc-statusline also saves
+#   the pane's own plan limits, which stand in when claude-usage returns an error.
+# Usage: afc-bar <pane pid> [pane id] [pane width] [page]   the header of one pane
+#        afc-bar --machine                                   [CPU / RAM] [Fleet], for the bottom bar
+#   (the first is called by pane-border-format in ~/.tmux.conf, the header
+#   on each pane; the pane id, like %3, is what finds the pane's model and effort)
+#
+# CPU and RAM are for the whole machine, and turn red at 85%. A field with nothing to show is left
+# out along with its brackets. Machine readings are sampled at most every 5 seconds.
+# Written for bash 3.2, since a Mac may run this with its system bash.
+
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+BIN="$HOME/.local/bin"
+SOCK="${AGENTS_SOCK:-agents}"
+CACHE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-bar"
+TTL=5
+
+GREEN='#9ece6a' AMBER='#e0af68' BLUE='#7dcfff' WHITE='#c0caf5' DIM='#565f89' RED='#f7768e' PURPLE='#bb9af7' TEAL='#73daca'
+
+hot() {   # hot <label> <percent>
+  if (( $2 >= 85 )); then printf '#[fg=%s]%s:%s%%#[fg=%s]' "$RED" "$1" "$2" "$WHITE"
+  else printf '%s:%s%%' "$1" "$2"; fi
+}
+
+# Sets cpu and ram, using prev_busy and prev_total to measure CPU since the last sample on Linux.
+sample_linux() {
+  local _ u n s i w q sq st k v tot=0 av=0
+  read -r _ u n s i w q sq st _ < /proc/stat
+  busy=$((u+n+s+q+sq+st)); total=$((busy+i+w))
+  cpu=$(( total > prev_total ? (busy-prev_busy)*100/(total-prev_total) : 0 ))
+  while read -r k v _; do
+    case "$k" in MemTotal:) tot=$v ;; MemAvailable:) av=$v; break ;; esac
+  done < /proc/meminfo
+  ram=$(( tot ? (tot-av)*100/tot : 0 ))
+}
+
+sample() {
+  case "$(uname -s)" in
+    Darwin)
+      cpu=$(ps -A -o %cpu= | awk -v n="$(sysctl -n hw.ncpu)" '{s+=$1} END{v=int(s/n); print (v>100?100:v)}')
+      ram=$(vm_stat | awk -v tot="$(sysctl -n hw.memsize)" '/page size of/{p=$8} /Pages active:|Pages wired down:|occupied by compressor:/{gsub(/\./,"",$NF); u+=$NF} END{print int(u*p*100/tot)}')
+      ;;
+    *)
+      sample_linux
+      # On Windows, Ubuntu only sees its own VM. The real numbers come from a file that
+      # agents-hotkey.ahk keeps fresh while the Agents window is open.
+      if [[ -d /mnt/c/Users ]]; then
+        note='ubuntu'
+        local files c='' r=''
+        files=(/mnt/c/Users/*/Agents/host-usage.txt)
+        if [[ -r "${files[0]}" ]] && (( now - $(stat -c %Y "${files[0]}") < 15 )); then
+          read -r c r < "${files[0]}"   # fails on a missing final newline but still fills the variables
+          if [[ "$c" =~ ^[0-9]+$ && "$r" =~ ^[0-9]+$ ]]; then cpu=$c; ram=$r; note=''; fi
+        fi
+      fi
+      ;;
+  esac
+  # Panes with a live agent in them (agents --running). Terminals don't count, busy or not.
+  running=$(AGENTS_SOCK="$SOCK" "$BIN/agents" --running 2>/dev/null || echo 0)
+  # Keep the bottom bar's count of minimised splits true even when one ends by itself (afc-min).
+  mins=$(tmux -L "$SOCK" list-panes -s -t '=afcmin' -F '#{?#{@min_from},x,}' 2>/dev/null | grep -c x)
+  [[ "$(tmux -L "$SOCK" show -gqv @min_count 2>/dev/null)" == "$mins" ]] || tmux -L "$SOCK" set -g @min_count "$mins" 2>/dev/null
+}
+
+now=$(date +%s)
+stamp=0 cpu=0 ram=0 running=0 prev_busy=0 prev_total=0 busy=0 total=0 note='' pane_limits='' model='' model_full='' msuffix=''
+[[ -r "$CACHE" ]] && read -r stamp cpu ram running prev_busy prev_total note < "$CACHE"
+if (( now - stamp >= TTL )); then
+  sample
+  echo "$now $cpu $ram $running $busy $total $note" > "$CACHE"
+fi
+
+line=''
+segs=() seglen=()    # each bracketed field, and how many columns it takes on screen
+add() {
+  [[ -n "$1" ]] || return 0
+  local seg="#[fg=$DIM][$1#[fg=$DIM]]" plain=$1 pre post
+  while [[ "$plain" == *'#['*']'* ]]; do    # drop the colour codes to count what is seen
+    pre=${plain%%'#['*}; post=${plain#*'#['}; plain=$pre${post#*']'}
+  done
+  segs[${#segs[@]}]=$seg
+  seglen[${#seglen[@]}]=$(( ${#plain} + 2 ))
+  [[ -n "$line" ]] && line+=" "
+  line+=$seg
+}
+
+# afc-bar --machine: the two fields that are about the whole machine, not one pane. They sit in the
+# bottom bar beside the tab arrows (status-right in ~/.tmux.conf), so the pane headers carry only
+# what differs per pane.
+if [[ "${1:-}" == --machine ]]; then
+  # Always run --bar: besides printing fleet memory, it also finishes agents whose background shell ended.
+  mem=$("$BIN/agents" --bar 2>/dev/null)
+  # One pair of brackets round all three figures, set apart by a dim |, packed tight with no spaces round the | or the /, as the operator asked.
+  dot="#[fg=$DIM]|"
+  mem=${mem// \/ //}    # "1.6G / 12G" -> "1.6G/12G"
+  printf '%s\n' "#[fg=$DIM][#[fg=$WHITE]$(hot C "$cpu")$dot#[fg=$WHITE]$(hot R "$ram")${note:+ ($note)}$dot#[fg=$BLUE]F:$running${mem:+ $mem}#[fg=$DIM]]"
+  exit 0
+fi
+
+# Short model name, the same shape for every maker (the operator's format):
+#   <maker letter><version>-<first 3 letters of the name> <first letter of the effort>
+#   Gemini 4 Hydrogen, high -> G4-Hyd H     Opus 5.5, xhigh -> C5.5-Opu X     gpt-5.6-luna, medium -> X5.6-Lun M
+# Maker letters are the fleet's own: C Claude, X Codex / GPT, G Gemini. Efforts: L low, M medium,
+# H high, X xhigh (max stays "max", M being taken). A name it cannot take apart is shown whole.
+# Sets model and msuffix from model and effort; keeps the full name in model_full.
+short_model() {
+  local maker='' ver='' name='' rest
+  model_full=$model
+  msuffix=${effort:+ · $effort}
+  case "$model" in
+    [Gg]emini[\ -]*) maker=G; rest=${model:7}; ver=${rest%%[ -]*}; [[ "$rest" == *[\ -]* ]] && name=${rest#*[ -]} ;;
+    [Gg][Pp][Tt]-*)  maker=X; rest=${model:4}; ver=${rest%%-*};    [[ "$rest" == *-* ]] && name=${rest#*-} ;;
+    Claude\ *|Opus\ *|Sonnet\ *|Haiku\ *|Fable\ *|Mythos\ *)
+                     maker=C; rest=${model#Claude }; name=${rest%% *}; ver=${rest#* }; ver=${ver%% *} ;;
+    *) return 0 ;;
+  esac
+  [[ "$ver" =~ ^[0-9][0-9.]*$ ]] || return 0
+  name=${name:0:3}
+  [[ -n "$name" ]] && name="-$(printf '%s' "${name:0:1}" | tr '[:lower:]' '[:upper:]')${name:1}"
+  model="$maker$ver$name"
+  case "$effort" in
+    '') msuffix='' ;; xhigh) msuffix=' X' ;; max) msuffix=' max' ;;
+    *) msuffix=" $(printf '%s' "${effort:0:1}" | tr '[:lower:]' '[:upper:]')" ;;
+  esac
+}
+
+who=$("$BIN/agents" --who "${1:-0}" 2>/dev/null)
+who=${who%%$'\n'*}   # one line only: a stray second line would break the bar
+if [[ -n "$who" ]]; then
+  tool=${who%% *}
+  case "$tool" in
+    claude) letter=C ;; codex) letter=X ;; gemini) letter=G ;; agy) letter=A ;;
+    *) letter=$(printf '%s' "${tool:0:1}" | tr '[:lower:]' '[:upper:]') ;;
+  esac
+  # The account is shown by its label from ~/.config/agents/account-labels (a neutral stand-in, so a
+  # shared screen never carries a personal account name); an account not listed shows its own name.
+  acct='' label=''
+  if [[ "$who" == *' '* ]]; then
+    acct=${who#* }; label=$acct
+    while read -r lname lshow _; do
+      [[ "$lname" == "$acct" && -n "$lshow" ]] && { label=$lshow; break; }
+    done < "$HOME/.config/agents/account-labels" 2>/dev/null
+    add "#[fg=$GREEN]$letter / $label"
+  else
+    add "#[fg=$GREEN]$letter"
+  fi
+fi
+# Model and effort of the Claude in this pane, as afc-statusline last saved them. A file older
+# than the pane's own shell belongs to an earlier pane that had the same id, so it is skipped.
+if [[ "$who" == claude* && -n "$2" ]]; then
+  # Put the chat back at the bottom if one of Claude's tall pop-ups left a gap under the prompt
+  # (afc-gap; it decides, and presses Ctrl+L at most once per gap). In the background: never wait on it.
+  ( AGENTS_SOCK="$SOCK" "$BIN/afc-gap" "$2" & ) >/dev/null 2>&1
+  mfile="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-panes/${2#%}"
+  if [[ -r "$mfile" ]]; then
+    fresh=1
+    up=$(ps -o etimes= -p "${1:-0}" 2>/dev/null | tr -d ' ')    # seconds the pane's shell has lived
+    saved=$(stat -c %Y "$mfile" 2>/dev/null)
+    if [[ "$up" =~ ^[0-9]+$ && "$saved" =~ ^[0-9]+$ ]]; then
+      (( now - saved <= up + 1 )) || fresh=0
+    fi
+    if (( fresh )); then
+      IFS= read -r saved_line < "$mfile"
+      saved_line=${saved_line//$'\t'/|}    # files written before 2026-11-13 10:15 used tabs
+      IFS='|' read -r model effort pane_limits pane_tokens <<< "$saved_line"
+      short_model
+      [[ -n "$model" ]] && add "#[fg=$PURPLE]$model$msuffix"
+      [[ -n "$pane_tokens" ]] && add "#[fg=$TEAL]T:$pane_tokens"
+    fi
+  fi
+fi
+# Codex, Gemini and Antigravity panes: model, effort and conversation tokens from the chat record the tool keeps
+# on disk (afc-agent-info). Reading it takes a moment, so the answer is kept per pane for 10 seconds
+# and refreshed in the background; the bar shows the last answer meanwhile.
+if [[ "$who" == codex* || "$who" == gemini* || "$who" == agy* ]] && [[ "${1:-0}" =~ ^[1-9][0-9]*$ ]]; then
+  ifile="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-panes/x$1"
+  isaved=$(stat -c %Y "$ifile" 2>/dev/null || echo 0)
+  if (( now - isaved >= 10 )); then
+    mkdir -p "${ifile%/*}" 2>/dev/null
+    ( "$BIN/afc-agent-info" "${who%% *}" "$1" > "$ifile.$$" 2>/dev/null; mv -f "$ifile.$$" "$ifile" ) >/dev/null 2>&1 &
+  fi
+  if [[ -s "$ifile" ]]; then
+    IFS= read -r saved_line < "$ifile"
+    IFS='|' read -r model effort _ pane_tokens <<< "$saved_line"
+    short_model
+    [[ -n "$model" ]] && add "#[fg=$PURPLE]$model$msuffix"
+    [[ -n "$pane_tokens" ]] && add "#[fg=$TEAL]T:$pane_tokens"
+  fi
+fi
+case "$who" in
+  claude*)            limits=$("$BIN/claude-usage" --short "$who" 2>/dev/null) ;;
+  codex*|gemini*|agy*) limits=$("$BIN/llm-usage" "$who" 2>/dev/null) ;;
+  *)                  limits='' ;;
+esac
+limits=${limits%%$'\n'*}
+# An error from the usage tools starts with the account's name ("acct1: HTTP 429"): show its label.
+[[ -n "$acct" && "$limits" == "$acct:"* ]] && limits="$label:${limits#"$acct":}"
+# Antigravity reports percent LEFT for three model groups at once (G Gemini, C Claude+GPT, A Argon):
+#   left G:S100.00% W91.67% C:S100.00% W0.00%! A:W0.47%!
+# Show it the way Claude's reads: percent USED, whole numbers, for the group this pane's model is in,
+# e.g. S0% W8%  ("!" on the week from 80% used). Anything that does not parse is shown as it came.
+if [[ "$who" == agy* && "$limits" == left\ * ]]; then
+  case "$model_full" in *[Aa]rgon*) grp=A ;; *[Cc]laude*|*GPT*|*gpt*) grp=C ;; *) grp=G ;; esac
+  short=$(printf '%s\n' "$limits" | awk -v g="$grp" '{
+    cur = ""; out = ""
+    for (i = 1; i <= NF; i++) {
+      t = $i
+      if (t ~ /^[A-Z]:/) { cur = substr(t, 1, 1); t = substr(t, 3) }
+      if (cur == g && t ~ /^[SW][0-9.]+%!?$/) {
+        k = substr(t, 1, 1); v = t; gsub(/[^0-9.]/, "", v); u = int(100 - v + 0.5)
+        out = out (out == "" ? "" : " ") k u "%" ((k == "W" && u >= 80) ? "!" : "")
+      }
+    }
+    print out }')
+  [[ -n "$short" ]] && limits=$short
+fi
+# Claude's line is "S.. W.." plus one figure per model that has its own weekly cap, led by the
+# model's first letter (F89% = Fable). Keep such a figure only when this pane runs that model;
+# on any other model it says nothing about the pane.
+if [[ "$who" == claude* && "$limits" == *%* ]]; then
+  mname=${model_full#Claude }
+  read -r -a lparts <<< "$limits"
+  limits="${lparts[0]}${lparts[1]:+ ${lparts[1]}}"
+  for (( li = 2; li < ${#lparts[@]}; li++ )); do
+    [[ -n "$mname" && "${lparts[li]:0:1}" == "${mname:0:1}" ]] && limits+=" ${lparts[li]}"
+  done
+fi
+# claude-usage answers with an error (e.g. "acct1: HTTP 429", the usage service refusing) or nothing:
+# show the limits Claude itself reported for this pane instead, when there are any.
+[[ "$limits" != *%* && -n "$pane_limits" ]] && limits=$pane_limits
+[[ -n "$limits" ]] && add "#[fg=$AMBER]$limits"
+
+# Fit the pane. With no width given, or when everything fits, print the whole line. Otherwise the
+# fields are dealt into pages that each fit, and one page is shown behind a marker:  ◀ 1/2 ▶ [..] [..]
+# The page number comes from the pane option @hdr_page, which a click on the header raises (see
+# ~/.tmux.conf); it wraps round, so clicking keeps cycling through the pages.
+width=${3:-0} page=${4:-0}
+[[ "$width" =~ ^[0-9]+$ ]] || width=0
+[[ "$page" =~ ^[0-9]+$ ]] || page=0
+page=$(( 10#$page ))
+total=0
+for (( i = 0; i < ${#seglen[@]}; i++ )); do total=$(( total + seglen[i] + 1 )); done
+avail=$(( width - 2 ))
+if (( width == 0 || total <= avail )); then
+  printf '%s \n' "$line"
+  exit 0
+fi
+room=$(( avail - 8 ))    # the marker takes 8 columns
+(( room < 10 )) && room=10
+pstart=(0) used=0
+for (( i = 0; i < ${#segs[@]}; i++ )); do
+  need=$(( seglen[i] + 1 ))
+  if (( used > 0 && used + need > room )); then pstart[${#pstart[@]}]=$i; used=0; fi
+  used=$(( used + need ))
+done
+np=${#pstart[@]}
+page=$(( page % np ))
+from=${pstart[page]}
+to=${pstart[page + 1]:-${#segs[@]}}
+out="#[fg=$BLUE]◀ $(( page + 1 ))/$np ▶"
+for (( i = from; i < to; i++ )); do out+=" ${segs[i]}"; done
+printf '%s \n' "$out"

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# afc-gap: put a Claude pane's chat back at the bottom after one of Claude's tall pop-ups closes.
+#
+# In classic mode ("tui": "default", needed for the tmux scrollbar) a tall pop-up inside the chat,
+# such as the /model picker or the slash-command list, pushes the text up; when it closes, the rows
+# it used stay empty under the prompt until new output fills them. Ctrl+L makes Claude redraw the
+# chat, which lands the prompt at the bottom again. This presses it for you.
+#
+# Usage: afc-gap <pane id>      called about once a second by afc-bar for the Claude panes on screen
+#        afc-gap --dry-run <pane id>   say what it sees and would do, send nothing
+#
+# It presses Ctrl+L only when ALL of these hold:
+#   - the pane is not in copy mode and not full-screen;
+#   - at least 6 rows at the bottom are empty;
+#   - right above them is Claude's idle prompt box (a rule, a line starting with the prompt mark,
+#     a rule), so a pop-up that is still open is left alone;
+#   - it looked the same on the previous check, a second earlier (no reacting to a half-drawn frame);
+#   - it has not already pressed it for this gap. A chat too short to fill the pane keeps its gap
+#     after the redraw; that is correct, and it is left alone until the gap closes on its own.
+dry=0
+[[ "$1" == --dry-run ]] && { dry=1; shift; }
+pane=${1:?usage: afc-gap [--dry-run] <pane id>}
+SOCK="${AGENTS_SOCK:-agents}"
+t() { tmux -L "$SOCK" "$@"; }
+state="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-panes/g${pane#%}"
+
+read -r h cy alt mode <<< "$(t display-message -p -t "$pane" '#{pane_height} #{cursor_y} #{alternate_on} #{pane_in_mode}' 2>/dev/null)"
+[[ "$h" =~ ^[0-9]+$ && "$cy" =~ ^[0-9]+$ ]] || exit 0
+if [[ "$alt" != 0 || "$mode" != 0 ]] || (( h - cy < 8 )); then
+  (( dry )) && echo "nothing to do (height $h, cursor row $cy, full-screen $alt, copy mode $mode)"
+  rm -f "$state"
+  exit 0
+fi
+
+# gap = empty rows at the bottom; box = 1 when the idle prompt box is among the last rows with text
+read -r gap box <<< "$(t capture-pane -p -t "$pane" 2>/dev/null | awk '
+  { line[NR] = $0 }
+  END {
+    last = NR
+    while (last >= 1 && line[last] ~ /^[[:space:]]*$/) last--
+    box = 0; rule = 0; prompt = 0
+    for (i = (last > 7 ? last - 7 : 1); i <= last; i++) {
+      # plain substring tests: this awk counts bytes, so a {20,} repeat on a 3-byte character fails
+      if (index(line[i], "────────────────────") == 1) { if (rule && prompt) box = 1; rule = 1; prompt = 0 }
+      else if (rule && index(line[i], "❯") == 1) prompt = 1
+    }
+    print NR - last, box
+  }')"
+if [[ ! "$gap" =~ ^[0-9]+$ ]] || (( gap < 6 )) || [[ "$box" != 1 ]]; then
+  (( dry )) && echo "no gap to close (empty rows at bottom: ${gap:-?}, idle prompt box seen: ${box:-?})"
+  rm -f "$state"
+  exit 0
+fi
+
+seen=''
+[[ -r "$state" ]] && read -r seen < "$state"
+if (( dry )); then
+  echo "gap of $gap rows under an idle prompt; state: ${seen:-first sighting}"
+  exit 0
+fi
+case "$seen" in
+  '')    echo seen > "$state" ;;                                   # first sighting: wait one more check
+  seen)  t send-keys -t "$pane" C-l; echo sent > "$state" ;;       # still there: redraw, once
+  sent)  ;;                                                        # already tried for this gap
+esac
+exit 0

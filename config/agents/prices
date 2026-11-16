@@ -1,0 +1,35 @@
+# Published API prices, for the "~$" cost estimate in the fleet header (afc-agent-info).
+# These are list prices per 1,000,000 tokens in USD. They are NOT what a subscription plan charges;
+# the estimate says what the conversation would cost if it were billed by the token.
+#
+# One model per line:
+#   <match>  <input>  <cached input>  <output>  [from=YYYY-MM-DD]  [# note]
+# <match> is looked for inside the model's id or name, lower case with spaces as dashes
+# ("Gemini 4 Hydrogen" -> gemini-4-hydrogen). The FIRST matching line wins, so put a line with a
+# from= date (a price that starts later) ABOVE the current one; it is skipped until that day.
+# Output includes thinking / reasoning tokens. A model missing here simply shows no cost.
+#
+# Read from the providers' own pricing pages on 2026-11-13, standard paid tier:
+#   Google     https://ai.google.dev/gemini-api/docs/pricing  (now at aistudio.google.com/docs/pricing)
+#   OpenAI     https://platform.openai.com/docs/pricing       (now at developers.openai.com/api/docs/pricing)
+#   Anthropic  https://docs.claude.com/en/docs/about-claude/pricing
+# The pages were read through an automated fetch; check a number against the page before leaning on it.
+
+# Google
+gemini-4-hydrogen   1.50   0.075   7.50
+gemini-4-argon      4.00   0.20   20.00   from=2026-12-01
+gemini-4-argon      2.00   0.10   10.00
+gemini-4-carbon     4.00   0.20   20.00   from=2026-12-01   # added 2026-11-16; the page gives Carbon the same figures as Argon
+gemini-4-carbon     2.00   0.10   10.00
+gemini-3.8-flash    1.50   0.15    7.50   from=2027-01-01
+gemini-3.8-flash    0.75   0.075   3.75
+gemini-3.1-pro      2.00   0.20   12.00   # prompts up to 200k tokens; above that the page says 4.00 / 0.40 / 18.00
+
+# OpenAI (prompts up to 272k tokens; longer ones cost more)
+gpt-5.6-luna        0.20   0.02    1.20
+gpt-6-luna          0.10   0.01    0.50
+gpt-6-astra        10.00   1.00   50.00
+
+# Anthropic (models run through Antigravity)
+claude-opus-5-5     4.00   0.20   20.00
+claude-opus-4-6     5.00   0.50   25.00

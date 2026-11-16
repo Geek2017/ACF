@@ -1,0 +1,16 @@
+[Unit]
+Description=ACF chat log: copy new agent chat records into each project's logs/acf (afc-logs)
+Documentation=file://%h/.local/bin/afc-logs
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/afc-logs run
+WorkingDirectory=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Its own small cage, outside agents.slice, so it never takes from the agents' budget.
+CPUQuota=50%
+MemoryMax=1G
+MemorySwapMax=0
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=30min

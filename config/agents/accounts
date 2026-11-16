@@ -1,0 +1,5 @@
+# Claude accounts for the fleet: <name> <Claude config folder>. ~/.claude is Claude's default.
+# Alt+A in the fleet moves the focused agent to another account; `agents --accounts` lists them.
+acct1     ~/.claude
+others   ~/.claude-others
+company  ~/.claude-company

@@ -1,0 +1,240 @@
+--- orig/tmux-3.8/screen-redraw.c	2026-10-08 15:10:01.000000000 +0800
++++ src/tmux-3.8/screen-redraw.c	2026-11-13 10:37:55.449389915 +0800
+@@ -1284,6 +1284,65 @@
+ 	}
+ }
+ 
++/*
++ * AFC patch: a thin scrollbar slider. If the window option @scrollbar-slider
++ * holds one single-width character (say U+2590 or U+2595), the slider is drawn
++ * as that character in the slider colour on the track colour, instead of a
++ * whole cell filled with the slider colour. Unset or unusable: stock tmux.
++ */
++static int
++redraw_scrollbar_slider_glyph(struct window_pane *wp, struct utf8_data *ud)
++{
++	struct options	*oo = wp->window->options;
++	const char	*s;
++	enum utf8_state	 more;
++
++	if (options_get(oo, "@scrollbar-slider") == NULL)
++		return (0);
++	s = options_get_string(oo, "@scrollbar-slider");
++	if (s == NULL || *s == '\0')
++		return (0);
++	if ((more = utf8_open(ud, (u_char)*s)) == UTF8_MORE) {
++		while (*++s != '\0' && more == UTF8_MORE)
++			more = utf8_append(ud, (u_char)*s);
++		if (more != UTF8_DONE)
++			return (0);
++	} else if ((u_char)*s >= 0x20 && (u_char)*s < 0x7f)
++		utf8_set(ud, *s);
++	else
++		return (0);
++	return (ud->width == 1);
++}
++
++/*
++ * AFC patch: stop the scrollbar short of the pane's bottom. The option
++ * @scrollbar-bottom-margin (pane, window or global window scope) is a number
++ * of rows at the bottom of the pane that the scrollbar leaves empty, so it
++ * ends above an agent's input box instead of running beside it. The track
++ * always keeps at least three rows. Also used by window-copy.c, so dragging
++ * the slider matches what is drawn.
++ */
++u_int	screen_redraw_scrollbar_margin(struct window_pane *, u_int);
++
++u_int
++screen_redraw_scrollbar_margin(struct window_pane *wp, u_int height)
++{
++	const char	*s, *errstr;
++	u_int		 m;
++
++	if (options_get(wp->options, "@scrollbar-bottom-margin") == NULL)
++		return (0);
++	s = options_get_string(wp->options, "@scrollbar-bottom-margin");
++	if (s == NULL)
++		return (0);
++	m = strtonum(s, 0, 1000, &errstr);
++	if (errstr != NULL || height <= 3)
++		return (0);
++	if (m > height - 3)
++		m = height - 3;
++	return (m);
++}
++
+ /* Draw a scrollbar span. */
+ static void
+ redraw_draw_scrollbar_span(struct redraw_draw_ctx *dctx,
+@@ -1295,18 +1354,28 @@
+ 	struct tty		*tty = &scene->c->tty;
+ 	struct style		*sb_style = &wp->scrollbar_style;
+ 	struct grid_cell	 gc, slgc, pad_gc, *gcp;
++	struct utf8_data	 slider_ud;
+ 	double			 pct_view;
+ 	u_int			 total_height, slider_h, slider_y;
+-	u_int			 sb_h = span->data.sb.height;
++	u_int			 sb_full = span->data.sb.height;
++	u_int			 sb_h, blank;
+ 	u_int			 sb_y = span->data.sb.y;
+ 	u_int			 i, off, sb_w, sb_pad;
+ 	int			 cm_y, cm_size;
+ 
++	/*
++	 * AFC patch: sb_full is the pane height (what one screen shows), sb_h
++	 * the track, which may stop short of the bottom. Rows below the track
++	 * are drawn empty.
++	 */
++	sb_h = sb_full - screen_redraw_scrollbar_margin(wp, sb_full);
++	blank = (sb_y >= sb_h);
++
+ 	if (window_pane_mode(wp) == WINDOW_PANE_NO_MODE) {
+ 		total_height = screen_size_y(s) + screen_hsize(s);
+ 		if (total_height == 0)
+ 			return;
+-		pct_view = (double)sb_h / total_height;
++		pct_view = (double)sb_full / total_height;
+ 		slider_h = (double)sb_h * pct_view;
+ 		slider_y = sb_h - slider_h;
+ 	} else {
+@@ -1314,10 +1383,10 @@
+ 			return;
+ 		if (window_copy_get_current_offset(wp, &cm_y, &cm_size) == 0)
+ 			return;
+-		total_height = cm_size + sb_h;
++		total_height = cm_size + sb_full;
+ 		if (total_height == 0)
+ 			return;
+-		pct_view = (double)sb_h / total_height;
++		pct_view = (double)sb_full / total_height;
+ 		slider_h = (double)sb_h * pct_view;
+ 		slider_y = (sb_h + 1) * ((double)cm_y / total_height);
+ 	}
+@@ -1332,8 +1401,12 @@
+ 
+ 	gc = sb_style->gc;
+ 	memcpy(&slgc, &gc, sizeof slgc);
+-	slgc.fg = gc.bg;
+-	slgc.bg = gc.fg;
++	if (redraw_scrollbar_slider_glyph(wp, &slider_ud))
++		memcpy(&slgc.data, &slider_ud, sizeof slgc.data);
++	else {
++		slgc.fg = gc.bg;
++		slgc.bg = gc.fg;
++	}
+ 	tty_default_colours(&pad_gc, wp, NULL);
+ 
+ 	sb_w = sb_style->width;
+@@ -1342,6 +1415,10 @@
+ 
+ 	tty_cursor(tty, x, y);
+ 	for (i = 0; i < n; i++) {
++		if (blank) {
++			tty_cell(tty, &pad_gc, NULL);
++			continue;
++		}
+ 		if (span->data.sb.flags & REDRAW_SCROLLBAR_LEFT) {
+ 			if (off + i >= sb_w && off + i < sb_w + sb_pad) {
+ 				tty_cell(tty, &pad_gc, NULL);
+--- orig/tmux-3.8/window-copy.c	2026-10-08 15:10:01.000000000 +0800
++++ src/tmux-3.8/window-copy.c	2026-11-13 10:38:01.595463780 +0800
+@@ -781,7 +781,11 @@
+ 	u_int				 ox, oy, px, py, n, offset, size;
+ 	u_int				 new_offset;
+ 	u_int				 slider_height = wp->sb_slider_h;
+-	u_int				 sb_height = wp->sy, sb_top = wp->yoff;
++	/* AFC patch: the track may stop short of the pane's bottom. */
++	extern u_int screen_redraw_scrollbar_margin(struct window_pane *, u_int);
++	u_int				 sb_height = wp->sy -
++					     screen_redraw_scrollbar_margin(wp, wp->sy);
++	u_int				 sb_top = wp->yoff;
+ 	u_int				 sy = screen_size_y(data->backing);
+ 	u_int				 my_w;
+ 	int				 new_slider_y, delta;
+@@ -816,7 +820,7 @@
+ 	 * See redraw_draw_pane_scrollbar - this is the inverse of the
+ 	 * formula used there.
+ 	 */
+-	new_offset = new_slider_y * ((float)(size + sb_height) / sb_height);
++	new_offset = new_slider_y * ((float)(size + wp->sy) / sb_height);
+ 	delta = (int)offset - new_offset;
+ 
+ 	/*
+--- orig/tmux-3.8/format.c	2026-10-08 15:10:03.000000000 +0800
++++ src/tmux-3.8/format.c	2026-11-16 09:03:42.101930526 +0800
+@@ -2096,7 +2096,13 @@
+ 		if (ft->m.statusat > 0 && ft->m.y >= (u_int)ft->m.statusat)
+ 			return (format_printf("%u", ft->m.x));
+ 	}
+-	return (NULL);
++	/*
++	 * AFC patch: anywhere else (a pane border, so also a pane's header
++	 * line), give the column in the window. A binding can then tell which
++	 * part of a pane header was clicked by comparing it with pane_left and
++	 * pane_width. Stock tmux gives nothing here.
++	 */
++	return (format_printf("%u", ft->m.x + ft->m.ox));
+ }
+ 
+ /* Callback for mouse_y. */
+@@ -2117,7 +2123,14 @@
+ 		if (ft->m.statusat > 0 && ft->m.y >= (u_int)ft->m.statusat)
+ 			return (format_printf("%u", ft->m.y - ft->m.statusat));
+ 	}
+-	return (NULL);
++	/*
++	 * AFC patch, as for mouse_x: on a pane border give the row in the
++	 * window (the status lines, when they are at the top, taken off), to
++	 * compare with pane_top. A pane's header line is row pane_top - 1.
++	 */
++	if (ft->m.statusat == 0 && ft->m.y >= ft->m.statuslines)
++		return (format_printf("%u", ft->m.y - ft->m.statuslines + ft->m.oy));
++	return (format_printf("%u", ft->m.y + ft->m.oy));
+ }
+ 
+ /* Callback for next_session_id. */
+--- orig/tmux-3.8/key-string.c	2026-10-02 20:13:07.000000000 +0800
++++ src/tmux-3.8/key-string.c	2026-11-16 09:45:59.645363085 +0800
+@@ -124,6 +124,7 @@
+ 	{ "KP.",	KEYC_KP_PERIOD|KEYC_KEYPAD },
+ 
+ 	/* Mouse keys. */
++	KEYC_MOUSE_STRING(MOUSEMOVE, MouseMove),	/* AFC patch: lets MouseMovePane, MouseMoveStatus, MouseMoveBorder be bound (hover) */
+ 	KEYC_MOUSE_STRING(MOUSEDOWN1, MouseDown1),
+ 	KEYC_MOUSE_STRING(MOUSEDOWN2, MouseDown2),
+ 	KEYC_MOUSE_STRING(MOUSEDOWN3, MouseDown3),
+--- orig/tmux-3.8/server-client.c	2026-10-08 15:10:03.000000000 +0800
++++ src/tmux-3.8/server-client.c	2026-11-16 09:47:51.549778231 +0800
+@@ -1253,6 +1253,13 @@
+ 			bn = 11;
+ 		else
+ 			bn = 0;
++		/*
++		 * AFC patch: a move has no button. Stock tmux gives it button 1
++		 * here, so a move over the status line or a border became a key
++		 * with no name that nothing could be bound to.
++		 */
++		if (type == KEYC_TYPE_MOUSEMOVE)
++			bn = 0;
+ 		key = KEYC_MAKE_MOUSE_KEY(type, bn, loc);
+ 	}
+ 
+@@ -2299,9 +2306,17 @@
+ 					mode |= MODE_MOUSE_ALL;
+ 			}
+ 		}
++		/*
++		 * AFC patch: the user option @mouse-hover (set to "on") also
++		 * asks the terminal for mouse movement, so MouseMove* bindings
++		 * can highlight what the pointer is over. Stock tmux only does
++		 * this for focus-follows-mouse and hiding scrollbars.
++		 */
+ 		if (options_get_number(oo, "focus-follows-mouse") ||
+ 		    w->sb == PANE_SCROLLBARS_MODAL ||
+-		    w->sb == PANE_SCROLLBARS_AUTOHIDE)
++		    w->sb == PANE_SCROLLBARS_AUTOHIDE ||
++		    (options_get(oo, "@mouse-hover") != NULL &&
++		    strcmp(options_get_string(oo, "@mouse-hover"), "on") == 0))
+ 			mode |= MODE_MOUSE_ALL;
+ 		else if (~mode & MODE_MOUSE_ALL)
+ 			mode |= MODE_MOUSE_BUTTON;

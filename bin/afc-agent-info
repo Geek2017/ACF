@@ -1,0 +1,304 @@
+#!/usr/bin/env -S python3 -I
+"""afc-agent-info: model, effort, conversation tokens and estimated cost of the Codex, Gemini or
+Antigravity agent in a fleet pane, as the one line afc-bar reads (the same shape afc-statusline saves
+for Claude):
+
+  afc-agent-info codex  <pane pid>     gpt-5.6-luna|medium||14k 5% ~$0.02
+  afc-agent-info gemini <pane pid>     gemini-3.8-flash|||12k ~$0.31
+  afc-agent-info agy    <pane pid>     Gemini 4 Hydrogen|high||131k 51% ~$1.96
+
+Nothing is asked of any provider. The numbers come from the chat record each tool keeps on disk:
+  Codex   <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl: the newest one started in the pane's folder.
+          Model and effort from its last turn_context; tokens from its last token_count (what the last
+          request held, and the share of the model's window that is).
+  Gemini  <GEMINI_CLI_HOME>/.gemini/tmp/<project>/chats/*.jsonl, the project whose .project_root is the
+          pane's folder: model and total tokens of the last reply. Gemini records no window size or effort.
+  Antigravity (agy)  <HOME of the account>/.gemini/antigravity-cli: history.jsonl names the newest chat
+          for the pane's folder; that chat's database (conversations/<id>.db, opened read-only) holds one
+          undocumented binary record per reply. Read from the last one: the model label, e.g. "Gemini 4
+          Hydrogen (High)" (the bracket is the effort), the tokens in context and the window size. The
+          field positions were worked out by inspection on 2026-11-13 and may move with an agy update;
+          if they do, the tokens go blank and the model falls back to the account's settings.json.
+The account's home and the folder are read from the agent's own process under the pane, so it follows
+whichever account the pane is on. Prints nothing when it finds no record.
+
+Cost ("~$1.96") is an ESTIMATE, not a figure from the tool and not a charge on a subscription plan:
+every reply's tokens (fresh input, cached input, output including thinking) times the provider's
+published API price for the model that reply used, summed over the conversation. Prices live in
+~/.config/agents/prices (see its header; update it when a provider changes rates). A model with no
+price there gets no cost. Codex records only conversation totals, so its whole conversation is priced
+at the model of its last turn.
+"""
+import datetime, glob, json, os, sys
+
+HOME = os.path.expanduser("~")
+PRICES = os.environ.get("AGENTS_PRICES") or f"{HOME}/.config/agents/prices"
+
+
+def descendants(pid):
+    kids = {}
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            stat = open(f"/proc/{p}/stat").read()
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        except Exception:
+            continue
+        kids.setdefault(ppid, []).append(int(p))
+    out, todo = [], [pid]
+    while todo:
+        cur = todo.pop()
+        for k in kids.get(cur, []):
+            out.append(k)
+            todo.append(k)
+    return out
+
+
+def proc_env(pid):
+    try:
+        raw = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+        return dict(x.decode(errors="replace").split("=", 1) for x in raw if b"=" in x)
+    except Exception:
+        return {}
+
+
+def agent_proc(pane_pid, tool):
+    """(env, cwd) of the tool's process under the pane, or of the pane's shell if none is found."""
+    for pid in descendants(pane_pid):
+        try:
+            cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+        except Exception:
+            continue
+        if any(tool in os.path.basename(w) for w in cmd.split(" ")[:3]):
+            return proc_env(pid), os.path.realpath(f"/proc/{pid}/cwd")
+    return proc_env(pane_pid), os.path.realpath(f"/proc/{pane_pid}/cwd")
+
+
+def short(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{round(n / 1000)}k"
+    return str(n)
+
+
+def tail_lines(path, limit=600_000):
+    """The last lines of a file that may be large; the first, possibly cut, line is dropped."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - limit))
+        data = f.read().decode(errors="replace").split("\n")
+    return data[1:] if size > limit else data
+
+
+_prices = None
+
+
+def load_prices():
+    """[(match, input, cached, output)] in USD per 1M tokens, rows not yet in force left out."""
+    global _prices
+    if _prices is None:
+        _prices = []
+        today = datetime.date.today().isoformat()
+        try:
+            for line in open(PRICES):
+                words = line.split("#", 1)[0].split()
+                if len(words) < 4:
+                    continue
+                since = next((w[5:] for w in words[4:] if w.startswith("from=")), "")
+                if since > today:
+                    continue
+                try:
+                    _prices.append((words[0].lower(), float(words[1]), float(words[2]), float(words[3])))
+                except ValueError:
+                    continue
+        except OSError:
+            pass
+    return _prices
+
+
+def price(model):
+    """(input, cached, output) per 1M tokens for a model id or label, or None. First match in the file wins."""
+    key = (model or "").lower().replace(" ", "-")
+    for match, pin, pcached, pout in load_prices():
+        if match in key:
+            return pin, pcached, pout
+    return None
+
+
+class Bill:
+    """Adds up the cost of replies; stays unknown if any reply's model has no price."""
+
+    def __init__(self):
+        self.usd, self.known, self.any = 0.0, True, False
+
+    def add(self, model, fresh, cached, out):
+        p = price(model)
+        if p is None:
+            self.known = False
+            return
+        self.any = True
+        self.usd += (max(fresh, 0) * p[0] + max(cached, 0) * p[1] + max(out, 0) * p[2]) / 1_000_000
+
+    def text(self):
+        if not (self.known and self.any) or self.usd < 0.005:
+            return ""
+        return f"~${round(self.usd)}" if self.usd >= 100 else f"~${self.usd:.2f}"
+
+
+def field(tokens, bill):
+    return " ".join(x for x in (tokens, bill.text()) if x)
+
+
+def codex(env, cwd):
+    home = env.get("CODEX_HOME") or f"{HOME}/.codex"
+    files = sorted(glob.glob(f"{home}/sessions/*/*/*/rollout-*.jsonl"), key=os.path.getmtime, reverse=True)
+    for path in files[:40]:
+        try:
+            first = json.loads(open(path).readline())
+        except Exception:
+            continue
+        if os.path.realpath((first.get("payload") or {}).get("cwd") or "") != cwd:
+            continue
+        model = effort = ""
+        used = window = None
+        total = {}
+        for line in reversed(tail_lines(path)):
+            if '"token_count"' not in line and '"turn_context"' not in line:
+                continue
+            try:
+                p = json.loads(line).get("payload") or {}
+            except Exception:
+                continue
+            if p.get("type") == "token_count" and used is None:
+                info = p.get("info") or {}
+                used = (info.get("last_token_usage") or {}).get("total_tokens")
+                window = info.get("model_context_window")
+                total = info.get("total_token_usage") or {}
+            elif "model" in p and not model:
+                model, effort = p.get("model") or "", p.get("effort") or ""
+            if model and used is not None:
+                break
+        tokens = ""
+        if used:
+            tokens = short(used) + (f" {round(used * 100 / window)}%" if window else "")
+        bill = Bill()
+        if total:      # input_tokens counts the cached ones too; output_tokens counts reasoning
+            cached = total.get("cached_input_tokens") or 0
+            bill.add(model, (total.get("input_tokens") or 0) - cached, cached, total.get("output_tokens") or 0)
+        return f"{model}|{effort}||{field(tokens, bill)}"
+    return ""
+
+
+def gemini(env, cwd):
+    home = env.get("GEMINI_CLI_HOME") or HOME
+    for root in glob.glob(f"{home}/.gemini/tmp/*/.project_root"):
+        try:
+            if os.path.realpath(open(root).read().strip()) != cwd:
+                continue
+        except Exception:
+            continue
+        chats = sorted(glob.glob(f"{os.path.dirname(root)}/chats/*.jsonl"), key=os.path.getmtime, reverse=True)
+        for path in chats[:1]:
+            model, last, bill = "", 0, Bill()
+            try:
+                lines = open(path, errors="replace")
+            except OSError:
+                continue
+            for line in lines:
+                if '"tokens"' not in line:
+                    continue
+                try:
+                    m = json.loads(line)
+                except Exception:
+                    continue
+                t = m.get("tokens") or {}
+                if m.get("type") != "gemini" or not t.get("total"):
+                    continue
+                model, last = m.get("model") or model, t["total"]
+                cached = t.get("cached") or 0     # input counts the cached ones too; thoughts bill as output
+                bill.add(m.get("model"), (t.get("input") or 0) - cached, cached,
+                         (t.get("output") or 0) + (t.get("thoughts") or 0))
+            if last:
+                return f"{model}|||{field(short(last), bill)}"
+    return ""
+
+
+# pb_fields / pb_get live in ~/.local/lib/afc/pb.py, shared with afc-logs.
+sys.path.insert(0, os.path.join(HOME, ".local/lib/afc"))
+from pb import pb_fields, pb_get  # noqa: E402
+
+
+def agy(env, cwd):
+    import sqlite3
+    store = f"{env.get('HOME') or HOME}/.gemini/antigravity-cli"
+    conv = None
+    try:
+        for line in reversed(tail_lines(f"{store}/history.jsonl", 200_000)):
+            if not line.strip():
+                continue
+            try:
+                h = json.loads(line)
+            except Exception:
+                continue
+            if os.path.realpath(h.get("workspace") or "") == cwd and h.get("conversationId"):
+                conv = h["conversationId"]
+                break
+    except Exception:
+        pass
+    label, used, window, bill = "", None, None, Bill()
+    if conv:
+        try:
+            db = sqlite3.connect(f"file:{store}/conversations/{conv}.db?mode=ro", uri=True, timeout=1)
+            # One record per reply, newest first. In each, message 1 holds: 21 the model label, 19 the
+            # model id, 9.10.1 tokens in context, 9.10.4 window size, and 4 the reply's usage
+            # (2 fresh input, 5 cached input, 3 output, which is 9 thinking + 10 answer).
+            for (data,) in db.execute("select data from gen_metadata order by idx desc"):
+                top = pb_get(data, 1)
+                if not isinstance(top, bytes):
+                    continue
+                name = pb_get(top, 21)
+                if name and not label:
+                    label = name.decode(errors="replace")
+                    used, window = pb_get(top, 9, 10, 1), pb_get(top, 9, 10, 4)
+                usage = pb_get(top, 4)
+                if isinstance(usage, bytes):
+                    u = {n: v for n, v in pb_fields(usage) if isinstance(v, int)}
+                    mid = pb_get(top, 19) or name or b""
+                    bill.add(mid.decode(errors="replace"), u.get(2, 0), u.get(5, 0), u.get(3, 0))
+            db.close()
+        except Exception:
+            pass
+    if not label:      # no reply yet in this chat: the account's chosen model
+        try:
+            label = json.load(open(f"{store}/settings.json")).get("model") or ""
+        except Exception:
+            pass
+    model, effort = label, ""
+    if label.endswith(")") and " (" in label:
+        model, effort = label[:-1].rsplit(" (", 1)
+        effort = effort.lower()
+    tokens = ""
+    if isinstance(used, int) and used > 0:
+        tokens = short(used) + (f" {round(used * 100 / window)}%" if isinstance(window, int) and window else "")
+    return f"{model}|{effort}||{field(tokens, bill)}"
+
+
+READERS = {"codex": codex, "gemini": gemini, "agy": agy}
+
+
+def main(argv):
+    if len(argv) != 2 or argv[0] not in READERS or not argv[1].isdigit():
+        print(__doc__, file=sys.stderr)
+        return 2
+    env, cwd = agent_proc(int(argv[1]), argv[0])
+    line = READERS[argv[0]](env, cwd)
+    if line.strip("|"):
+        print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

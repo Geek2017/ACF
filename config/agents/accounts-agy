@@ -1,0 +1,7 @@
+# Antigravity (agy) accounts for the fleet: <name> <HOME folder>. ~ is the default (token in ~/.gemini/antigravity-cli).
+# agy has no config-folder switch, so each extra account is a stand-in HOME under ~/.agy-homes/: the fleet links the
+# real home's dotfiles into it (git, ssh, shell all work) and keeps only .gemini separate. Sign in: agents --as agy:<name>
+main     ~
+acct1     ~/.agy-homes/acct1
+others   ~/.agy-homes/others
+company  ~/.agy-homes/company

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# afc-model-menu: the Alt+M pop-up. Pick the model (and, for Claude, the effort) of the agent in the
+# focused pane from a tmux menu that floats over the pane, instead of the agent's own picker.
+#   Claude  types  /model <id>  or  /effort <level>
+#           (Claude's own picker is a tall menu inside the chat and leaves empty rows when it closes.)
+#   Gemini  types  /model set <id>
+#           (Gemini CLI 0.66 does not list Argon or Carbon in its picker, but takes any name this
+#           way. Checked 2026-11-13 with the API-key account: gemini-4-argon, gemini-4-carbon and
+#           gemini-4-hydrogen all answer, and the chat record shows the chosen model replied.)
+# Other agents (Codex, Antigravity) keep their own pickers; the pop-up says so.
+# Usage: afc-model-menu <client> <pane id> <pane pid>   (bound to M-m in ~/.tmux.conf; runs inside tmux)
+# To add a model, add a line to the list for its tool below: label, key, id.
+# -M on the menus: items can be clicked with the mouse as well as picked by key.
+client=${1:?usage: afc-model-menu <client> <pane id> <pane pid>}
+pane=${2:?}
+pid=${3:?}
+who=$("$HOME/.local/bin/agents" --who "$pid" 2>/dev/null | head -1)
+
+# Type the command, pause, then press Enter. Without the pause Gemini takes the Enter as part of
+# the typed burst and leaves the command sitting in its prompt, unsent.
+type_it() { printf "send-keys -t '%s' -l '%s' ; run-shell -d 0.5 ; send-keys -t '%s' Enter" "$pane" "$1" "$pane"; }
+
+case "${who%% *}" in
+  claude)
+    tmux display-menu -M -c "$client" -t "$pane" -T "#[align=centre] Claude model / effort " -x P -y P \
+      "Opus 5.5"      1 "$(type_it '/model claude-opus-5-5')" \
+      "Fable 5.2"     2 "$(type_it '/model claude-fable-5-2')" \
+      "Sonnet 5.5"    3 "$(type_it '/model claude-sonnet-5-5')" \
+      "Haiku 5.5"     4 "$(type_it '/model claude-haiku-5-5')" \
+      "Opus 4.8"      5 "$(type_it '/model claude-opus-4-8')" \
+      "" \
+      "Effort low"    l "$(type_it '/effort low')" \
+      "Effort medium" m "$(type_it '/effort medium')" \
+      "Effort high"   h "$(type_it '/effort high')" \
+      "Effort xhigh"  x "$(type_it '/effort xhigh')"
+    ;;
+  gemini)
+    tmux display-menu -M -c "$client" -t "$pane" -T "#[align=centre] Gemini model " -x P -y P \
+      "Gemini 4 Argon"     a "$(type_it '/model set gemini-4-argon')" \
+      "Gemini 4 Carbon"    c "$(type_it '/model set gemini-4-carbon')" \
+      "Gemini 4 Hydrogen"  h "$(type_it '/model set gemini-4-hydrogen')" \
+      "Gemini 3.8 Flash"   f "$(type_it '/model set gemini-3.8-flash')"
+    ;;
+  *)
+    tmux display-message -c "$client" -d 3000 "Alt+M has model lists for Claude and Gemini panes only; use this agent's own /model."
+    ;;
+esac

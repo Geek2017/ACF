@@ -1,0 +1,779 @@
+#!/usr/bin/env bash
+# agents — the Claude agent fleet: one tmux tab per project, Claude already running,
+# everything inside agents.slice (slows at 10G, hard stop at 12G, max 3 cores).
+#
+#   agents                  open the fleet, or reattach if it is already running
+#   agents --add [dir] [name]  add a project (default: this folder); opens its tab if the fleet is up
+#   agents --pick           choose (or create) a project folder in a KDE dialog, then --add it (Alt+N in the fleet)
+#   agents --status         list tabs and fleet memory
+#   agents --kill           stop every agent in the fleet (asks first)
+#   agents --dry-run        show what would open, start nothing
+#   agents --window         bring the Agents window to the front, or open it (Meta+A, KDE menu, login)
+#   agents --new-window     always open another Agents window (e.g. for a second monitor)
+#   agents --accounts       list the Claude accounts (Alt+G in the fleet: other account, or Gemini / Codex)
+#   agents --usage [acct]   plan usage per account: email, session %, weekly %, model cap (claude-usage)
+#   agents --as <acct> [..] run Claude on that account in any terminal (sign one in: agents --as company, /login)
+#   agents --as gemini:<acct> | codex:<acct> [..]  the same for Gemini (then /auth) and Codex (agents --as codex:<acct> login)
+#
+# Project list: ~/.config/agents/projects — one per line: <name> <folder>
+# Accounts:     ~/.config/agents/accounts        — one per line: <name> <Claude config folder>   (CLAUDE_CONFIG_DIR)
+#               ~/.config/agents/accounts-gemini — one per line: <name> <GEMINI_CLI_HOME folder>  (Gemini keeps .gemini inside it; ~ = default)
+#               ~/.config/agents/accounts-codex  — one per line: <name> <CODEX_HOME folder>       (~/.codex = default)
+#               ~/.config/agents/accounts-agy    — one per line: <name> <HOME folder for Antigravity> (~ = default; see tool_share)
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:$PATH"
+SOCK="${AGENTS_SOCK:-agents}"   # AGENTS_SOCK: scratch server for tests
+SESSION=agents
+LIST="${AGENTS_LIST:-$HOME/.config/agents/projects}"
+ACCOUNTS="${AGENTS_ACCOUNTS:-$HOME/.config/agents/accounts}"
+ACCOUNT_NOW="$HOME/.config/agents/account"   # the account new agents start on; Alt+G changes it
+ACCOUNTS_GEMINI="${AGENTS_ACCOUNTS_GEMINI:-$HOME/.config/agents/accounts-gemini}"
+ACCOUNTS_CODEX="${AGENTS_ACCOUNTS_CODEX:-$HOME/.config/agents/accounts-codex}"
+ACCOUNTS_AGY="${AGENTS_ACCOUNTS_AGY:-$HOME/.config/agents/accounts-agy}"
+STAT="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/agents.slice/memory.stat"
+
+t() { tmux -L "$SOCK" "$@"; }
+
+# What the fleet's menus and messages SHOW for an account. ~/.config/agents/account-labels maps an
+# account name to a neutral label (also used by afc-bar for the pane header), so a shared screen
+# never carries a personal account name or its email. An account with no label shows as before.
+LABELS="$HOME/.config/agents/account-labels"
+label_of() {  # <account name> -> its label, or the name itself
+  local n s _
+  if [[ -r "$LABELS" ]]; then
+    while read -r n s _; do
+      [[ "$n" == "$1" && -n "$s" ]] && { echo "$s"; return 0; }
+    done < "$LABELS"
+  fi
+  echo "$1"
+}
+shown() {  # <account name> <email> [sep] -> "label", or "name<sep>email" when it has no label
+  local l; l=$(label_of "$1")
+  if [[ "$l" != "$1" ]]; then echo "$l"; else echo "$1${3:-   }$2"; fi
+}
+fleet_up() { command -v tmux >/dev/null && t has-session -t "$SESSION" 2>/dev/null; }
+
+# Claude keeps each folder's chats in ~/.claude/projects/<folder, non-alphanumerics as ->
+has_history() {
+  local enc; enc=$(printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g')
+  compgen -G "$HOME/.claude/projects/$enc/*.jsonl" >/dev/null
+}
+
+# Claude already open on this folder elsewhere (Konsole, desktop app) — two windows on one chat collide
+open_elsewhere() {
+  local p
+  for p in $(pgrep -x claude || true); do
+    [[ "$(readlink "/proc/$p/cwd" 2>/dev/null)" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+mode() {
+  if open_elsewhere "$1"; then echo "skip: open elsewhere"
+  elif has_history "$1"; then echo "continue last chat"
+  else echo "new chat"; fi
+}
+
+# Puts "bypass permissions" in the Shift+Tab cycle (as the desktop app does); agents still START in normal mode
+BYPASS=--allow-dangerously-skip-permissions
+
+pane_cmd() {
+  local claude acct=""
+  # Guardrail: a chat that is continued goes back on the account it belongs to, not on whatever
+  # account happens to be the current default (chat_account, below). Without this a fleet restart
+  # reopened every tab on one account, and Claude refused the earlier thinking of chats that
+  # had been running on another ("can't use thinking from another organization").
+  [[ "$(mode "$1")" == continue* ]] && acct=$(chat_account "$1" || true)
+  claude="$(account_prefix "$acct")claude $BYPASS"
+  case "$(mode "$1")" in
+    skip*)     echo "echo 'Claude is already open for this folder in another window. Close it there, then type: claude --continue'; exec bash" ;;
+    continue*) echo "$claude --continue; exec bash" ;;
+    *)         echo "$claude; exec bash" ;;
+  esac
+}
+
+# Claude accounts. Claude takes its account from CLAUDE_CONFIG_DIR (~/.claude when unset), so each
+# account is a config folder. All of them share ~/.claude's chats, hooks and plugins: an agent moved
+# to another account (Alt+G) resumes the same chat and its tab signals keep working. Only the sign-in
+# itself (.credentials.json, .claude.json) is per account.
+SHARED=(settings.json projects file-history plans history.jsonl plugins)
+
+account_list() {  # prints "name<TAB>folder" per account
+  local name dir
+  if [[ ! -f "$ACCOUNTS" ]]; then printf 'main\t%s\n' "$HOME/.claude"; return 0; fi
+  while read -r name dir || [[ -n "$name" ]]; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    printf '%s\t%s\n' "$name" "${dir/#\~/$HOME}"
+  done < "$ACCOUNTS"
+}
+account_dir()  { account_list | awk -F'\t' -v n="$1" '$1 == n { print $2; f = 1; exit } END { exit !f }'; }
+account_name() { account_list | awk -F'\t' -v d="$1" '$2 == d { print $1; f = 1; exit } END { exit !f }'; }
+
+current_account() {
+  local name; name=$(cat "$ACCOUNT_NOW" 2>/dev/null || true)
+  if [[ -n "$name" ]] && account_dir "$name" >/dev/null; then echo "$name"; else account_list | head -1 | cut -f1; fi
+}
+
+account_email() {  # folder -> who is signed in there
+  local json="$1/.claude.json"
+  [[ "$1" == "$HOME/.claude" ]] && json="$HOME/.claude.json"   # Claude keeps the default one in $HOME
+  jq -r '.oauthAccount.emailAddress // "not signed in"' "$json" 2>/dev/null || echo "not signed in"
+}
+
+share_with_main() {  # folder: link it to ~/.claude's shared parts (the first time, its own chats are merged in)
+  local dir="$1" main="$HOME/.claude" item stamp
+  [[ "$dir" == "$main" ]] && return 0
+  stamp=$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$dir"
+  for item in "${SHARED[@]}"; do
+    [[ -e "$main/$item" ]] || continue
+    [[ "$(readlink "$dir/$item" 2>/dev/null)" == "$main/$item" ]] && continue
+    if [[ -e "$dir/$item" || -L "$dir/$item" ]]; then
+      # Nothing is overwritten: on a name clash ~/.claude's copy wins and this one stays in the .bak
+      [[ "$item" == projects && -d "$dir/$item" && ! -L "$dir/$item" ]] && cp -r --update=none "$dir/$item/." "$main/$item/"
+      mv "$dir/$item" "$dir/$item.bak-$stamp"
+    fi
+    ln -s "$main/$item" "$dir/$item"
+  done
+}
+
+# Which account a folder's latest chat belongs to (the chat `claude --continue` would pick up).
+#   1. the account you last moved that chat to with Alt+G (--switch notes it in
+#      ~/.local/state/afc/chat-accounts/<chat id>). Only a deliberate move is noted: what a chat
+#      merely happens to be running on is not, or one bad restart would be remembered for good;
+#   2. else the owner Claude wrote into the chat file itself (its last "session-owner" record),
+#      matched to the fleet account signed in to that organisation.
+# Prints the account name; fails when it cannot tell (the caller then uses the current account).
+CHAT_ACCOUNTS="${XDG_STATE_HOME:-$HOME/.local/state}/afc/chat-accounts"
+chat_account() {  # folder
+  local enc f sid dir name org json
+  enc=$(printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g')
+  f=$(ls -t "$HOME/.claude/projects/$enc"/*.jsonl 2>/dev/null | head -1 || true)
+  [[ -n "$f" ]] || return 1
+  sid=$(basename "$f" .jsonl)
+  dir=$(cat "$CHAT_ACCOUNTS/$sid" 2>/dev/null || true)
+  if [[ -n "$dir" ]] && name=$(account_name "$dir"); then echo "$name"; return 0; fi
+  org=$( { grep -a '"type":"session-owner"' "$f" 2>/dev/null || true; } | tail -1 | jq -r '.organizationUuid // empty' 2>/dev/null || true)
+  [[ -n "$org" ]] || return 1
+  while IFS=$'\t' read -r name dir; do
+    json="$dir/.claude.json"; [[ "$dir" == "$HOME/.claude" ]] && json="$HOME/.claude.json"
+    if [[ "$(jq -r '.oauthAccount.organizationUuid // empty' "$json" 2>/dev/null || true)" == "$org" ]]; then echo "$name"; return 0; fi
+  done < <(account_list)
+  return 1
+}
+
+# The Claude account a NEW agent opened from a pane should start on: the account of the Claude in
+# that pane; else the account of the folder's latest chat; else the fleet's current account. So a
+# split made from a pane on account B starts on B, and never falls back to the first account in
+# the list just because it is first. (A menu can still name another account explicitly.)
+pane_account() {  # pane pid
+  local p kind dir name
+  if read -r p kind < <(pane_agent "$1") && [[ "$kind" == claude ]]; then
+    dir=$(claude_dir "$p" || true); name=$(account_name "$dir" || true)
+    [[ -n "$name" ]] && { echo "$name"; return 0; }
+  fi
+  dir=$(readlink "/proc/$1/cwd" 2>/dev/null || true)
+  name=$(chat_account "$dir" || true)
+  [[ -n "$name" ]] && { echo "$name"; return 0; }
+  current_account
+}
+
+claude_as() {  # account [claude args...]
+  local dir; dir=$(account_dir "$1") || { echo "Unknown account: $1 (see: agents --accounts)" >&2; return 1; }
+  shift
+  share_with_main "$dir"
+  if [[ "$dir" == "$HOME/.claude" ]]; then env -u CLAUDE_CONFIG_DIR "${AGENTS_CLAUDE:-claude}" "$@"
+  else CLAUDE_CONFIG_DIR="$dir" "${AGENTS_CLAUDE:-claude}" "$@"; fi
+}
+
+# The same for tmux command strings: the current account as an env prefix ("" for ~/.claude)
+account_prefix() {  # [account]: the current one when none is given
+  local dir; dir=$(account_dir "${1:-$(current_account)}")
+  share_with_main "$dir"
+  [[ "$dir" == "$HOME/.claude" ]] || printf 'CLAUDE_CONFIG_DIR=%q ' "$dir"
+}
+
+pane_agent() {  # pane-pid -> "<pid> claude|gemini|codex": the agent in that pane (a few levels below its shell)
+  local pids="$1" p _
+  for _ in 1 2 3 4; do
+    for p in $pids; do
+      case "$(cat "/proc/$p/comm" 2>/dev/null)" in
+        claude) echo "$p claude"; return 0 ;;
+        codex)  echo "$p codex"; return 0 ;;
+        agy)    echo "$p agy"; return 0 ;;
+        gemini) echo "$p gemini"; return 0 ;;
+        node)   # Gemini is a node script
+                tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -qE '/bin/gemini |gemini-cli/' && { echo "$p gemini"; return 0; } ;;
+      esac
+    done
+    pids=$(for p in $pids; do pgrep -P "$p" || true; done)
+    [[ -n "$pids" ]] || break
+  done
+  return 1
+}
+
+pane_claude() {  # pane-pid -> the claude process in that pane
+  local p kind
+  read -r p kind < <(pane_agent "$1") && [[ "$kind" == claude ]] && echo "$p"
+}
+
+fleet_pane_of() {  # pid -> the fleet pane it runs under (walks up its parents)
+  local panes c=$1
+  panes=$(t list-panes -a -F '#{pane_pid} #{pane_id}' 2>/dev/null) || return 1
+  while (( c > 1 )); do
+    awk -v c="$c" '$1 == c { print $2; f = 1 } END { exit !f }' <<< "$panes" && return 0
+    c=$(ps -o ppid= -p "$c" 2>/dev/null | tr -d ' '); c=${c:-1}
+  done
+  return 1
+}
+
+claude_dir() {  # claude pid -> the config folder (account) it runs on
+  local dir; dir=$(tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | tail -1 || true)
+  echo "${dir:-$HOME/.claude}"
+}
+
+# Gemini, Codex and Antigravity (agy, Google's replacement for Gemini CLI's Google sign-in) accounts work the
+# same way as Claude's, through a folder variable: GEMINI_CLI_HOME (Gemini keeps a .gemini folder inside it;
+# unset = ~), CODEX_HOME (unset = ~/.codex). Antigravity has no such variable, so an account is a whole HOME
+# folder: every dotfile of the real home linked in except .gemini, where its sign-in and sessions live
+# (GEMINI_FORCE_FILE_STORAGE keeps the token in that folder instead of the shared keyring).
+# The tool-generic helpers below cover all four; the claude_* ones above stay as the Claude fast path.
+TOOLS=(claude gemini codex agy)
+tool_file()    { case "$1" in claude) echo "$ACCOUNTS" ;; gemini) echo "$ACCOUNTS_GEMINI" ;; codex) echo "$ACCOUNTS_CODEX" ;; agy) echo "$ACCOUNTS_AGY" ;; esac; }
+tool_default() { case "$1" in claude) echo "$HOME/.claude" ;; gemini|agy) echo "$HOME" ;; codex) echo "$HOME/.codex" ;; esac; }
+tool_var()     { case "$1" in claude) echo CLAUDE_CONFIG_DIR ;; gemini) echo GEMINI_CLI_HOME ;; codex) echo CODEX_HOME ;; agy) echo HOME ;; esac; }
+tool_bin()     { case "$1" in claude) echo "${AGENTS_CLAUDE:-claude}" ;; gemini) echo "${AGENTS_GEMINI:-gemini}" ;; codex) echo "${AGENTS_CODEX:-codex}" ;; agy) echo "${AGENTS_AGY:-agy}" ;; esac; }
+tool_now()     { case "$1" in claude) echo "$ACCOUNT_NOW" ;; *) echo "$ACCOUNT_NOW-$1" ;; esac; }
+tool_label()   { case "$1" in claude) echo Claude ;; gemini) echo Gemini ;; codex) echo Codex ;; agy) echo Antigravity ;; esac; }
+
+tool_accounts() {  # tool -> "name<TAB>folder" per account (just the default when there is no list)
+  [[ "$1" == claude ]] && { account_list; return; }
+  local f name dir; f=$(tool_file "$1")
+  if [[ ! -f "$f" ]]; then printf 'main\t%s\n' "$(tool_default "$1")"; return 0; fi
+  while read -r name dir || [[ -n "$name" ]]; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    printf '%s\t%s\n' "$name" "${dir/#\~/$HOME}"
+  done < "$f"
+}
+tool_dir()   { tool_accounts "$1" | awk -F'\t' -v n="$2" '$1 == n { print $2; f = 1; exit } END { exit !f }'; }
+tool_name()  { tool_accounts "$1" | awk -F'\t' -v d="$2" '$2 == d { print $1; f = 1; exit } END { exit !f }'; }
+tool_count() { tool_accounts "$1" | wc -l; }
+tool_current() {  # tool -> the account new agents of that tool start on
+  [[ "$1" == claude ]] && { current_account; return; }
+  local name; name=$(cat "$(tool_now "$1")" 2>/dev/null || true)
+  if [[ -n "$name" ]] && tool_dir "$1" "$name" >/dev/null; then echo "$name"; else tool_accounts "$1" | head -1 | cut -f1; fi
+}
+tool_email() {  # tool folder -> who is signed in there
+  case "$1" in
+    claude) account_email "$2" ;;
+    gemini) local a k   # Google login, else the auth type Gemini is set to (an API key has no account)
+            a=$(jq -r '.active // empty' "$2/.gemini/google_accounts.json" 2>/dev/null || true)
+            k=$(jq -r '.security.auth.selectedType // empty' "$2/.gemini/settings.json" 2>/dev/null || true)
+            if [[ -n "$a" ]]; then echo "$a"; elif [[ "$k" == gemini-api-key ]]; then echo "API key"
+            elif [[ -n "$k" ]]; then echo "$k"; else echo "not signed in"; fi ;;
+    codex)  python3 -I -c 'import json,sys,base64
+try:
+    t = json.load(open(sys.argv[1]))["tokens"]["id_token"].split(".")[1]; t += "=" * (-len(t) % 4)
+    print(json.loads(base64.urlsafe_b64decode(t)).get("email", "signed in"))
+except Exception:
+    print("not signed in")' "$2/auth.json" ;;
+    agy)    python3 -I -c 'import json,sys,base64,re,os
+f = sys.argv[1]
+if not os.path.exists(f): print("not signed in"); sys.exit()
+raw = open(f, "rb").read()
+try:
+    d = json.loads(raw)
+    for k in ("email", "account", "user"):
+        if isinstance(d.get(k), str) and "@" in d[k]: print(d[k]); sys.exit()
+    raw = json.dumps(d).encode()
+except Exception:
+    pass
+for m in re.finditer(rb"eyJ[A-Za-z0-9_-]+\.(eyJ[A-Za-z0-9_-]+)\.", raw):   # any JWT: read its email claim
+    try:
+        t = m.group(1); t += b"=" * (-len(t) % 4)
+        e = json.loads(base64.urlsafe_b64decode(t)).get("email")
+        if e: print(e); sys.exit()
+    except Exception:
+        pass
+print("signed in")' "$2/.gemini/antigravity-cli/antigravity-oauth-token" ;;
+  esac
+}
+tool_share() {  # tool folder: a new Gemini/Codex home gets the main one's settings (MCP servers, model, hooks) by link
+  local dir="$2"
+  case "$1" in
+    claude) share_with_main "$dir" ;;
+    gemini) [[ "$dir" == "$HOME" ]] && return 0; mkdir -p "$dir/.gemini"
+            [[ -e "$dir/.gemini/settings.json" || ! -e "$HOME/.gemini/settings.json" ]] || ln -s "$HOME/.gemini/settings.json" "$dir/.gemini/settings.json" ;;
+    codex)  [[ "$dir" == "$HOME/.codex" ]] && return 0; mkdir -p "$dir"
+            [[ -e "$dir/config.toml" || ! -e "$HOME/.codex/config.toml" ]] || ln -s "$HOME/.codex/config.toml" "$dir/config.toml" ;;
+    agy)    # a stand-in HOME: the real home's entries linked in (git, ssh, shell, caches all work), except .gemini,
+            # which is this account's own; inside it, agy's config (MCP servers, skills, plugins) is shared by link
+            [[ "$dir" == "$HOME" ]] && return 0; mkdir -p "$dir/.gemini"
+            local e
+            for e in "$HOME"/.[!.]* "$HOME"/*; do
+              [[ -e "$e" || -L "$e" ]] || continue
+              case "${e##*/}" in .gemini|.agy-homes) continue ;; esac
+              [[ -e "$dir/${e##*/}" || -L "$dir/${e##*/}" ]] || ln -s "$e" "$dir/${e##*/}"
+            done
+            mkdir -p "$HOME/.gemini/config"
+            [[ -e "$dir/.gemini/config" ]] || ln -s "$HOME/.gemini/config" "$dir/.gemini/config" ;;
+  esac
+}
+tool_run() {  # tool account [args...]: that agent on that account
+  local tool="$1" dir var; dir=$(tool_dir "$tool" "$2") || { echo "Unknown $tool account: $2 (see: agents --accounts)" >&2; return 1; }
+  shift 2; tool_share "$tool" "$dir"; var=$(tool_var "$tool")
+  if [[ "$tool" == agy ]]; then env "HOME=$dir" GEMINI_FORCE_FILE_STORAGE=true "$(tool_bin "$tool")" "$@"   # HOME is always set
+  elif [[ "$dir" == "$(tool_default "$tool")" ]]; then env -u "$var" "$(tool_bin "$tool")" "$@"
+  else env "$var=$dir" "$(tool_bin "$tool")" "$@"; fi
+}
+agent_dir() {  # tool pid -> the home/config folder (account) that agent runs on
+  [[ "$1" == claude ]] && { claude_dir "$2"; return; }
+  local dir; dir=$(tr '\0' '\n' < "/proc/$2/environ" 2>/dev/null | sed -n "s/^$(tool_var "$1")=//p" | tail -1 || true)
+  echo "${dir:-$(tool_default "$1")}"
+}
+
+# Prints "name<TAB>dir" for each usable line of the list
+projects() {
+  [[ -f "$LIST" ]] || { echo "No project list at $LIST. Add one: cd <project> && agents --add" >&2; return 1; }
+  local name dir
+  while read -r name dir || [[ -n "$name" ]]; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    dir="${dir/#\~/$HOME}"
+    if [[ ! -d "$dir" ]]; then echo "skip $name: folder not found ($dir)" >&2; continue; fi
+    printf '%s\t%s\n' "$name" "$dir"
+  done < "$LIST"
+}
+
+in_list() {
+  local n d
+  [[ -f "$LIST" ]] || return 1
+  while read -r n d; do
+    [[ "$n" == \#* ]] && continue
+    [[ "${d/#\~/$HOME}" == "$1" ]] && return 0
+  done < "$LIST"
+  return 1
+}
+
+open_tab() {  # name dir
+  local cmd win; cmd=$(pane_cmd "$2")
+  if fleet_up; then
+    win=$(t new-window -P -F '#{window_id}' -t "$SESSION:" -n "$1" -c "$2" "$cmd")
+  else
+    # The tmux server starts inside agents.slice, so every agent and everything it runs is capped
+    if ! win=$(systemd-run --user --scope --slice=agents.slice --quiet \
+         tmux -L "$SOCK" new-session -d -P -F '#{window_id}' -s "$SESSION" -n "$1" -c "$2" "$cmd"); then
+      echo "warning: could not start inside agents.slice; fleet is running uncapped" >&2
+      win=$(t new-session -d -P -F '#{window_id}' -s "$SESSION" -n "$1" -c "$2" "$cmd")
+    fi
+  fi
+  # @project marks a project tab: Alt+Q on its last pane takes the project off the list (--close)
+  [[ -n "$win" ]] && t set-option -w -t "$win" @project "$1"
+  return 0
+}
+
+drop_project() {  # name: comment its line out of the list, so the next start doesn't reopen it
+  [[ -f "$LIST" ]] || return 0
+  local tmp; tmp=$(mktemp "$LIST.XXXXXX")
+  awk -v n="$1" -v d="$(date +%F)" '$1 == n { print "# closed " d ": " $0; next } { print }' "$LIST" > "$tmp"
+  cat "$tmp" > "$LIST"; rm -f "$tmp"
+}
+
+case "${1:-}" in
+  "")
+    command -v tmux >/dev/null || { echo "tmux is not installed: sudo apt install tmux" >&2; exit 1; }
+    if ! fleet_up; then
+      n=0
+      while IFS=$'\t' read -r name dir <&3; do open_tab "$name" "$dir"; n=$((n + 1)); done 3< <(projects)
+      if (( n == 0 )); then echo "No projects opened. Add one: cd <project> && agents --add" >&2; exit 1; fi
+      t select-window -t "$SESSION:=1"
+    fi
+    if [[ -t 0 && -z "${TMUX:-}" ]]; then
+      # Fleet already on screen in another window: open an independent view (its own current tab,
+      # same agents) that disappears when this window closes, instead of mirroring the other window
+      if [[ -n "$(t list-clients -t "$SESSION" 2>/dev/null)" ]]; then
+        exec tmux -L "$SOCK" new-session -t "$SESSION" \; set-option destroy-unattached on
+      fi
+      exec tmux -L "$SOCK" attach -t "$SESSION"
+    fi
+    echo "Fleet is running. Attach from a normal terminal with: agents"
+    ;;
+  --add)
+    dir="$(cd "${2:-.}" && pwd -P)"
+    name="${3:-$(basename "$dir")}"; name="${name//[[:space:]]/-}"
+    mkdir -p "$(dirname "$LIST")"
+    if in_list "$dir"; then
+      echo "$name is already in the fleet list"
+    else
+      printf '%s %s\n' "$name" "$dir" >> "$LIST"
+      echo "Added $name -> $dir"
+    fi
+    if fleet_up && ! t list-windows -t "$SESSION" -F '#{window_name}' | grep -qxF "$name"; then
+      open_tab "$name" "$dir"
+      echo "Opened tab $name in the running fleet"
+    fi
+    ;;
+  --pick)
+    start="${2:-${AGENTS_PICK_DIR:-/media/jmg/MyDrive/Codebase/\$\$AFocus}}"
+    [[ -d "$start" ]] || start="$HOME"
+    dir=$(kdialog --title "Add a project to the fleet (New Folder button = new project)" \
+                  --getexistingdirectory "$start" 2>/dev/null) || exit 0
+    [[ -n "$dir" ]] || exit 0
+    out=$("$0" --add "$dir" 2>&1) || { fleet_up && t display-message "agents: $out"; exit 1; }
+    fleet_up && t display-message "${out//$'\n'/ — }"
+    ;;
+  --status)
+    if fleet_up; then
+      t list-windows -t "$SESSION" -F '  #{window_index}  #{window_name}  #{pane_current_path}'
+    else
+      echo "Fleet is not running."
+    fi
+    if [[ -r "$STAT" ]]; then
+      read -r anon file < <(awk '$1=="anon"{a=$2} $1=="file"{f=$2} END{print a+0, f+0}' "$STAT")
+      high=$(systemctl --user show agents.slice -p MemoryHigh --value)
+      max=$(systemctl --user show agents.slice -p MemoryMax --value)
+      echo "fleet memory: $(numfmt --to=iec "$anon") real + $(numfmt --to=iec "$file") file cache" \
+           "(slows at $(numfmt --to=iec "$high"), hard stop at $(numfmt --to=iec "$max"))"
+    fi
+    ;;
+  --pane)
+    # Runs INSIDE a new split/tab: takes the folder from the source pane's process (/proc/<pid>/cwd),
+    # never from a tmux format — tmux re-parses "$$" in paths (Codebase/$$AFocus -> Codebase/$),
+    # which used to drop splits into $HOME. Usage: agents --pane <what> <source-pane-pid>, <what> being
+# claude|plan|bypass, gemini|gemini-plan|gemini-bypass, codex|codex-plan|codex-bypass, term or tab
+    dir=$(readlink "/proc/${3:-0}/cwd" 2>/dev/null || true)
+    [[ -d "$dir" ]] || dir="$PWD"   # source pane gone: stay where tmux started us
+    cd "$dir"
+    [[ "${2:-}" == tab ]] && tmux rename-window -t "${TMUX_PANE:-}" "$(basename "$dir")" 2>/dev/null || true
+    # resume <chat id|last>: the agent restarted on another account by --switch
+    # claude|plan|bypass <pid> <account>: Claude on that account instead (--split-menu's "another account")
+    acct=$(current_account)
+    case "${2:-term}" in
+      claude|plan|bypass) acct="${4:-$(pane_account "${3:-0}")}" ;;   # the pane it was split from decides
+      gemini*) acct="${4:-$(tool_current gemini)}" ;;   # gemini|gemini-plan|gemini-bypass <pid> [account]
+      codex*)  acct="${4:-$(tool_current codex)}" ;;
+      agy*)    acct="${4:-$(tool_current agy)}" ;;
+    esac
+    case "${2:-term}" in
+      claude) claude_as "$acct" $BYPASS || true ;;                  # AGENTS_CLAUDE: test stub
+      plan)   claude_as "$acct" $BYPASS --permission-mode plan || true ;;
+      bypass) claude_as "$acct" $BYPASS --permission-mode bypassPermissions || true ;;
+      resume) if [[ "${4:-last}" == last ]]; then claude_as "$acct" $BYPASS --continue || true
+              else claude_as "$acct" $BYPASS --resume "$4" || true; fi ;;
+      gemini)        tool_run gemini "$acct" || true ;;
+      gemini-plan)   tool_run gemini "$acct" --approval-mode plan || true ;;
+      gemini-bypass) tool_run gemini "$acct" --approval-mode yolo || true ;;
+      codex)         tool_run codex "$acct" || true ;;
+      # Codex cannot start in its Plan mode (Shift+Tab inside switches to it); read-only is the closest
+      codex-plan)    tool_run codex "$acct" --sandbox read-only || true ;;
+      codex-bypass)  tool_run codex "$acct" --dangerously-bypass-approvals-and-sandbox || true ;;
+      agy)           tool_run agy "$acct" || true ;;
+      agy-plan)      tool_run agy "$acct" --mode plan || true ;;
+      agy-bypass)    tool_run agy "$acct" --dangerously-skip-permissions || true ;;
+    esac
+    exec bash
+    ;;
+  --pane-account)
+    # Which Claude account a new split from this pane would start on. Usage: agents --pane-account <pane pid>
+    pane_account "${2:?pane pid}"
+    ;;
+  --paste)
+    # Ctrl+V in the fleet (tmux binding): an image on the clipboard goes to the app as Ctrl+V,
+    # which is Claude's own image paste; text is pasted as text (bracketed, as if typed).
+    # Usage: agents --paste <pane-id> <tmux-socket-path>  (the binding passes both)
+    pane="${2:?pane id}"; sock="${3:?socket path}"; ts() { tmux -S "$sock" "$@"; }
+    if timeout 1 xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -q '^image/'; then
+      ts send-keys -t "$pane" C-v
+    elif timeout 1 xclip -selection clipboard -o 2>/dev/null | ts load-buffer -b fleet-paste - 2>/dev/null; then
+      ts paste-buffer -p -d -b fleet-paste -t "$pane"
+    else
+      ts send-keys -t "$pane" C-v   # empty or unreadable clipboard: let the app decide
+    fi
+    ;;
+  --running)
+    # afc-bar's F: count — panes with a live agent (claude, codex, gemini, agy). A terminal
+    # running npm or curl is not an agent, so it no longer counts.
+    n=0
+    for p in $(t list-panes -a -F '#{pane_pid}' 2>/dev/null); do
+      pane_agent "$p" >/dev/null && n=$((n + 1))
+    done
+    echo "$n"
+    ;;
+  --bar)
+    # tmux status bar: real (non-cache) fleet memory against the slow-down point.
+    # Runs every second (the tab bar blinks), so it reads the cgroup files directly — no systemctl.
+    # Also finishes agents that stopped with a background shell still running (see --mark):
+    # once that shell is gone the tab counts as done. Claude does not always start a new turn then.
+    t list-panes -a -F '#{pane_id} #{window_id} #{@bgshell}' 2>/dev/null | while read -r pane win c; do
+      [[ -n "$c" ]] || continue
+      pgrep -P "$c" -f '/\.claude/shell-snapshots/' >/dev/null && continue
+      t set -p -t "$pane" @busy 0 \; set -pu -t "$pane" @bgshell
+      t list-clients -F '#{window_id}' | grep -qxF "$win" || t set -w -t "$pane" @unseen 1
+    done
+    [[ -r "$STAT" ]] || exit 0
+    anon=$(awk '$1=="anon"{print $2}' "$STAT")
+    high=$(cat "${STAT%/*}/memory.high" 2>/dev/null)
+    printf '%s / %s\n' "$(numfmt --to=iec "$anon")" "$(numfmt --to=iec "$high" 2>/dev/null || echo "?")"
+    ;;
+  --mark)
+    # Called by agent hooks inside a fleet pane (Claude: ~/.claude/settings.json, Gemini:
+    # ~/.gemini/settings.json, Codex: notify in ~/.codex/config.toml, which only sends done):
+    #   busy  prompt sent / tool used -> tab name underlined while any agent in the tab works
+    #   done  turn finished           -> tab blinks until you look at it (unless you are looking now);
+    #                                    with a background shell still running it stays underlined
+    #                                    instead, and --bar finishes it when the shell ends
+    #   wait  asking you (permission) -> blinks like done, whatever is still running
+    #   end   agent closed            -> clear the busy mark
+    # Outside tmux (desktop app, Konsole) it does nothing.
+    pane="${TMUX_PANE:-}"; tm=(command tmux)
+    if [[ -z "${TMUX:-}" || -z "$pane" ]]; then
+      # Gemini runs hooks with a cleaned environment (no TMUX) and Codex's notify adds a JSON
+      # argument: for those, find the fleet pane above this hook instead
+      [[ -n "${GEMINI_SESSION_ID:-}${GEMINI_CWD:-}" || "${3:-}" == \{* ]] || exit 0
+      tm=(command tmux -L "$SOCK"); pane=$(fleet_pane_of $$) || exit 0
+    fi
+    TMUX_PANE="$pane"; tmux() { "${tm[@]}" "$@"; }
+    case "${2:-}" in
+      busy) tmux set -p -t "$TMUX_PANE" @busy 1 \; set -pu -t "$TMUX_PANE" @bgshell ;;
+      end)  tmux set -p -t "$TMUX_PANE" @busy 0 \; set -pu -t "$TMUX_PANE" @bgshell ;;
+      done|wait)
+        if [[ "$2" == done ]]; then
+          # Walk up from this hook to the claude process; its Bash-tool shells are its direct children
+          c=$PPID
+          while (( c > 1 )) && [[ "$(cat "/proc/$c/comm" 2>/dev/null)" != claude ]]; do
+            c=$(ps -o ppid= -p "$c" 2>/dev/null | tr -d ' '); c=${c:-1}   # not /proc/<pid>/stat: "tmux: server" has a space
+          done
+          if (( c > 1 )) && pgrep -P "$c" -f '/\.claude/shell-snapshots/' >/dev/null; then
+            tmux set -p -t "$TMUX_PANE" @busy 1 \; set -p -t "$TMUX_PANE" @bgshell "$c"
+            exit 0
+          fi
+        fi
+        tmux set -p -t "$TMUX_PANE" @busy 0 \; set -pu -t "$TMUX_PANE" @bgshell
+        win=$(tmux display -p -t "$TMUX_PANE" '#{window_id}')
+        tmux list-clients -F '#{window_id}' | grep -qxF "$win" || tmux set -w -t "$TMUX_PANE" @unseen 1
+        ;;
+    esac
+    exit 0
+    ;;
+  --usage)
+    exec claude-usage "${@:2}"
+    ;;
+  --accounts)
+    # Also (re)links each account to ~/.claude's shared parts, in case Claude replaced a link with a file
+    for tool in "${TOOLS[@]}"; do
+      now=$(tool_current "$tool")
+      while IFS=$'\t' read -r name dir; do
+        tool_share "$tool" "$dir"
+        printf '%s %-7s %-9s %-30s %s\n' "$([[ "$name" == "$now" ]] && echo '*' || echo ' ')" "$tool" "$name" "$(tool_email "$tool" "$dir")" "$dir"
+      done < <(tool_accounts "$tool")
+    done
+    echo "* = the account new agents of that tool start on. In the fleet, Alt+G moves the focused agent to"
+    echo "    another account or another tool; Alt+\\ splits a new one, on any account."
+    echo "Sign in:  Claude  agents --as <name>, then /login      Gemini  agents --as gemini:<name>, then /auth"
+    echo "          Codex   agents --as codex:<name> login     Antigravity  agents --as agy:<name> (Google sign-in on first run)"
+    echo "Lists:    $ACCOUNTS  |  $ACCOUNTS_GEMINI (GEMINI_CLI_HOME folders)  |  $ACCOUNTS_CODEX (CODEX_HOME folders)  |  $ACCOUNTS_AGY (HOME folders)"
+    echo "Gemini CLI takes no personal Google sign-in since 2026-06 (API key or enterprise only); Antigravity carries the Google AI Pro/Ultra subscription."
+    ;;
+  --as)
+    case "${2:?usage: agents --as <account> | gemini:<account> | codex:<account> [args]}" in
+      gemini:*|codex:*|agy:*) tool_run "${2%%:*}" "${2#*:}" "${@:3}" ;;
+      *) claude_as "$2" "${@:3}" ;;
+    esac
+    ;;
+  --who)
+    # tmux bottom bar: the agent in the focused pane, with its account for Claude (nothing for a plain terminal)
+    read -r p kind < <(pane_agent "${2:-0}") || exit 0
+    if [[ "$kind" == claude ]]; then dir=$(claude_dir "$p"); echo "claude $(account_name "$dir" || basename "$dir")"
+    elif (( $(tool_count "$kind") > 1 )); then dir=$(agent_dir "$kind" "$p"); echo "$kind $(tool_name "$kind" "$dir" || basename "$dir")"
+    else echo "$kind"; fi
+    ;;
+  --split-menu|--split-down)
+    # Alt+\ in the fleet: what goes in a new pane on the right; Alt+- (--split-down) the same menu, new
+    # pane below this one. c p b start Claude on the account marked * in `agents --accounts`; o asks
+    # for another account, then the mode (that pane only).
+    # Usage: agents --split-menu|--split-down <client> <pane-id> <pane-pid> [pick | <account>] (the binding passes three)
+    menu="$1"; client="${2:?client}"; pane="${3#%}"; pid="${4:?pane pid}"; self="$HOME/.local/bin/agents"; start=""
+    win=$(t display -p -t "%$pane" '#{window_id}')
+    # Right: full height at the right edge. Below: halves this pane. select-layout -E then evens out the
+    # new pane's row or column only, so top/bottom stacks survive (even-horizontal flattened them).
+    if [[ "$menu" == --split-down ]]; then where="below"; how="-v"; else where="to the right"; how="-fh"; fi
+    split() { echo "split-window $how -t %$pane '$self --pane $1 $pid${2:+ $2}' ; select-layout -E -t $win"; }
+    again() { echo "run-shell -b \"$self $menu '$client' $pane $pid $1\""; }
+    case "${5:-}" in
+      "")
+        title="Split $where"
+        items=(
+          "New Claude (fresh chat) · $(label_of "$(pane_account "$pid")")" c "$(split claude)"
+          "New Claude in plan mode"          p "$(split plan)"
+          "New Claude, bypass (no asking)"   b "$(split bypass)"
+          "New Claude on another account..." o "$(again pick)"
+          ""
+          "New Gemini (fresh chat)"          g "$(split gemini)"
+          "New Gemini in plan mode"          h "$(split gemini-plan)"
+          "New Gemini, bypass (no asking)"   i "$(split gemini-bypass)"
+          "New Gemini on another account..." j "$(again pick:gemini)"
+          ""
+          "New Codex (fresh chat)"           x "$(split codex)"
+          "New Codex, read-only (plan)"      y "$(split codex-plan)"
+          "New Codex, bypass (no asking)"    z "$(split codex-bypass)"
+          "New Codex on another account..."  w "$(again pick:codex)"
+          ""
+          "New Antigravity (fresh chat)"      n "$(split agy)"
+          "New Antigravity in plan mode"      m "$(split agy-plan)"
+          "New Antigravity, bypass (no asking)" u "$(split agy-bypass)"
+          "New Antigravity on another account..." e "$(again pick:agy)"
+          ""
+          "Agent from another tab"           a "choose-tree -Zw \"join-pane $how -t %$pane -s '%%' ; select-layout -E -t $win\""
+          "Plain terminal"                   t "$(split term)"
+        ) ;;
+      pick)
+        title="New Claude on which account?"; items=(); key=0; mine=$(pane_account "$pid")
+        while IFS=$'\t' read -r name dir; do
+          [[ "$name" == "$mine" ]] && start=$key     # open the list on this pane's account
+          key=$((key + 1)); items+=("$(shown "$name" "$(account_email "$dir")")" "$key" "$(again "$name")")
+        done < <(account_list) ;;
+      pick:gemini|pick:codex|pick:agy)
+        tool="${5#pick:}"; title="New $(tool_label "$tool") on which account?"; items=(); key=0
+        while IFS=$'\t' read -r name dir; do
+          key=$((key + 1)); items+=("$(shown "$name" "$(tool_email "$tool" "$dir")")" "$key" "$(again "$tool:$name")")
+        done < <(tool_accounts "$tool")
+        items+=("" "Add one: a line in $(tool_file "$tool" | sed "s|$HOME|~|")" "" "display-message 'agents --accounts shows how to sign it in'") ;;
+      gemini:*|codex:*|agy:*)
+        tool="${5%%:*}"; name="${5#*:}"
+        tool_dir "$tool" "$name" >/dev/null || { t display-message "agents: no $tool account called $name"; exit 1; }
+        title="New $(tool_label "$tool") on $(label_of "$name")"
+        case "$tool" in
+          gemini) items=("Fresh chat" g "$(split gemini "$name")" "Plan mode" h "$(split gemini-plan "$name")" "Bypass (no asking)" i "$(split gemini-bypass "$name")") ;;
+          codex)  items=("Fresh chat" x "$(split codex "$name")" "Read-only (plan)" y "$(split codex-plan "$name")" "Bypass (no asking)" z "$(split codex-bypass "$name")") ;;
+          agy)    items=("Fresh chat" n "$(split agy "$name")" "Plan mode" m "$(split agy-plan "$name")" "Bypass (no asking)" u "$(split agy-bypass "$name")") ;;
+        esac ;;
+      *)
+        account_dir "$5" >/dev/null || { t display-message "agents: no account called $5"; exit 1; }
+        title="New Claude on $(label_of "$5")"
+        items=("Fresh chat" c "$(split claude "$5")" "Plan mode" p "$(split plan "$5")" "Bypass (no asking)" b "$(split bypass "$5")") ;;
+    esac
+    t display-menu -M ${start:+-C "$start"} -c "$client" -t "%$pane" -T "#[align=centre] $title " -x C -y C "${items[@]}"
+    ;;
+  --account-menu)
+    # Alt+G in the fleet. Usage: agents --account-menu <client> <pane-id> <pane-pid> (the binding passes them)
+    client="${2:?client}"; pane="${3#%}"; pid="${4:?pane pid}"; start=""
+    here=$("$0" --who "$pid" || true)
+    item() {  # label key target
+      local label="$1"; [[ "$4" == "$here" ]] && { label="$label   (this agent)"; start=$(( ${#items[@]} / 3 )); }
+      items+=("$label" "$2" "run-shell -b '$HOME/.local/bin/agents --switch $3 $pane $pid'")
+    }
+    items=(); key=0
+    while IFS=$'\t' read -r name dir; do
+      key=$((key + 1))
+      item "Claude  $(shown "$name" "$(account_email "$dir")")" "$key" "$name" "claude $name"
+    done < <(account_list)
+    items+=("")   # separator
+    for tool in gemini codex agy; do
+      case "$tool" in gemini) key=g ;; codex) key=x ;; agy) key=n ;; esac
+      while IFS=$'\t' read -r name dir; do
+        if (( $(tool_count "$tool") > 1 )); then item "$(tool_label "$tool")  $(shown "$name" "$(tool_email "$tool" "$dir")")" "$key" "$tool:$name" "$tool $name"
+        elif [[ "$(label_of "$name")" != "$name" ]]; then item "$(tool_label "$tool")" "$key" "$tool:$name" "$tool"
+        else item "$(tool_label "$tool")  $(tool_email "$tool" "$dir")" "$key" "$tool:$name" "$tool"; fi
+        key=""
+      done < <(tool_accounts "$tool")
+    done
+    t display-menu -M ${start:+-C "$start"} -c "$client" -t "%$pane" -T "#[align=centre] Agent for this pane " -x C -y C "${items[@]}"
+    ;;
+  --switch)
+    # Alt+G menu: turns the agent in a pane into another one, in the same folder:
+    #   <account>       Claude restarts on that account in the same chat (chats are shared, see
+    #                   share_with_main); new agents start on that account from now on
+    #   gemini | codex  that agent starts there instead (a fresh chat: chats don't carry over between tools)
+    # A pane with an idle shell gets the agent too; a pane busy with anything else is left alone.
+    # Usage: agents --switch <account|gemini|codex> <pane-id> <pane-pid>
+    to="${2:?account, gemini[:account], codex[:account] or agy[:account]}"; pane="%${3#%}"; pid="${4:?pane pid}"; dir="" tdir=""
+    case "$to" in
+      gemini|codex|agy|gemini:*|codex:*|agy:*)
+        tool="${to%%:*}"; name="${to#*:}"; [[ "$name" == "$to" ]] && name=$(tool_current "$tool")
+        tdir=$(tool_dir "$tool" "$name") || { t display-message "agents: no $tool account called $name"; exit 1; }
+        tool_share "$tool" "$tdir"; mkdir -p "${ACCOUNT_NOW%/*}"; printf '%s\n' "$name" > "$(tool_now "$tool")"
+        who="$(tool_label "$tool") $(shown "$name" "($(tool_email "$tool" "$tdir"))" " ")"; run="--pane $tool 0 $name"; to="$tool" ;;
+      *)
+        dir=$(account_dir "$to") || { t display-message "agents: no account called $to"; exit 1; }
+        share_with_main "$dir"
+        mkdir -p "${ACCOUNT_NOW%/*}"; printf '%s\n' "$to" > "$ACCOUNT_NOW"
+        who="Claude $(shown "$to" "($(account_email "$dir"))" " ")"; run="--pane resume 0 last" ;;
+    esac
+    if read -r p kind < <(pane_agent "$pid"); then
+      if [[ "$kind" == claude && -n "$dir" ]]; then
+        from=$(claude_dir "$p")
+        [[ "$from" != "$dir" ]] || { t display-message "This agent is already on $who"; exit 0; }
+        chat=$(jq -r '.sessionId // empty' "$from/sessions/$p.json" 2>/dev/null || true)   # Claude's own record of this run
+        run="--pane resume 0 ${chat:-last}"
+        # a deliberate move: remember it, so a later fleet restart reopens this chat on this account
+        if [[ "$chat" =~ ^[A-Za-z0-9-]+$ ]]; then mkdir -p "$CHAT_ACCOUNTS" && printf '%s\n' "$dir" > "$CHAT_ACCOUNTS/$chat"; fi
+      elif [[ "$kind" == "$to" && "$(agent_dir "$to" "$p")" == "$tdir" ]]; then
+        t display-message "This agent is already $who"; exit 0
+      fi
+      cwd=$(readlink "/proc/$p/cwd")
+    else
+      case "$(t display -p -t "$pane" '#{pane_current_command}')" in
+        bash|zsh|sh|fish) cwd=$(t display -p -t "$pane" '#{pane_current_path}') ;;
+        *) t display-message "This pane is busy with something else, left it alone${dir:+. New agents start on $who}"; exit 0 ;;
+      esac
+    fi
+    t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$cwd" "$HOME/.local/bin/agents $run"
+    t display-message "This pane is now $who"
+    ;;
+  --close)
+    # Alt+Q, after its y/n: close that pane. When it is the last pane of a project tab (@project), the
+    # project leaves the list too, so a restart doesn't reopen it (back with: agents --add <folder>).
+    # Usage: agents --close <pane-id>
+    pane="${2:?pane id}"
+    read -r panes win project < <(t display -p -t "$pane" '#{window_panes} #{window_id} #{@project}') || true
+    if [[ "${panes:-}" == 1 && -n "${project:-}" ]]; then drop_project "$project"; fi
+    t kill-pane -t "$pane"
+    # Even out the row or column the pane left (-E), not the whole tab, so top/bottom stacks stay
+    (( ${panes:-1} > 1 )) && t select-layout -E -t "$win" 2>/dev/null
+    exit 0
+    ;;
+  --kill)
+    fleet_up || { echo "Fleet is not running."; exit 0; }
+    read -r -p "Stop every agent in the fleet? [y/N] " answer
+    [[ "$answer" == [yY]* ]] || { echo "Left running."; exit 0; }
+    t kill-server
+    echo "Fleet stopped."
+    ;;
+  --dry-run)
+    if fleet_up; then echo "Fleet running now: yes (agents would just reattach)"; else echo "Fleet running now: no"; fi
+    while IFS=$'\t' read -r name dir <&3; do
+      acct=""; [[ "$(mode "$dir")" == continue* ]] && acct=$(chat_account "$dir" || true)
+      printf '  %-18s %-20s on %-8s %s\n' "$name" "$(mode "$dir")" "${acct:-$(current_account)}" "$dir"
+    done 3< <(projects)
+    echo "Would start: tmux server inside agents.slice, one tab per project above."
+    acct=$(current_account)
+    echo "Account: $acct ($(account_email "$(account_dir "$acct")"))"
+    ;;
+  --window)
+    # An Agents window is already open: raise it through a one-shot KWin script instead of opening another
+    if pgrep -f '^alacritty --title Agents --class Agents' >/dev/null && command -v qdbus >/dev/null; then
+      js="$HOME/.local/share/agents/kwin-focus.js"
+      k() { qdbus org.kde.KWin /Scripting "org.kde.kwin.Scripting.$1" "${@:2}" >/dev/null 2>&1; }
+      k unloadScript agents-focus || true
+      if k loadScript "$js" agents-focus && k start; then
+        k unloadScript agents-focus || true
+        exit 0
+      fi
+    fi
+    exec "$0" --new-window
+    ;;
+  --new-window)
+    # Not readlink -f: this file is reached through the link ~/.local/bin/agents, and its real path
+    # (in the project folder) holds "$$" and spaces, which tmux and shells mangle. Use the link.
+    self="$HOME/.local/bin/agents"
+    if command -v alacritty >/dev/null; then exec alacritty --title Agents --class Agents -e "$self"
+    else exec konsole -e "$self"; fi
+    ;;
+  -h|--help)
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    echo "Unknown option: $1 (try: agents --help)" >&2
+    exit 2
+    ;;
+esac

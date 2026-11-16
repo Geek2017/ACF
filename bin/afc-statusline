@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# afc-statusline: Claude Code's statusLine command for the AFC fleet. Claude hands it a JSON
+# description of the session on stdin; it saves, for the pane it runs in, one line:
+#   model name|effort level|plan limits|conversation tokens   e.g.  Opus 5.5|xhigh|S12% W74%|196k 20% $129
+# afc-bar shows the first two in the pane header, and uses the limits (S = 5-hour session,
+# W = week, "!" from 80%) when claude-usage cannot reach the usage service. A session that has
+# not had a reply yet has no limits, and that field is empty. The tokens are what this conversation
+# holds right now (input + output in its context) and the share of the model's window that fills;
+# Claude gives no running total of tokens spent, only this and a dollar cost (what the conversation
+# would have cost at API prices, shown last). It prints nothing, so Claude draws
+# no status line of its own.
+# Wired up in ~/.claude/settings.json ("statusLine"), which every fleet account shares.
+# Outside tmux, or without jq, it does nothing.
+[[ -n "$TMUX_PANE" ]] && command -v jq >/dev/null 2>&1 || { cat >/dev/null; exit 0; }
+dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-panes"
+mkdir -p "$dir" 2>/dev/null || { cat >/dev/null; exit 0; }
+pane=${TMUX_PANE#%}
+tmp="$dir/.$pane.$$"
+json=$(cat)
+if printf '%s' "$json" | jq -r '
+    (.rate_limits // {}) as $r
+    | [ (if $r.five_hour.used_percentage != null then "S\($r.five_hour.used_percentage | round)%"
+         elif $r.seven_day.used_percentage != null then "S0%"    # no open 5-hour window = nothing used in one
+         else empty end),
+        (if $r.seven_day.used_percentage != null
+           then "W\($r.seven_day.used_percentage | round)%" + (if $r.seven_day.used_percentage >= 80 then "!" else "" end)
+           else empty end) ] as $l
+    | ((.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0)) as $t
+    | (if $t >= 1000000 then "\(($t / 100000 | round) / 10)M" elif $t >= 1000 then "\($t / 1000 | round)k" else "\($t)" end) as $tk
+    | (if $t > 0 then $tk + (if .context_window.used_percentage != null then " \(.context_window.used_percentage | round)%" else "" end) else "" end) as $ctx
+    | (.cost.total_cost_usd // 0) as $c
+    | (if $c >= 100 then "$\($c | round)" elif $c >= 0.005 then (($c * 100 | round) as $n | "$\($n / 100 | floor).\($n % 100 | tostring | if length < 2 then "0" + . else . end)") else "" end) as $usd
+    | [.model.display_name // .model.id // "", .effort.level // "", ($l | join(" ")), ([$ctx, $usd] | map(select(. != "")) | join(" "))] | join("|")
+  ' > "$tmp" 2>/dev/null; then
+  mv -f "$tmp" "$dir/$pane"
+else
+  rm -f "$tmp"
+fi
+exit 0

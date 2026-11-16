@@ -1,0 +1,55 @@
+# autonice rules — background work gets lower CPU priority automatically.
+#
+# Format:  <priority>  <pattern>
+#   priority: 0 = normal, 19 = lowest (only runs when nothing else needs the CPU)
+#   pattern:  extended regex matched against the full command line
+#
+# Children inherit priority, so anything an agent starts (tests, builds)
+# is lowered too. Things NOT listed here (desktop, Zed window, browser)
+# keep normal priority. Edit freely; changes apply within a few seconds.
+
+# --- Heavy jobs: tests, builds, installs -> lowest ---
+19  node( .*)? --test
+19  (^|/)(npm|pnpm|yarn|bun|npx)( |$)
+19  (^|/)(jest|vitest|mocha|pytest|tsc|esbuild|webpack|rollup)( |$)
+19  vite( .*)? build
+19  (^|/)(cargo|rustc|make|cc1|cc1plus|ld|gcc|g\+\+|clang)( |$)
+19  (^|/)pip3?( |$)
+
+# --- AI agents and background helpers -> low ---
+10  claude-agent-acp
+10  (^|/)claude( |$)
+10  (^|/)(opencode|codex|gemini|goose)( |$)
+# Zed agent panel: Codex, Mistral Vibe, and Gemini when started as gemini.js
+10  codex-acp
+10  vibe-acp
+10  /gemini\.js( |$)
+10  s4_tunnel\.py
+
+# --- Slot gate: heavy jobs WAIT their turn instead of all running at once ---
+# The priority rules above only slow work down; everything still starts and
+# sits in RAM. The gate caps how many run at once:
+#   slots <class> <N>        at most N jobs of that class at a time
+#   gate  <class> <pattern>  a match takes a slot; if none is free, autonice
+#                            PAUSES it and resumes it when a slot frees
+# Patterns match from the START of the command line (the program itself), so
+# a command that merely mentions a test file or "next dev" is not caught.
+# Only background work is gated; anything running in a terminal is left alone.
+# Wait politely instead of being paused:  jobq <command>    (jobq -c dev ...)
+# See who holds what:                      jobq --status
+slots heavy 2
+slots dev   3
+
+# tests, e2e, builds, headless browsers
+gate heavy  ^[^ ]*node( -[^ ]+)* --test( |$)
+gate heavy  ^[^ ]*(node|bun)( -[^ ]+)* [^ ]*/@?(jest|vitest|mocha|playwright)([./][^ ]*)?( |$)
+gate heavy  ^[^ ]*python[0-9.]*( -m)? [^ ]*pytest( |$)
+gate heavy  ^[^ ]*(node|bun|tsx)( -[^ ]+)* [^ ]*e2e[^ /]*\.(mjs|cjs|js|ts)( |$)
+gate heavy  ^[^ ]*node( -[^ ]+)* [^ ]*/(next|vite)([./][^ ]*)? build( |$)
+gate heavy  ^[^ ]*node( -[^ ]+)* [^ ]*/(tsc|webpack|rollup)( |$)
+gate heavy  ^[^ ]*cargo (build|test|run)( |$)
+gate heavy  ^[^ ]*(chrome|chromium)[^ ]* (.* )?--headless
+
+# dev servers (each one holds ~1 GB for as long as it runs)
+gate dev    ^[^ ]*node( -[^ ]+)* [^ ]*/next([./][^ ]*)? dev( |$)
+gate dev    ^[^ ]*node( -[^ ]+)* [^ ]*/vite(\.js)?( (dev|serve)( |$)| --|$)

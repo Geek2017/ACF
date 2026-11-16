@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# afc-move: move a split around inside its tab.
+#
+#   afc-move menu <client> <pane>   pop-up listing the moves that apply to that split
+#                                   (the ↔ button in its header, or Alt+J for the focused one)
+#   afc-move left|right <pane>      swap places with the split on that side
+#   afc-move up|down <pane>         swap places with the split above / below (when stacked)
+#   afc-move stack-left <pane>      merge: put it under the split on its left, sharing that column
+#   afc-move stack-right <pane>     merge: put it under the split on its right
+#   afc-move column <pane>          un-merge: give it a column of its own again, at the right edge
+#   afc-move column-left <pane>     the same, at the left edge
+#
+# Runs inside tmux (bindings in ~/.tmux.conf). "Side" means what you see: the neighbour is the
+# split that touches this one on that side; at the edge of the tab there is none, and tmux's own
+# wrap-around to the far side is not followed. A maximised tab is put back to normal first, so the
+# move is visible. Agents keep running through all of it; Claude panes redraw to their new width
+# by themselves (afc-reflow).
+t() { tmux "$@"; }
+say() { t display-message -d 3000 "$1" 2>/dev/null; }
+
+geo() { t display-message -p -t "$1" '#{pane_left} #{pane_top} #{pane_width} #{pane_height}' 2>/dev/null; }
+
+# The split touching <pane> on <side> (left|right|up|down), or nothing.
+neighbour() {
+  local pane=$1 side=$2 win tok id l tp w h ml mt mw mh
+  win=$(t display-message -p -t "$pane" '#{window_id}') || return 1
+  case "$side" in left) tok='{left-of}' ;; right) tok='{right-of}' ;; up) tok='{up-of}' ;; down) tok='{down-of}' ;; esac
+  t select-pane -t "$pane"
+  id=$(t display-message -p -t "$win.$tok" '#{pane_id}' 2>/dev/null) || return 1
+  [[ -n "$id" && "$id" != "$pane" ]] || return 1
+  read -r ml mt mw mh <<< "$(geo "$pane")"; read -r l tp w h <<< "$(geo "$id")"
+  case "$side" in        # refuse tmux's wrap-around: the neighbour must really be on that side
+    left)  (( l < ml )) || return 1 ;;
+    right) (( l > ml )) || return 1 ;;
+    up)    (( tp < mt )) || return 1 ;;
+    down)  (( tp > mt )) || return 1 ;;
+  esac
+  echo "$id"
+}
+
+# After a merge the tab has one column fewer: share the width out equally among the columns left.
+even_columns() {  # <a pane in the window>
+  local win ww n target l id lefts
+  win=$(t display-message -p -t "$1" '#{window_id}'); ww=$(t display-message -p -t "$1" '#{window_width}')
+  mapfile -t lefts < <(t list-panes -t "$win" -F '#{pane_left}' | sort -n | uniq)
+  n=${#lefts[@]}; (( n > 1 )) || return 0
+  target=$(( ww / n - 3 ))
+  for l in "${lefts[@]}"; do
+    id=$(t list-panes -t "$win" -F '#{pane_left} #{pane_id}' | awk -v l="$l" '$1 == l { print $2; exit }')
+    [[ -n "$id" ]] && t resize-pane -t "$id" -x "$target"
+  done
+  return 0
+}
+
+unzoom() { [[ "$(t display-message -p -t "$1" '#{window_zoomed_flag}')" == 1 ]] && t resize-pane -Z -t "$1"; return 0; }
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  left|right|up|down)
+    pane=${1:?pane id}; unzoom "$pane"
+    if n=$(neighbour "$pane" "$cmd"); then
+      t swap-pane -d -s "$pane" -t "$n"
+      t select-pane -t "$pane"
+    else
+      say "No split on that side to trade places with."
+    fi
+    ;;
+  stack-left|stack-right)
+    pane=${1:?pane id}; unzoom "$pane"
+    if n=$(neighbour "$pane" "${cmd#stack-}"); then
+      t join-pane -v -s "$pane" -t "$n" && { even_columns "$pane"; t select-pane -t "$pane"; }
+    else
+      say "No split on that side to merge with."
+    fi
+    ;;
+  column|column-left)
+    pane=${1:?pane id}; unzoom "$pane"
+    other=$(t list-panes -t "$pane" -F '#{pane_id}' | grep -vx -- "$pane" | head -1)
+    if [[ -z "$other" ]]; then say "This is the tab's only split."; exit 0; fi
+    if [[ "$cmd" == column-left ]]; then t join-pane -fhb -s "$pane" -t "$other"; else t join-pane -fh -s "$pane" -t "$other"; fi
+    even_columns "$pane"
+    t select-pane -t "$pane"
+    ;;
+  menu)
+    client=${1:-}; pane=${2:?pane id}
+    self="$HOME/.local/bin/afc-move"
+    go() { echo "run-shell -b '$self $1 $pane'"; }
+    unzoom "$pane"
+    read -r ml mt mw mh <<< "$(geo "$pane")"
+    wh=$(t display-message -p -t "$pane" '#{window_height}')
+    items=()
+    L=$(neighbour "$pane" left || true); R=$(neighbour "$pane" right || true)
+    U=$(neighbour "$pane" up || true);   D=$(neighbour "$pane" down || true)
+    [[ -n "$L" ]] && items+=("Move left"  h "$(go left)")
+    [[ -n "$R" ]] && items+=("Move right" l "$(go right)")
+    [[ -n "$U" ]] && items+=("Move up"    k "$(go up)")
+    [[ -n "$D" ]] && items+=("Move down"  j "$(go down)")
+    if [[ -n "$L$R" ]]; then
+      items+=("")
+      [[ -n "$L" ]] && items+=("Merge under the split on the left"  "<" "$(go stack-left)")
+      [[ -n "$R" ]] && items+=("Merge under the split on the right" ">" "$(go stack-right)")
+    fi
+    if [[ -n "$U$D" ]]; then      # it shares its column: offer to take it out again
+      items+=("" "Own column, at the right" r "$(go column)" "Own column, at the left" e "$(go column-left)")
+    fi
+    if (( ${#items[@]} == 0 )); then say "This is the tab's only split: nothing to move."; exit 0; fi
+    t display-menu -M ${client:+-c "$client"} -t "$pane" -T "#[align=centre] Move this split " -x C -y C "${items[@]}"
+    ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

@@ -1,0 +1,21 @@
+[Unit]
+Description=Capped CPU group for AI agents and builds (autonice moves them here)
+
+[Slice]
+# 300% = at most 3 of your 6 cores, no matter how much work they start.
+# Change the number and run: systemctl --user daemon-reload
+CPUQuota=300%
+
+# Memory: slow a runaway agent down at 12 GB, kill it alone at 14 GB — before
+# it can eat the whole 24 GB and take the desktop down (OpenCode did this once).
+# Raised from 8/10 on 2026-10-24 for the 10-agent fleet, and from 10/12 on
+# 2026-10-28 (agents peaked at 10.9 GB and kept hitting the slow-down line;
+# the rest of the desktop used ~6 GB). 14 keeps ~10 GB for the desktop, Zed and
+# browsers. Do not go higher without measuring what's left.
+MemoryHigh=12G
+MemoryMax=14G
+
+# Swap: at most 1 GB. Without this the overflow past 8 GB went to swap instead,
+# filled it, and froze the whole desktop (2026-10-22). Now a runaway agent hits
+# 10 GB fast and is killed alone.
+MemorySwapMax=1G

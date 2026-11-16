@@ -1,0 +1,60 @@
+#!/bin/bash
+# keepawake-agents — keep the screen awake (no blank, dim, lock) and block
+# auto-suspend WHILE an AI agent process is running; let normal KDE power
+# saving resume when none are.
+#
+# How: while an agent is detected, hold one child that combines
+#   - a logind idle:sleep inhibitor (systemd-inhibit)  -> blocks suspend
+#   - keepawake-hold (KDE D-Bus inhibits)              -> blocks blank/dim/lock
+# Killing the child releases both. If this watcher dies, its child dies too and
+# the screen goes back to normal — fail-safe, nothing stays stuck awake.
+#
+#   keepawake-agents            run the watcher (normally started by systemd)
+#   keepawake-agents --status   show whether it is currently holding the screen
+
+# Commands whose presence means "an agent is running". Extended regex over the
+# full command line. Mirrors ~/.config/autonice/rules.
+PATTERN="${KEEPAWAKE_PATTERN:-claude-agent-acp|(^|/)claude( |$)|(^|/)(opencode|codex|gemini|goose)( |$)}"
+INTERVAL="${KEEPAWAKE_INTERVAL:-15}"
+HOLD="$HOME/.local/bin/keepawake-hold"
+
+HOLD_PID=""
+
+agents_running() {
+    # Our own processes, minus this watcher, the holder, the desktop shell,
+    # and the matching grep itself.
+    ps -u "$USER" -o pid=,args= 2>/dev/null \
+        | grep -Ev -- "keepawake-|claude-desktop|[ /]grep " 2>/dev/null \
+        | grep -Eq -- "$PATTERN"
+}
+
+holding() { [ -n "$HOLD_PID" ] && kill -0 "$HOLD_PID" 2>/dev/null; }
+
+if [ "$1" = "--status" ]; then
+    if agents_running; then echo "agent: running"; else echo "agent: none"; fi
+    echo "logind idle/sleep inhibitors:"
+    systemd-inhibit --list 2>/dev/null | grep -E "keepawake|idle" | sed 's/^/  /' || true
+    echo "KDE HasInhibit: $(qdbus org.freedesktop.PowerManagement \
+        /org/freedesktop/PowerManagement HasInhibit 2>/dev/null)"
+    exit 0
+fi
+
+start_hold() {
+    holding && return
+    systemd-inhibit --what=idle:sleep --who="agents" \
+        --why="AI agent running" --mode=block "$HOLD" &
+    HOLD_PID=$!
+}
+
+stop_hold() {
+    holding && kill "$HOLD_PID" 2>/dev/null
+    HOLD_PID=""
+}
+
+cleanup() { stop_hold; exit 0; }
+trap cleanup TERM INT
+
+while true; do
+    if agents_running; then start_hold; else stop_hold; fi
+    sleep "$INTERVAL" & wait $!
+done

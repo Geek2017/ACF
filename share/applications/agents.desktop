@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Agents
+Comment=Claude agent fleet: one tab per project, Claude already running
+Exec=/home/jmg/.local/bin/agents --window
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Agents Window (another monitor)
+Exec=/home/jmg/.local/bin/agents --new-window
