@@ -83,21 +83,73 @@ Everything with a button also lights up under the pointer and can be clicked, me
 
 ## How it works
 
+A turn runs top to bottom: a model answers, the agent in the pane acts on the answer, and the fleet's programs turn what the agent did into what you see and what is kept.
+
 ```mermaid
-flowchart LR
-  subgraph cap["agents.slice: 3 cores, slows at 12 GB, stops at 14 GB"]
-    tmux["tmux<br>tab = project, split = agent"]
-    agent["Claude Code, Codex,<br>Gemini CLI, Antigravity"]
-    tmux --> agent
+flowchart TB
+  you(["You<br>a prompt, typed in a pane"])
+
+  subgraph llm["1 · LLMs"]
+    anthropic["Anthropic<br>Claude models"]
+    openai["OpenAI<br>GPT models"]
+    google["Google<br>Gemini models"]
   end
-  launcher["agents<br>the launcher"] -->|"starts"| tmux
-  agent -->|"hooks: busy, done, wait"| signals["tab signals<br>underline, blink"]
-  agent -->|"status line, chat records"| bar["afc-bar<br>pane header, bottom bar"]
-  usage["claude-usage, llm-usage<br>plan limits"] --> bar
-  agent -->|"chat records on disk"| logs["afc-logs<br>every 15 minutes"]
-  logs --> store["project/logs/acf<br>database + one file per thread"]
-  guard["autonice, jobq<br>priority and slots"] -.-> agent
+
+  subgraph fleet["2 · ACF agents"]
+    claude["Claude Code"]
+    codex["Codex"]
+    gemini["Gemini CLI"]
+    agy["Antigravity"]
+  end
+
+  subgraph acf["3 · ACF programs"]
+    guard["agents.slice, autonice, jobq<br>the resource budget"]
+    mark["agents --mark<br>busy, done, wait"]
+    bar["afc-bar<br>claude-usage, llm-usage"]
+    logs["afc-logs<br>every 15 minutes"]
+  end
+
+  subgraph out["4 · Output"]
+    work["The work<br>files edited, commands run<br>in the project folder"]
+    signals["Tab signals<br>underline = working<br>blink = done or waiting"]
+    header["Pane header, bottom bar<br>model, tokens, cost, limits"]
+    store["Chat log<br>project/logs/acf<br>database, a file per thread"]
+  end
+
+  you <-->|"prompt ↓<br>reply ↑"| fleet
+  anthropic <-->|"prompt, tool results ↑<br>reply, tool calls ↓"| claude
+  openai <--> codex
+  google <--> gemini
+  google <--> agy
+
+  fleet -->|"tool calls"| guard --> work
+  fleet -->|"hooks"| mark --> signals
+  fleet -->|"status line,<br>chat records"| bar --> header
+  fleet -->|"chat records<br>on disk"| logs --> store
 ```
+
+### 1 · The LLMs
+
+The models run on their makers' servers, not on this machine. Each agent talks straight to its own maker, over the account its pane is on.
+
+| Agent | Models | An account is |
+|---|---|---|
+| Claude Code | Anthropic's Claude | a Claude config folder (`CLAUDE_CONFIG_DIR`) |
+| Codex | OpenAI's GPT | a Codex home folder (`CODEX_HOME`) |
+| Gemini CLI | Google's Gemini | a Gemini home folder (`GEMINI_CLI_HOME`), on an API key or an enterprise sign-in |
+| Antigravity | Gemini, and the Claude and GPT models Google offers through it | a stand-in home folder with its own Google sign-in |
+
+The fleet runs no model and sits in none of these requests. It decides where an agent runs: which folder, which tool, which account, which mode. Its own programs ask no model anything either: the header figures and the chat log are read from files the tools already keep, and the plan limits from each maker's usage figures.
+
+**Changing the account or tool in a pane** (Alt+G)
+
+1. The menu lists every account of every tool, with who is signed in.
+2. Another Claude account: the pane restarts on that account and resumes the same chat. All Claude accounts share one chat store through links; only the sign-in differs. The move is remembered, so a restart reopens that chat on that account.
+3. Another tool: that agent starts in the same folder with a fresh chat.
+
+### 2 · The ACF agents
+
+An agent is one of the four tools running in a split of the fleet's tmux window: one tab per project, any number of splits per tab.
 
 **Starting the fleet** (`agents`, or the Agents entry in the desktop menu)
 
@@ -106,29 +158,35 @@ flowchart LR
 3. Each project gets a tab. A folder with an earlier chat continues it, on the account that chat belongs to; otherwise a new chat starts.
 4. The window attaches. If the fleet is already running, `agents` attaches to it; a second window gets its own view of the same agents.
 
-**While an agent works**
+**One turn**
+
+1. You type a prompt in a pane. The agent sends it to its model, along with what it has read of the project.
+2. The model answers with text and with tool calls: read this file, edit that one, run this command.
+3. The agent carries the tool calls out in the project folder and sends the results back to the model. Steps 2 and 3 repeat until the model asks for nothing more. Then the turn ends and the reply stands in the pane.
+4. An agent started in plan mode only proposes changes. One with permission prompts on stops and asks before a tool call that needs your yes.
+
+### 3 · The ACF programs
+
+Four pieces stand between the agents and the output, one per arrow that leaves the agents in the diagram.
+
+**The resource budget** (`agents.slice`, and `autonice` every 5 seconds)
+
+1. tmux runs inside `agents.slice`, so every agent and every command a tool call starts shares one budget: 3 CPU cores, slowed at 12 GB of memory, stopped at 14 GB.
+2. Processes that match `~/.config/autonice/rules` get a lower CPU and disk priority and are moved into the capped group. Priority is only ever lowered.
+3. A background job that matches a `gate` rule takes a slot. With no slot free it is paused, and resumed when one frees. `jobq <command>` waits for a slot instead.
+4. If `autonice` stops, it first resumes everything it paused.
+
+**Tab signals** (`agents --mark`)
 
 1. Hooks in each tool's settings call `agents --mark`: `busy` when a prompt is sent or a tool runs, `done` when the turn ends, `wait` when it asks for permission, `end` when it closes.
 2. `--mark` sets a flag on the pane and tmux draws it: the tab's name is underlined while any agent in it is busy, and the tab blinks when one finishes or waits while you are looking elsewhere. Looking at the tab clears the blink.
 3. A turn that ends with a background command still running stays underlined until that command ends.
 
-**The pane header** (redrawn about once a second)
+**The pane header** (`afc-bar`, redrawn about once a second)
 
 1. Claude hands its status-line data to `afc-statusline`, which saves model, effort, limits, tokens and cost for that pane.
 2. `afc-bar` works out which tool and account the pane runs from the pane's own processes, reads that saved line, and adds the plan limits from `claude-usage` or `llm-usage`. Both answer from a cache and refresh it in the background, so the bar never waits.
 3. Codex, Gemini and Antigravity have no status line: `afc-agent-info` reads the same facts from the chat records they keep on disk.
-
-**Changing the account or tool in a pane** (Alt+G)
-
-1. The menu lists every account of every tool, with who is signed in.
-2. Another Claude account: the pane restarts on that account and resumes the same chat. All Claude accounts share one chat store through links; only the sign-in differs. The move is remembered, so a restart reopens that chat on that account.
-3. Another tool: that agent starts in the same folder with a fresh chat.
-
-**The resource guard** (`autonice`, every 5 seconds)
-
-1. Processes that match `~/.config/autonice/rules` get a lower CPU and disk priority and are moved into the capped group. Priority is only ever lowered.
-2. A background job that matches a `gate` rule takes a slot. With no slot free it is paused, and resumed when one frees. `jobq <command>` waits for a slot instead.
-3. If `autonice` stops, it first resumes everything it paused.
 
 **The chat log** (`afc-logs`, every 15 minutes)
 
@@ -136,6 +194,18 @@ flowchart LR
 2. It finds the chat files that changed, for all four tools, and reads what is new.
 3. Each thread goes to the project it ran in: the fleet project, else the nearest folder above with a `.git`, `CLAUDE.md`, `AGENTS.md` or `_ai`, else the folder itself. Chats run in the home folder or a temp folder go to `~/logs/acf/`.
 4. Secrets are replaced by `[redacted]`, then the entries go into `logs/acf/acf.db` (full-text search) and one `.md` file per thread. In a git project, `logs/acf/` is added to `.gitignore`.
+
+### 4 · The output
+
+What a turn leaves behind, and where.
+
+| Output | Where it lands | Made by |
+|---|---|---|
+| The work | the project folder: the files the agent edited and whatever its commands produced | the agent's tool calls, inside the budget |
+| The reply | the pane; tmux keeps the chat history for the scrollbar | the agent |
+| Tab signals | the tab's name in the bottom bar: underlined while an agent works, blinking when one is done or waiting | the tools' hooks, then `agents --mark` |
+| Figures | the pane header and the bottom bar: tool, account, model, effort, tokens, cost, plan limits, fleet memory | `afc-statusline` or `afc-agent-info`, then `afc-bar` |
+| The chat log | `<project>/logs/acf/`: `acf.db` and one `.md` file per thread, secrets redacted | `afc-logs` |
 
 ## What is in this folder
 
