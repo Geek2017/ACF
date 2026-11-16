@@ -10,6 +10,20 @@ Moved here: 2026-11-16, on the Kubuntu 24.04 workstation.
 
 **If this drive is not mounted or this folder is moved**, the links break and the fleet will not start. The last home-folder copies are in `~/.local/share/acf-home-backup-20261116/` with restore steps in its `README.txt`; after a move, `bash _tools/install.sh --apply` from the new place re-points the links.
 
+## What it does
+
+| Capability | What you get |
+|---|---|
+| **Many agents, one window** | One tab per project and any number of splits inside it. Each split runs Claude Code, Codex, Gemini CLI, Antigravity or a plain terminal, started fresh, in plan mode (read-only for Codex) or with no permission prompts. |
+| **Picks up where you stopped** | `agents` reopens every project on its list and continues each one's last chat. A folder whose chat is already open in another window gets a note instead of a second agent. |
+| **Several accounts per tool** | Alt+G moves the agent in a pane to another account (Claude keeps the same chat) or to another tool. A new split starts on the account of the pane it came from. A label can stand in for an account name on a shared screen. |
+| **Shows what every agent is doing** | A tab's name is underlined while an agent in it works, and the tab blinks when one has finished or is waiting for an answer. Each pane's header shows tool, account, model, effort, tokens, share of the model's window, cost and plan limits. |
+| **A window manager for splits** | Move, merge, minimise, maximise and close with a key or a click on the pane header. A thin scrollbar through the chat, copy longer than one screen, paste of text or an image. |
+| **A resource budget** | Every agent and everything it starts runs in one capped group: 3 CPU cores, slowed at 12 GB of memory, stopped at 14 GB. Builds, tests and agents get lower priority. At most 2 heavy jobs and 3 dev servers run at once; the rest wait their turn. The machine stays awake while agents work. |
+| **A permanent chat log** | Every 15 minutes each tool's chat records are copied into the project they belong to: a searchable database and one readable file per thread, with secrets replaced by `[redacted]`. No model is asked, so it costs no tokens. |
+| **Plan limits and cost at a glance** | Session and weekly limits per account for Claude, Codex and Antigravity, and what each conversation would cost at list prices. |
+| **Rebuilds from this folder** | `install.sh` sets a machine up; `build-tmux.sh` builds the patched tmux with no download and no sudo. |
+
 ## What you see
 
 ```
@@ -49,6 +63,79 @@ Moved here: 2026-11-16, on the Kubuntu 24.04 workstation.
 | Ctrl+B then R | reload the config |
 
 Everything with a button also lights up under the pointer and can be clicked, menus included.
+
+## Commands
+
+| Command | Does |
+|---|---|
+| `agents` | open the fleet, or attach to it if it is running |
+| `agents --add [folder] [name]` | add a project (default: this folder); opens its tab if the fleet is up |
+| `agents --status` | list the tabs and the fleet's memory |
+| `agents --dry-run` | show what would open, start nothing |
+| `agents --accounts` | list every tool's accounts and who is signed in to each |
+| `agents --usage` | plan limits per Claude account |
+| `agents --as <account>` | run Claude on that account in any terminal (`gemini:<account>`, `codex:<account>`, `agy:<account>` for the others) |
+| `agents --kill` | stop every agent (asks first) |
+| `afc-logs search WORDS` | search this project's chat log (`--all` for every project) |
+| `afc-logs threads`, `afc-logs show THREAD` | list the threads, print one |
+| `jobq <command>` | run a heavy command when a slot is free, instead of being paused |
+| `jobq --status`, `autonice --status` | who holds the slots, what is throttled |
+
+## How it works
+
+```mermaid
+flowchart LR
+  subgraph cap["agents.slice: 3 cores, slows at 12 GB, stops at 14 GB"]
+    tmux["tmux<br>tab = project, split = agent"]
+    agent["Claude Code, Codex,<br>Gemini CLI, Antigravity"]
+    tmux --> agent
+  end
+  launcher["agents<br>the launcher"] -->|"starts"| tmux
+  agent -->|"hooks: busy, done, wait"| signals["tab signals<br>underline, blink"]
+  agent -->|"status line, chat records"| bar["afc-bar<br>pane header, bottom bar"]
+  usage["claude-usage, llm-usage<br>plan limits"] --> bar
+  agent -->|"chat records on disk"| logs["afc-logs<br>every 15 minutes"]
+  logs --> store["project/logs/acf<br>database + one file per thread"]
+  guard["autonice, jobq<br>priority and slots"] -.-> agent
+```
+
+**Starting the fleet** (`agents`, or the Agents entry in the desktop menu)
+
+1. `agents` reads the project list, `~/.config/agents/projects`: one `<tab name> <folder>` per line.
+2. It starts the tmux server inside `agents.slice`, so everything started from a tab falls under the budget.
+3. Each project gets a tab. A folder with an earlier chat continues it, on the account that chat belongs to; otherwise a new chat starts.
+4. The window attaches. If the fleet is already running, `agents` attaches to it; a second window gets its own view of the same agents.
+
+**While an agent works**
+
+1. Hooks in each tool's settings call `agents --mark`: `busy` when a prompt is sent or a tool runs, `done` when the turn ends, `wait` when it asks for permission, `end` when it closes.
+2. `--mark` sets a flag on the pane and tmux draws it: the tab's name is underlined while any agent in it is busy, and the tab blinks when one finishes or waits while you are looking elsewhere. Looking at the tab clears the blink.
+3. A turn that ends with a background command still running stays underlined until that command ends.
+
+**The pane header** (redrawn about once a second)
+
+1. Claude hands its status-line data to `afc-statusline`, which saves model, effort, limits, tokens and cost for that pane.
+2. `afc-bar` works out which tool and account the pane runs from the pane's own processes, reads that saved line, and adds the plan limits from `claude-usage` or `llm-usage`. Both answer from a cache and refresh it in the background, so the bar never waits.
+3. Codex, Gemini and Antigravity have no status line: `afc-agent-info` reads the same facts from the chat records they keep on disk.
+
+**Changing the account or tool in a pane** (Alt+G)
+
+1. The menu lists every account of every tool, with who is signed in.
+2. Another Claude account: the pane restarts on that account and resumes the same chat. All Claude accounts share one chat store through links; only the sign-in differs. The move is remembered, so a restart reopens that chat on that account.
+3. Another tool: that agent starts in the same folder with a fresh chat.
+
+**The resource guard** (`autonice`, every 5 seconds)
+
+1. Processes that match `~/.config/autonice/rules` get a lower CPU and disk priority and are moved into the capped group. Priority is only ever lowered.
+2. A background job that matches a `gate` rule takes a slot. With no slot free it is paused, and resumed when one frees. `jobq <command>` waits for a slot instead.
+3. If `autonice` stops, it first resumes everything it paused.
+
+**The chat log** (`afc-logs`, every 15 minutes)
+
+1. The run is skipped when CPU or RAM is at 85% or more.
+2. It finds the chat files that changed, for all four tools, and reads what is new.
+3. Each thread goes to the project it ran in: the fleet project, else the nearest folder above with a `.git`, `CLAUDE.md`, `AGENTS.md` or `_ai`, else the folder itself. Chats run in the home folder or a temp folder go to `~/logs/acf/`.
+4. Secrets are replaced by `[redacted]`, then the entries go into `logs/acf/acf.db` (full-text search) and one `.md` file per thread. In a git project, `logs/acf/` is added to `.gitignore`.
 
 ## What is in this folder
 
