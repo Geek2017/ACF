@@ -16,13 +16,54 @@
 #
 # CPU and RAM are for the whole machine, and turn red at 85%. A field with nothing to show is left
 # out along with its brackets. Machine readings are sampled at most every 5 seconds.
+#
+# COST. tmux re-runs this about once a second for EVERY pane header, so a full run (about a fifth of
+# a second of CPU) on ten panes used to burn two cores all day. Now each answer is kept and a re-run
+# inside its keep time prints it and stops, starting no other program:
+#   a header        HDR_TTL seconds  (kept per pane; a new width or page is worked out at once)
+#   the bottom bar  MACH_TTL seconds
+#   who is in a pane: until the pane's child process changes, WHO_TTL seconds at most
+#   plan limits     LIM_TTL seconds per account      count of live agents  RUN_TTL seconds
+# Anything added here that starts a program belongs BELOW the kept-answer check, never above it.
 # Written for bash 3.2, since a Mac may run this with its system bash.
 
 export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+MAC=''; [[ "$OSTYPE" != darwin* ]] || . "$HOME/.local/lib/afc/mac.sh"   # macOS: Homebrew's bash and GNU tools (lib/afc/mac.sh)
 BIN="$HOME/.local/bin"
 SOCK="${AGENTS_SOCK:-agents}"
-CACHE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-bar"
-TTL=5
+RT="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+CACHE="$RT/afc-bar"
+KEEP="$RT/afc-bar.d"      # the kept answers
+TTL=5 HDR_TTL=5 MACH_TTL=2 WHO_TTL=30 LIM_TTL=30 RUN_TTL=20
+
+# The time, without starting `date` (bash 4.2 and later; older ones fall back to date).
+now=''; printf -v now '%(%s)T' -1 2>/dev/null
+[[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+
+# The kept answer, if it is still good: print it and stop. Line 1 of the file is
+# "<when> <what was asked> <1 if a Claude pane>", line 2 the answer.
+isclaude=0
+if [[ "${1:-}" == --machine ]]; then hfile="$KEEP/machine" hkey='-' httl=$MACH_TTL
+else
+  if [[ -n "${2:-}" ]]; then hfile="$KEEP/h${2#%}"; else hfile="$KEEP/hp${1:-0}"; fi
+  hkey="${1:-0}/${3:-0}/${4:-0}" httl=$HDR_TTL
+fi
+if [[ -r "$hfile" ]]; then
+  hs='' hk='' hc='' hout=''
+  { read -r hs hk hc; IFS= read -r hout; } < "$hfile" 2>/dev/null
+  if [[ "$hs" =~ ^[0-9]+$ && "$hk" == "$hkey" && -n "$hout" ]] && (( now >= hs && now - hs < httl )); then
+    # A Claude pane still gets its gap check every other second (afc-gap), so a gap closes about
+    # as fast as before.
+    if [[ "$hc" == 1 ]] && (( now % 2 == 0 )); then ( AGENTS_SOCK="$SOCK" "$BIN/afc-gap" "$2" & ) >/dev/null 2>&1; fi
+    printf '%s\n' "$hout"
+    exit 0
+  fi
+fi
+emit() {   # print the answer and keep it
+  printf '%s\n' "$1"
+  [[ -d "$KEEP" ]] || mkdir -p "$KEEP" 2>/dev/null
+  printf '%s %s %s\n%s\n' "$now" "$hkey" "$isclaude" "$1" > "$hfile" 2>/dev/null
+}
 
 GREEN='#9ece6a' AMBER='#e0af68' BLUE='#7dcfff' WHITE='#c0caf5' DIM='#565f89' RED='#f7768e' PURPLE='#bb9af7' TEAL='#73daca'
 
@@ -65,18 +106,30 @@ sample() {
       ;;
   esac
   # Panes with a live agent in them (agents --running). Terminals don't count, busy or not.
-  running=$(AGENTS_SOCK="$SOCK" "$BIN/agents" --running 2>/dev/null || echo 0)
+  # Counting walks every pane and costs about a second of CPU, so it is done at most every RUN_TTL
+  # seconds and in the background; the bar shows the last count meanwhile.
+  local rs=0 rn=''
+  [[ -r "$CACHE.run" ]] && read -r rs rn < "$CACHE.run"
+  [[ "$rn" =~ ^[0-9]+$ ]] && running=$rn
+  if ! [[ "$rs" =~ ^[0-9]+$ ]] || (( now - rs >= RUN_TTL || now < rs )); then
+    echo "$now ${rn:-$running}" > "$CACHE.run"    # claim the turn first, so parallel calls do not all count
+    ( n=$(AGENTS_SOCK="$SOCK" "$BIN/agents" --running 2>/dev/null) && [[ "$n" =~ ^[0-9]+$ ]] && echo "$now $n" > "$CACHE.run" ) >/dev/null 2>&1 &
+    # the same moment clears out kept answers of panes that are long gone
+    ( find "$KEEP" -type f -mmin +30 -delete ) >/dev/null 2>&1 &
+  fi
   # Keep the bottom bar's count of minimised splits true even when one ends by itself (afc-min).
   mins=$(tmux -L "$SOCK" list-panes -s -t '=afcmin' -F '#{?#{@min_from},x,}' 2>/dev/null | grep -c x)
   [[ "$(tmux -L "$SOCK" show -gqv @min_count 2>/dev/null)" == "$mins" ]] || tmux -L "$SOCK" set -g @min_count "$mins" 2>/dev/null
 }
 
-now=$(date +%s)
 stamp=0 cpu=0 ram=0 running=0 prev_busy=0 prev_total=0 busy=0 total=0 note='' pane_limits='' model='' model_full='' msuffix=''
-[[ -r "$CACHE" ]] && read -r stamp cpu ram running prev_busy prev_total note < "$CACHE"
-if (( now - stamp >= TTL )); then
-  sample
-  echo "$now $cpu $ram $running $busy $total $note" > "$CACHE"
+# The machine's readings are only shown in the bottom bar, so only that call samples them.
+if [[ "${1:-}" == --machine ]]; then
+  [[ -r "$CACHE" ]] && read -r stamp cpu ram running prev_busy prev_total note < "$CACHE"
+  if (( now - stamp >= TTL )); then
+    sample
+    echo "$now $cpu $ram $running $busy $total $note" > "$CACHE"
+  fi
 fi
 
 line=''
@@ -102,7 +155,7 @@ if [[ "${1:-}" == --machine ]]; then
   # One pair of brackets round all three figures, set apart by a dim |, packed tight with no spaces round the | or the /, as the operator asked.
   dot="#[fg=$DIM]|"
   mem=${mem// \/ //}    # "1.6G / 12G" -> "1.6G/12G"
-  printf '%s\n' "#[fg=$DIM][#[fg=$WHITE]$(hot C "$cpu")$dot#[fg=$WHITE]$(hot R "$ram")${note:+ ($note)}$dot#[fg=$BLUE]F:$running${mem:+ $mem}#[fg=$DIM]]"
+  emit "#[fg=$DIM][#[fg=$WHITE]$(hot C "$cpu")$dot#[fg=$WHITE]$(hot R "$ram")${note:+ ($note)}$dot#[fg=$BLUE]F:$running${mem:+ $mem}#[fg=$DIM]]"
   exit 0
 fi
 
@@ -133,8 +186,28 @@ short_model() {
   esac
 }
 
-who=$("$BIN/agents" --who "${1:-0}" 2>/dev/null)
-who=${who%%$'\n'*}   # one line only: a stray second line would break the bar
+# Who is in the pane: the tool and, for Claude, the account. Asking the launcher costs about 60 ms,
+# so the answer is kept for as long as the pane's own child process is the same one (a new agent or
+# another account is always a new process), and for WHO_TTL seconds at most. Only a found agent is
+# kept; a pane with none is asked about each time.
+who='' kids='' whit=0
+wfile="$KEEP/w${1:-0}"
+[[ -r "/proc/${1:-0}/task/${1:-0}/children" ]] && read -r kids < "/proc/$1/task/$1/children" 2>/dev/null
+if [[ -n "$MAC" ]]; then kids=$(pgrep -P "${1:-0}" 2>/dev/null | tr '\n' ' '); kids=${kids% }; fi   # macOS has no such file
+if [[ -n "$kids" && -r "$wfile" ]]; then
+  ws='' wk='' ww=''
+  { read -r ws; IFS= read -r wk; IFS= read -r ww; } < "$wfile" 2>/dev/null
+  if [[ "$ws" =~ ^[0-9]+$ && "$wk" == "$kids" && -n "$ww" ]] && (( now >= ws && now - ws < WHO_TTL )); then who=$ww; whit=1; fi
+fi
+if (( ! whit )); then
+  who=$("$BIN/agents" --who "${1:-0}" 2>/dev/null)
+  who=${who%%$'\n'*}   # one line only: a stray second line would break the bar
+  if [[ -n "$who" && -n "$kids" ]]; then
+    [[ -d "$KEEP" ]] || mkdir -p "$KEEP" 2>/dev/null
+    printf '%s\n%s\n%s\n' "$now" "$kids" "$who" > "$wfile" 2>/dev/null
+  fi
+fi
+[[ "$who" == claude* && -n "${2:-}" ]] && isclaude=1
 if [[ -n "$who" ]]; then
   tool=${who%% *}
   case "$tool" in
@@ -163,7 +236,15 @@ if [[ "$who" == claude* && -n "$2" ]]; then
   mfile="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-panes/${2#%}"
   if [[ -r "$mfile" ]]; then
     fresh=1
-    up=$(ps -o etimes= -p "${1:-0}" 2>/dev/null | tr -d ' ')    # seconds the pane's shell has lived
+    # seconds the pane's shell has lived: read from /proc where there is one (no program started)
+    up=''
+    if [[ -r "/proc/${1:-0}/stat" && -r /proc/uptime ]]; then
+      pstat='' upt=''
+      IFS= read -r pstat < "/proc/$1/stat" 2>/dev/null; read -r upt _ < /proc/uptime
+      read -r -a pf <<< "${pstat##*) }"
+      [[ "${pf[19]:-}" =~ ^[0-9]+$ && "${upt%%.*}" =~ ^[0-9]+$ ]] && up=$(( ${upt%%.*} - pf[19] / 100 ))
+    fi
+    [[ "$up" =~ ^[0-9]+$ ]] || up=$(if [[ -n "$MAC" ]]; then p_age "${1:-0}"; else ps -o etimes= -p "${1:-0}" 2>/dev/null | tr -d ' '; fi)
     saved=$(stat -c %Y "$mfile" 2>/dev/null)
     if [[ "$up" =~ ^[0-9]+$ && "$saved" =~ ^[0-9]+$ ]]; then
       (( now - saved <= up + 1 )) || fresh=0
@@ -196,12 +277,25 @@ if [[ "$who" == codex* || "$who" == gemini* || "$who" == agy* ]] && [[ "${1:-0}"
     [[ -n "$pane_tokens" ]] && add "#[fg=$TEAL]T:$pane_tokens"
   fi
 fi
-case "$who" in
-  claude*)            limits=$("$BIN/claude-usage" --short "$who" 2>/dev/null) ;;
-  codex*|gemini*|agy*) limits=$("$BIN/llm-usage" "$who" 2>/dev/null) ;;
-  *)                  limits='' ;;
-esac
-limits=${limits%%$'\n'*}
+# Plan limits move slowly and asking costs about 80 ms, so the answer is kept per account for LIM_TTL seconds.
+limits='' lhit=0
+if [[ -n "$who" ]]; then
+  lfile="$KEEP/l-${who//[^A-Za-z0-9_.-]/_}"
+  if [[ -r "$lfile" ]]; then
+    ls_='' ll=''
+    { read -r ls_; IFS= read -r ll; } < "$lfile" 2>/dev/null
+    if [[ "$ls_" =~ ^[0-9]+$ ]] && (( now >= ls_ && now - ls_ < LIM_TTL )); then limits=$ll; lhit=1; fi
+  fi
+  if (( ! lhit )); then
+    case "$who" in
+      claude*)            limits=$("$BIN/claude-usage" --short "$who" 2>/dev/null) ;;
+      codex*|gemini*|agy*) limits=$("$BIN/llm-usage" "$who" 2>/dev/null) ;;
+    esac
+    limits=${limits%%$'\n'*}
+    [[ -d "$KEEP" ]] || mkdir -p "$KEEP" 2>/dev/null
+    printf '%s\n%s\n' "$now" "$limits" > "$lfile" 2>/dev/null
+  fi
+fi
 # An error from the usage tools starts with the account's name ("acct1: HTTP 429"): show its label.
 [[ -n "$acct" && "$limits" == "$acct:"* ]] && limits="$label:${limits#"$acct":}"
 # Antigravity reports percent LEFT for three model groups at once (G Gemini, C Claude+GPT, A Argon):
@@ -251,7 +345,7 @@ total=0
 for (( i = 0; i < ${#seglen[@]}; i++ )); do total=$(( total + seglen[i] + 1 )); done
 avail=$(( width - 2 ))
 if (( width == 0 || total <= avail )); then
-  printf '%s \n' "$line"
+  emit "$line "
   exit 0
 fi
 room=$(( avail - 8 ))    # the marker takes 8 columns
@@ -268,4 +362,4 @@ from=${pstart[page]}
 to=${pstart[page + 1]:-${#segs[@]}}
 out="#[fg=$BLUE]◀ $(( page + 1 ))/$np ▶"
 for (( i = from; i < to; i++ )); do out+=" ${segs[i]}"; done
-printf '%s \n' "$out"
+emit "$out "

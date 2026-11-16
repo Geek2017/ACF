@@ -70,21 +70,33 @@ link() {  # <path inside the project> <target file> [mode]
   echo "  linked  $dst"
 }
 
+# A Mac gets the fleet's programs and lists only: the resource guard, the systemd units, the KDE
+# launcher files and the Alacritty config are for Linux (_tools/mac-setup.sh is what a Mac runs).
+# Windows runs it in WSL, which IS Linux and keeps the guard and the units; what it skips is the
+# desktop around them, since the window is Windows Terminal's (_tools/windows-setup.sh).
+MAC=0; [[ "$(uname -s)" == Darwin ]] && MAC=1
+DESKTOP=1; (( MAC )) && DESKTOP=0
+if [[ -n "${WSL_DISTRO_NAME:-}" ]] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then DESKTOP=0; fi
 GUARD=" autonice jobq keepawake-agents "
 for f in "$HERE"/bin/*; do
+  [[ -f "$f" ]] || continue            # not a program: a __pycache__ left by python3, say
   b=$(basename "$f")
-  if [[ "$GUARD" == *" $b "* ]]; then copy "bin/$b" "$HOME/.local/bin/$b" 755; else link "bin/$b" "$HOME/.local/bin/$b" 755; fi
+  if [[ "$GUARD" == *" $b "* ]]; then (( MAC )) || copy "bin/$b" "$HOME/.local/bin/$b" 755; else link "bin/$b" "$HOME/.local/bin/$b" 755; fi
 done
-link lib/afc/pb.py "$HOME/.local/lib/afc/pb.py"
+for f in "$HERE"/lib/afc/*; do [[ -f "$f" ]] && link "lib/afc/$(basename "$f")" "$HOME/.local/lib/afc/$(basename "$f")"; done
 link tmux/tmux.conf "$HOME/.tmux.conf"
-link share/agents/kwin-focus.js "$HOME/.local/share/agents/kwin-focus.js"
-link share/applications/agents.desktop "$HOME/.local/share/applications/agents.desktop"
+if (( DESKTOP )); then
+  link share/agents/kwin-focus.js "$HOME/.local/share/agents/kwin-focus.js"
+  link share/applications/agents.desktop "$HOME/.local/share/applications/agents.desktop"
+fi
 for f in "$HERE"/share/llm-usage/nobrowser/*; do link "share/llm-usage/nobrowser/$(basename "$f")" "$HOME/.local/share/llm-usage/nobrowser/$(basename "$f")" 755; done
 
-for f in "$HERE"/config/systemd/user/*; do copy "config/systemd/user/$(basename "$f")" "$HOME/.config/systemd/user/$(basename "$f")"; done
+if (( ! MAC )); then for f in "$HERE"/config/systemd/user/*; do copy "config/systemd/user/$(basename "$f")" "$HOME/.config/systemd/user/$(basename "$f")"; done; fi
 for f in "$HERE"/config/agents/*; do copy "config/agents/$(basename "$f")" "$HOME/.config/agents/$(basename "$f")"; done
-copy config/autonice/rules "$HOME/.config/autonice/rules"
-copy config/alacritty/alacritty.toml "$HOME/.config/alacritty/alacritty.toml"
+if (( DESKTOP )); then
+  copy config/autonice/rules "$HOME/.config/autonice/rules"
+  copy config/alacritty/alacritty.toml "$HOME/.config/alacritty/alacritty.toml"
+fi
 
 if (( APPLY )); then [[ -e "$HOME/.local/bin/afc" ]] || ln -s agents "$HOME/.local/bin/afc"
 elif [[ ! -e "$HOME/.local/bin/afc" ]]; then echo "  would link ~/.local/bin/afc -> agents"; fi

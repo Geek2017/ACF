@@ -1,6 +1,6 @@
 # Agentic CLI Fleet (ACF)
 
-One terminal window that runs many coding agents at once, each in its own tab or split, on one Linux machine. Claude Code, Codex, Gemini CLI and Antigravity sit side by side; the fleet keeps them inside a memory and CPU budget, shows what each one is doing, and keeps a log of every conversation.
+One terminal window that runs many coding agents at once, each in its own tab or split, on one machine: a Linux desktop, a headless Ubuntu server over SSH, a Mac, or Windows ([what each one gets](#on-other-machines)). Claude Code, Codex, Gemini CLI and Antigravity sit side by side; the fleet keeps them inside a memory and CPU budget, shows what each one is doing, and keeps a log of every conversation.
 
 This folder is **where the fleet lives**. Its programs and its tmux config run from here: the usual home-folder paths (`~/.local/bin/agents`, `~/.local/bin/afc-*`, `~/.tmux.conf`, …) are links to the files in this folder, so an edit here is live at once (programs on their next call, the tmux config after Ctrl+B then R).
 
@@ -21,7 +21,7 @@ Moved here: 2026-11-16, on the Kubuntu 24.04 workstation.
 | **A window manager for splits** | Move, merge, minimise, maximise and close with a key or a click on the pane header. A thin scrollbar through the chat, copy longer than one screen, paste of text or an image. |
 | **A folder of its own for a split** | A split can start in its own git worktree, on its own branch. Two agents in one project then no longer write over each other's files; one agent's work comes back with an ordinary `git merge`. |
 | **A resource budget** | Every agent and everything it starts runs in one capped group: 3 CPU cores, slowed at 12 GB of memory, stopped at 14 GB. Builds, tests and agents get lower priority. At most 2 heavy jobs and 3 dev servers run at once; the rest wait their turn. The machine stays awake while agents work. |
-| **A permanent chat log** | Every 15 minutes each tool's chat records are copied into the project they belong to: a searchable database and one readable file per thread, with secrets replaced by `[redacted]`. No model is asked, so it costs no tokens. |
+| **A permanent chat log** | Every 15 minutes each tool's chat records are copied into the project they belong to, as one file: a searchable database, with secrets replaced by `[redacted]`. No model is asked, so it costs no tokens. |
 | **Plan limits and cost at a glance** | Session and weekly limits per account for Claude, Codex and Antigravity, and what each conversation would cost at list prices. |
 | **Rebuilds from this folder** | `install.sh` sets a machine up; `build-tmux.sh` builds the patched tmux with no download and no sudo. `agents --doctor` checks that everything is in place; `test-fleet.sh` tries the launcher on a throw-away fleet. |
 
@@ -85,9 +85,14 @@ Everything with a button also lights up under the pointer and can be clicked, me
 | `agents --kill` | stop every agent (asks first) |
 | `afc-logs search WORDS` | search this project's chat log (`--all` for every project) |
 | `afc-logs threads`, `afc-logs show THREAD` | list the threads, print one |
+| `afc-logs prune-md` | remove the readable `.md` files earlier versions wrote beside the database (`--all` for every project, `--dry-run` to look first) |
+| `afc-rules show` | what the rule check found in this TokenOps project (`--all` for every project in the fleet) |
+| `afc-rules replay` | judge the last two weeks of chats in TokenOps projects as the check would have (`--days N`, `-v` per turn); changes nothing |
+| `afc-rules install`, `afc-rules doctor` | add the rule check's hooks to all four tools' settings (`--dry-run`, `--remove`); see what is in place |
 | `jobq <command>` | run a heavy command when a slot is free, instead of being paused |
 | `jobq --status`, `autonice --status` | who holds the slots, what is throttled |
 | `bash _tools/test-fleet.sh` | try the launcher on a throw-away fleet: about 80 checks in three minutes, nothing real is touched |
+| `bash _tools/test-rules.sh` | try the rule check on a made-up TokenOps project and chat files of each tool: 36 checks, a few seconds |
 
 ## How it works
 
@@ -115,13 +120,15 @@ flowchart TB
     mark["agents --mark<br>busy, done, wait"]
     bar["afc-bar<br>claude-usage, llm-usage"]
     logs["afc-logs<br>every 15 minutes"]
+    rules["afc-rules<br>the project's own rules"]
   end
 
   subgraph out["4 · Output"]
     work["The work<br>files edited, commands run<br>in the project folder"]
     signals["Tab signals<br>underline = working<br>blink = done or waiting"]
     header["Pane header, bottom bar<br>model, tokens, cost, limits"]
-    store["Chat log<br>project/logs/acf<br>database, a file per thread"]
+    store["Chat log<br>project/logs/acf<br>one database per project"]
+    verdict["Rule check<br>✓ / ✗ in the pane header<br>logs/acf/rules.log"]
   end
 
   you <-->|"prompt ↓<br>reply ↑"| fleet
@@ -134,6 +141,8 @@ flowchart TB
   fleet -->|"hooks"| mark --> signals
   fleet -->|"status line,<br>chat records"| bar --> header
   fleet -->|"chat records<br>on disk"| logs --> store
+  fleet -->|"hooks: prompt, turn end"| rules --> verdict
+  rules -.->|"reminder,<br>or sent back to fix"| fleet
 ```
 
 ### 1 · The LLMs
@@ -190,7 +199,7 @@ An agent is one of the four tools running in a split of the fleet's tmux window:
 
 ### 3 · The ACF programs
 
-Four pieces stand between the agents and the output, one per arrow that leaves the agents in the diagram.
+Five pieces stand between the agents and the output, one per arrow that leaves the agents in the diagram.
 
 **The resource budget** (`agents.slice`, and `autonice` every 5 seconds)
 
@@ -218,7 +227,17 @@ Four pieces stand between the agents and the output, one per arrow that leaves t
 1. The run is skipped when CPU or RAM is at 85% or more.
 2. It finds the chat files that changed, for all four tools, and reads what is new.
 3. Each thread goes to the project it ran in: the fleet project, else the nearest folder above with a `.git`, `CLAUDE.md`, `AGENTS.md` or `_ai`, else the folder itself. Chats run in the home folder or a temp folder go to `~/logs/acf/`.
-4. Secrets are replaced by `[redacted]`, then the entries go into `logs/acf/acf.db` (full-text search) and one `.md` file per thread. In a git project, `logs/acf/` is added to `.gitignore`.
+4. Secrets are replaced by `[redacted]`, then the entries go into `logs/acf/acf.db` (full-text search), the one file a project's log is. Every sub-agent is a thread of its own, so a readable `.md` file per thread came to hundreds of files in a project; that is now off unless `log-md on` is in `~/.config/agents/settings`, and `afc-logs show` prints any thread from the database. In a git project, `logs/acf/` is added to `.gitignore`.
+
+**The rule check** (`afc-rules`, on every prompt and at every turn end, in TokenOps projects only)
+
+1. The rules are the project's own: the files TokenOps put in it, listed in `_ai/TOKENOPS.json`. They are looked up from the folder the agent works in (that folder, or one above it up to its git root), never from a global file. A folder without `_ai/TOKENOPS.json` gets nothing: no reminder, no check. `afc-rules doctor` also lists any global instruction file a tool would load on top (on this machine there are none).
+2. On every prompt the tool's own hook adds a short reminder, about 85 tokens, naming this project's rule files by path: check `_ai/FIXES.md` before editing (with the number of fix records), keep `_ai/INDEX.md` within its budget, record finished work in `_ai/UPDATES.md`. It also says "read `_ai/INDEX.md` first" while the chat has not done so, and repeats anything the last turn left open. Claude and Codex: `UserPromptSubmit`; Gemini: `BeforeAgent`; Antigravity: `PreInvocation`, once per turn.
+3. At every turn end it reads what the agent did from the agent's own chat file, with the same readers as the chat log (no model is asked), and checks it against those files. Hard rules: files changed while `_ai/INDEX.md` was never read (an entry file with an `@_ai/INDEX.md` line, as Claude's and Gemini's are, loads it, which counts as read); a file that a fix record protects (`affected_paths` in `_ai/fixes/FIX-*.md`) changed with no `check-fixes.py --path` for it and no read of `_ai/FIXES.md` or of the record; `_ai/INDEX.md` changed and over its budget. Notes: work not yet in `_ai/UPDATES.md`, a generated rule file edited, a file written outside the project (Claude's memory folder counts; temp folders do not), every skill read at once. The fix records are read as `check-fixes.py` reads them; no project script is run.
+4. A hard rule broken in this turn sends the agent back, once per turn, with what is wrong and the command to run (Claude and Codex: `block`; Gemini: `deny`; Antigravity: `continue`). The agent fixes it or says why the rule does not apply, and the turn ends. Notes never send it back. `rules report` in `~/.config/agents/settings` stops the sending back; `rules off` stops the reminder and the check too.
+5. The pane header shows the result after the figures: `✓ rules`, `△ N notes` or `✗ N rules`. Each finding is a line in `<project>/logs/acf/rules.log`; `afc-rules show` lists them.
+6. Not seen: files changed by shell commands (`sed -i`, `cat >`, a script) and by Claude's sub-agents. A hook that fails, or takes over 20 seconds, lets the turn go on. A first check reads the whole chat file (under a second for the largest chat here, 74 MB); after that only what is new.
+7. Setting up: `afc-rules install` adds the hooks to `~/.claude/settings.json`, `~/.codex/config.toml`, `~/.gemini/settings.json` and `~/.gemini/config/hooks.json`; every account shares those files through links. Agents pick the hooks up when they next start. Codex runs a new hook only after you trust it once: `/hooks` in a Codex pane.
 
 ### 4 · The output
 
@@ -231,7 +250,8 @@ What a turn leaves behind, and where.
 | Tab signals | the tab's name in the bottom bar: underlined while an agent works, blinking when one is done or waiting | Claude's hooks or the watcher, then `agents --mark` |
 | Notifications | the desktop, when an agent is done or waiting and you are not looking at its tab | `agents --mark`, then `agents --notify` |
 | Figures | the pane header and the bottom bar: tool, account, model, effort, tokens, cost, plan limits, fleet memory | `afc-statusline` or `afc-agent-info`, then `afc-bar` |
-| The chat log | `<project>/logs/acf/`: `acf.db` and one `.md` file per thread, secrets redacted | `afc-logs` |
+| The chat log | `<project>/logs/acf/acf.db`, one file per project, secrets redacted | `afc-logs` |
+| The rule check | TokenOps projects: a reminder with each prompt; at the turn end the pane header (`✓ rules`, `△ N notes`, `✗ N rules`), `<project>/logs/acf/rules.log`, and for a broken hard rule the agent sent back to fix it | the tools' hooks, then `afc-rules` |
 
 ## What is in this folder
 
@@ -245,6 +265,7 @@ What a turn leaves behind, and where.
 | `bin/afc-agent-info` | | the same facts for Codex, Gemini and Antigravity, read from their own chat records |
 | `bin/claude-usage`, `bin/llm-usage` | | plan limits per account |
 | `bin/afc-logs` | | the chat log: every thread copied into `<project>/logs/acf/`, searchable, no tokens |
+| `bin/afc-rules` | | the rule check of TokenOps projects: the reminder on each prompt, the check at each turn end, its hooks |
 | `bin/afc-min`, `bin/afc-move` | | minimise / restore, and move / merge splits |
 | `bin/afc-reflow`, `bin/afc-gap` | | make Claude redraw after a resize, and close the gap its pop-ups leave |
 | `bin/afc-longcopy`, `bin/afc-model-menu` | | long copy, and the Alt+M menu |
@@ -259,7 +280,8 @@ What a turn leaves behind, and where.
 | `config/alacritty/` | copy: `~/.config/alacritty/` | the terminal the fleet window runs in |
 | `config/claude/`, `config/gemini/` | | only the fleet's keys from those tools' settings, to merge by hand |
 | `share/` | link: `~/.local/share/` | the desktop launcher, the window-raise script, the no-browser stand-ins |
-| `_tools/` | | `collect.sh`, `install.sh`, `build-tmux.sh`, `test-fleet.sh` |
+| `lib/afc/` | link: `~/.local/lib/afc/` | shared pieces: `mac.sh` and `macproc.py`, what the programs read instead of `/proc` on a Mac |
+| `_tools/` | | `collect.sh`, `install.sh`, `build-tmux.sh`, `test-fleet.sh`, `test-rules.sh`, `test-wsl.sh`, `server-setup.sh`, `mac-setup.sh`, `windows-setup.sh` |
 | `logs/acf/` | | this folder's own chat log, written by `afc-logs` when an agent works here (raw transcripts: they name the real account) |
 
 Not here, on purpose: sign-ins, other projects' chats and logs, and the built tmux program (it is rebuilt from `tmux/` and stays on the home disk, so tmux itself starts even without this drive).
@@ -288,6 +310,22 @@ bash _tools/build-tmux.sh
 It takes about a minute, installs into `~/.local/opt/tmux-3.8`, and keeps the previous program beside the new one. Add `--prefix <folder>` to try a build without touching the installed one. A running fleet only picks up a new build after a restart.
 
 To change tmux itself: unpack the source, apply the patch, edit, then write the new differences back to `tmux/afc-tmux-3.8.patch` (same `orig/tmux-3.8/…` and `src/tmux-3.8/…` path style, applied with `patch -p2`) and run the build script.
+
+## On other machines
+
+The fleet was written for this Kubuntu workstation. Two other kinds of machine run it, each with one script that sets the whole thing up:
+
+| Machine | Set-up | What it does not get |
+|---|---|---|
+| **Ubuntu server, no desktop** | `bash _tools/server-setup.sh` | the desktop launcher and keep-awake. Everything else is there, budget included, sized for that machine. Sign in over SSH: the agents print a link, you open it on your own computer and paste the code back. Tried end to end on fresh 24.04 and 26.04. |
+| **Mac** (Apple silicon or Intel) | `bash _tools/mac-setup.sh` | the budget (`agents.slice`, `autonice`, `jobq` are cgroups and systemd), keep-awake, desktop notifications, and the plan limits in the pane headers — Claude keeps its sign-in in the Keychain there, not in a file the fleet can read. |
+| **Windows 10/11** | `bash _tools/windows-setup.sh`, inside WSL | keep-awake (Windows decides when it sleeps, and the agents sleep with it), and the "Open the tab" button on a notification. |
+
+All three leave sign-ins and the agents themselves alone, and skip every step already done, so running them again is safe. `--dry-run` says what they would do and changes nothing.
+
+**Windows** needs the least code and the most explaining. tmux is not a Windows program and the fleet is a tmux program, so there is nothing to port: it runs in WSL2, which is real Linux on the same PC, with the budget, the units and `/proc` all as they are here. Only the four things that reach *outside* Linux change, and each goes to Windows itself: the clipboard (`Get-Clipboard`, or `xclip` when WSLg is there, which is quicker), notifications (a Windows toast), Alt+N (Windows' folder dialog) and the Agents window (Windows Terminal, where `windows-setup.sh` adds a "Fleet" profile). Those calls hand PowerShell the command base64-encoded as UTF-16LE, so a project path with a quote or a space in it never meets Windows' quoting rules. Two things to know: WSL only runs systemd when `/etc/wsl.conf` says `[boot] systemd=true`, and turning that on needs `wsl --shutdown` from a Windows window — the setup script writes the line and then stops to tell you. And keep projects in the Linux home folder: one under `/mnt/c` makes every file an agent reads cross between Windows and Linux, which is several times slower. `agents --doctor` has a Windows section that checks all of this.
+
+A Mac differs enough to need three pieces of its own. Its bash is 3.2 and the programs want 4, so `lib/afc/mac.sh` starts them again under Homebrew's bash and makes the GNU tools answer to their plain names *inside* the programs — the agents in the panes keep the Mac's own tools. There is no `/proc`, so `bin/afc-procfs` writes the handful of files the programs read there (`comm`, `cmdline`, `cwd`, open files, and only the few environment variables the fleet asks for — never the whole environment, which may hold keys) into a snapshot folder under `$TMPDIR`, from `libproc` and `sysctl` through `lib/afc/macproc.py`. And two agents are called something else there: Claude's program is `claude.exe`, Antigravity's is `antigravity`. In Terminal, turn on Settings → Profiles → Keyboard → "Use Option as Meta key", or none of the Alt keys reach tmux.
 
 ## Things that will bite
 

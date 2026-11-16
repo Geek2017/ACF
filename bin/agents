@@ -27,6 +27,56 @@
 #               ~/.config/agents/accounts-agy    — one per line: <name> <HOME folder for Antigravity> (~ = default; see tool_share)
 set -euo pipefail
 
+# Linux tells the fleet about a process through /proc. A Mac has none: lib/afc/mac.sh (read on macOS
+# only) points PROC at files that afc-procfs writes instead, and "pf <pid>..." has them written
+# afresh, so pf comes right before each read. It also brings Homebrew's bash and GNU tools.
+MAC=""; PROC=/proc
+pf() { :; }
+p_comm() { cat "/proc/$1/comm" 2>/dev/null; }        # pid -> its short name (claude, codex, node ...)
+p_age() { ps -o etimes= -p "$1" 2>/dev/null; }       # pid -> the seconds it has been running
+# Windows: the fleet runs in WSL2, which IS Linux (bash, /proc, systemd), so only the four things
+# that reach the desktop differ. They go through Windows' own programs: see win() below.
+WSL=""; PS=""
+if [[ "$OSTYPE" == darwin* ]]; then . "$HOME/.local/lib/afc/mac.sh"
+elif [[ -n "${WSL_DISTRO_NAME:-}" ]] ||
+     { read -r _osr < /proc/sys/kernel/osrelease 2>/dev/null && [[ "$_osr" == *[Mm]icrosoft* ]]; }; then
+  # (read, not grep: this runs on every hook, and a fork each time would be felt)
+  WSL=1
+  # PowerShell 5.1 (powershell.exe) first: it runs single-threaded-apartment, which the folder
+  # dialog needs. pwsh.exe does for everything else.
+  PS=$(command -v powershell.exe 2>/dev/null || command -v pwsh.exe 2>/dev/null || true)
+fi
+
+win() {
+  # Run a PowerShell command on Windows and give back what it printed, without its CR line ends.
+  #   win <powershell> [seconds to wait]
+  # The command is handed over base64-encoded UTF-16LE (-EncodedCommand): that way Windows' own
+  # quoting rules never see it, so a project path with a space or a quote in it cannot break out.
+  [[ -n "$PS" ]] || return 1
+  local b
+  b=$(printf '%s' "$1" | iconv -f UTF-8 -t UTF-16LE 2>/dev/null | base64 -w0) || return 1
+  timeout "${2:-10}" "$PS" -NoProfile -NonInteractive -EncodedCommand "$b" 2>/dev/null | tr -d '\r'
+}
+
+win_quote() { local s=${1//\'/\'\'}; printf "'%s'" "$s"; }   # a bash string as a PowerShell literal
+
+toast() {
+  # A Windows notification (toast), from WSL: toast <title> <body>. Windows has no notification
+  # daemon for WSL, so this goes to Windows' own. It is sent in PowerShell's name, the one app id
+  # every Windows has registered; a toast of the fleet's own would mean installing a Windows app.
+  # That is also why there is no "Open the tab" button here as there is on Linux: a button has to
+  # call back into a registered app. The tab is named in the title instead.
+  win "\$ErrorActionPreference = 'SilentlyContinue'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > \$null
+\$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+\$t = \$x.GetElementsByTagName('text')
+\$t.Item(0).AppendChild(\$x.CreateTextNode($(win_quote "$1"))) > \$null
+\$t.Item(1).AppendChild(\$x.CreateTextNode($(win_quote "$2"))) > \$null
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(
+  '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+).Show([Windows.UI.Notifications.ToastNotification]::new(\$x))" 10 >/dev/null 2>&1 || true
+}
+
 export PATH="$HOME/.local/bin:$PATH"
 SOCK="${AGENTS_SOCK:-agents}"   # AGENTS_SOCK: scratch server for tests
 SESSION=agents
@@ -68,8 +118,10 @@ has_history() {
 # Claude already open on this folder elsewhere (Konsole, desktop app) — two windows on one chat collide
 open_elsewhere() {
   local p
-  for p in $(pgrep -x claude || true); do
-    [[ "$(readlink "/proc/$p/cwd" 2>/dev/null)" == "$1" ]] && return 0
+  local all; all=$(pgrep -x 'claude(\.exe)?' || true)   # claude.exe is its name on a Mac
+  pf $all
+  for p in $all; do
+    [[ "$(readlink "$PROC/$p/cwd" 2>/dev/null)" == "$1" ]] && return 0
   done
   return 1
 }
@@ -89,6 +141,7 @@ BYPASS=--allow-dangerously-skip-permissions
 #   notify-after <seconds>   how long a turn must have taken for that                         (30)
 #   limit-warn <percent>     warn once the pane's account has used this much of a plan limit  (90)
 #   start-gap <seconds>      pause between one agent's start and the next after a restart     (2)
+#   log-md on|off            chat log: also one readable .md file per thread (read by afc-logs) (off)
 SETTINGS="${AGENTS_SETTINGS:-$HOME/.config/agents/settings}"
 setting() {  # name default -> its value
   local n v _
@@ -204,7 +257,7 @@ pane_account() {  # pane pid
     dir=$(claude_dir "$p" || true); name=$(account_name "$dir" || true)
     [[ -n "$name" ]] && { echo "$name"; return 0; }
   fi
-  dir=$(readlink "/proc/$1/cwd" 2>/dev/null || true)
+  pf "$1"; dir=$(readlink "$PROC/$1/cwd" 2>/dev/null || true)
   name=$(chat_account "$dir" || true)
   [[ -n "$name" ]] && { echo "$name"; return 0; }
   current_account
@@ -227,15 +280,16 @@ account_prefix() {  # [account]: the current one when none is given
 
 pane_agent() {  # pane-pid -> "<pid> claude|gemini|codex": the agent in that pane (a few levels below its shell)
   local pids="$1" p _
+  pf -t "$1"
   for _ in 1 2 3 4; do
     for p in $pids; do
-      case "$(cat "/proc/$p/comm" 2>/dev/null)" in
+      case "$(cat "$PROC/$p/comm" 2>/dev/null)" in
         claude) echo "$p claude"; return 0 ;;
         codex)  echo "$p codex"; return 0 ;;
         agy)    echo "$p agy"; return 0 ;;
         gemini) echo "$p gemini"; return 0 ;;
         node)   # Gemini is a node script
-                tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -qE '/bin/gemini |gemini-cli/' && { echo "$p gemini"; return 0; } ;;
+                tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null | grep -qE '/bin/gemini |gemini-cli/' && { echo "$p gemini"; return 0; } ;;
       esac
     done
     pids=$(for p in $pids; do pgrep -P "$p" || true; done)
@@ -260,7 +314,7 @@ fleet_pane_of() {  # pid -> the fleet pane it runs under (walks up its parents)
 }
 
 claude_dir() {  # claude pid -> the config folder (account) it runs on
-  local dir; dir=$(tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | tail -1 || true)
+  local dir; pf "$1"; dir=$(tr '\0' '\n' < "$PROC/$1/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | tail -1 || true)
   echo "${dir:-$HOME/.claude}"
 }
 
@@ -360,7 +414,7 @@ tool_run() {  # tool account [args...]: that agent on that account
 }
 agent_dir() {  # tool pid -> the home/config folder (account) that agent runs on
   [[ "$1" == claude ]] && { claude_dir "$2"; return; }
-  local dir; dir=$(tr '\0' '\n' < "/proc/$2/environ" 2>/dev/null | sed -n "s/^$(tool_var "$1")=//p" | tail -1 || true)
+  local dir; pf "$2"; dir=$(tr '\0' '\n' < "$PROC/$2/environ" 2>/dev/null | sed -n "s/^$(tool_var "$1")=//p" | tail -1 || true)
   echo "${dir:-$(tool_default "$1")}"
 }
 
@@ -391,9 +445,9 @@ new_tab() {  # name dir command [tmux size options, used when this tab starts th
   if fleet_up; then
     t new-window -P -F '#{window_id}' -t "$SESSION:" -n "$name" -c "$dir" "$cmd"
   # The tmux server starts inside agents.slice, so every agent and everything it runs is capped
-  elif ! systemd-run --user --scope --slice=agents.slice --quiet \
+  elif [[ -n "$MAC" ]] || ! systemd-run --user --scope --slice=agents.slice --quiet \
          tmux -L "$SOCK" new-session -d "$@" -P -F '#{window_id}' -s "$SESSION" -n "$name" -c "$dir" "$cmd"; then
-    echo "warning: could not start inside agents.slice; fleet is running uncapped" >&2
+    [[ -n "$MAC" ]] || echo "warning: could not start inside agents.slice; fleet is running uncapped" >&2   # macOS has no agents.slice
     t new-session -d "$@" -P -F '#{window_id}' -s "$SESSION" -n "$name" -c "$dir" "$cmd"
   fi
 }
@@ -462,7 +516,10 @@ scan_procs() {
   while read -r pid ppid comm; do
     [[ -n "$pid" ]] || continue
     COMM[$pid]=$comm; KIDS[$ppid]+="$pid "
-  done < <(ps -e -o pid=,ppid=,comm=)
+  done < <(if [[ -n "$MAC" ]]; then ps -ax -o pid=,ppid=,ucomm= | sed -E 's/ claude\.exe *$/ claude/; s/ antigravity *$/ agy/'
+           else ps -e -o pid=,ppid=,comm=; fi)
+  # macOS: have the files of everything in the fleet's panes written once, for the reads below
+  if [[ -n "$MAC" ]]; then pf -t $(t list-panes -a -F '#{pane_pid}' 2>/dev/null || true); fi
   for tool in "${TOOLS[@]}"; do
     while IFS=$TAB read -r name dir; do
       k="$tool$TAB$dir"; [[ -n "${ACCT[$k]:-}" ]] || ACCT[$k]=$name
@@ -479,7 +536,7 @@ scan_agent() {  # pane pid -> AP and AK: its agent's pid and kind, found as pane
     for p in $pids; do
       case "${COMM[$p]:-}" in
         claude|codex|agy|gemini) AP=$p; AK=${COMM[$p]}; return 0 ;;
-        node) args=(); mapfile -d '' args 2>/dev/null < "/proc/$p/cmdline" || true   # Gemini is a node script
+        node) args=(); mapfile -d '' args 2>/dev/null < "$PROC/$p/cmdline" || true   # Gemini is a node script
               if [[ "${args[*]} " =~ $re ]]; then AP=$p; AK=gemini; return 0; fi ;;
       esac
       next+="${KIDS[$p]:-}"
@@ -491,14 +548,14 @@ scan_agent() {  # pane pid -> AP and AK: its agent's pid and kind, found as pane
 
 proc_env() {  # pid, variable -> PV: its value in that process's environment (the last one, as claude_dir takes it)
   local -a env; local e
-  PV=""; env=(); mapfile -d '' env 2>/dev/null < "/proc/$1/environ" || true
+  PV=""; env=(); mapfile -d '' env 2>/dev/null < "$PROC/$1/environ" || true
   for e in "${env[@]}"; do [[ "$e" == "$2="* ]] && PV=${e#*=}; done
   return 0
 }
 
 arg_after() {  # pid, word -> PV: the argument that follows that word on the process's command line
   local -a args; local i
-  PV=""; args=(); mapfile -d '' args 2>/dev/null < "/proc/$1/cmdline" || true
+  PV=""; args=(); mapfile -d '' args 2>/dev/null < "$PROC/$1/cmdline" || true
   for ((i = 0; i + 1 < ${#args[@]}; i++)); do
     if [[ "${args[i]}" == "$2" ]]; then PV=${args[i + 1]}; return 0; fi
   done
@@ -514,7 +571,7 @@ agent_open() {  # agent pid, pattern -> OF: a file matching it that the agent, o
       while read -r line; do
         line=${line##* -> }
         if [[ "$line" =~ $2 ]]; then OF=$line; return 0; fi
-      done < <(ls -l "/proc/$p/fd" 2>/dev/null)
+      done < <(ls -l "$PROC/$p/fd" 2>/dev/null)
       next+="${KIDS[$p]:-}"
     done
     pids=$next; [[ -n "$pids" ]] || break
@@ -529,14 +586,14 @@ pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its
     p=$AP; kind=$AK
     proc_env "$p" "$(tool_var "$kind")"; dir=${PV:-$(tool_default "$kind")}
     k="$kind$TAB$dir"; acct=${ACCT[$k]:-}
-    cwd=$(readlink "/proc/$p/cwd" 2>/dev/null || true)
+    cwd=$(readlink "$PROC/$p/cwd" 2>/dev/null || true)
     case "$kind" in
       claude) rec=""; IFS= read -r -d '' rec 2>/dev/null < "$dir/sessions/$p.json" || true   # Claude's own record of this run
               re='"sessionId"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_-]+)"'
               if [[ "$rec" =~ $re ]]; then chat=${BASH_REMATCH[1]}
               # No record yet and the agent is under two minutes old: it is still starting. Saving now would
               # write this split down without its chat, so the whole save waits for the next look.
-              elif (( $(ps -o etimes= -p "$p" 2>/dev/null || echo 999) < 120 )); then return 1
+              elif (( $(p_age "$p" || echo 999) < 120 )); then return 1
               else arg_after "$p" --resume; chat=$PV; fi
               arg_after "$p" --permission-mode; [[ "$PV" == plan ]] && mode=p ;;
       # A resumed Codex or Antigravity opens its record only at its next turn; until then the id is on its command line
@@ -574,13 +631,13 @@ pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its
     # from the record each keeps (activity). Which pane, which agent, which file:
     if [[ "$kind" == codex || "$kind" == agy || ( "$kind" == gemini && -z "$GEMINI_HOOKED" ) ]]; then TRK[$3]="$kind$TAB$p$TAB$rf"; fi
   else
-    kind=term; cwd=$(readlink "/proc/$1/cwd" 2>/dev/null || true)
+    kind=term; cwd=$(readlink "$PROC/$1/cwd" 2>/dev/null || true)
     # No agent, but the pane's own command is still the launcher, not yet the shell it ends in: an
     # agent that waits its turn after a restart (start_wait), or one between two lines of its start.
     # It is not a terminal, so the save waits. Ten minutes on, it is taken for what it looks like.
-    args=(); mapfile -d '' args 2>/dev/null < "/proc/$1/cmdline" || true
+    args=(); mapfile -d '' args 2>/dev/null < "$PROC/$1/cmdline" || true
     if [[ " ${args[*]} " == *" --pane "* || "${args[*]}" == *"claude "*"exec bash"* ]] &&
-       (( $(ps -o etimes= -p "$1" 2>/dev/null || echo 999) < 600 )); then return 1; fi
+       (( $(p_age "$1" || echo 999) < 600 )); then return 1; fi
   fi
   [[ "$acct" =~ ^[A-Za-z0-9_.-]+$ ]] || acct=-
   [[ "$chat" =~ ^[A-Za-z0-9_.-]+$ && "$chat" != -* ]] || chat=-
@@ -649,7 +706,7 @@ usage_top() {  # "S92% W30%! O5%" -> 92: the higher of session and week
   echo $(( s > w ? s : w ))
 }
 
-chat_log() {  # agent kind, agent pid, pane pid, folder -> the file afc-logs keeps of that agent's chat (brought up to date first)
+chat_log() {  # agent kind, agent pid, pane pid, folder -> a readable file of that agent's chat, from the chat log (brought up to date first)
   local chat="" out
   case "$1" in
     claude) chat=$(jq -r '.sessionId // empty' "$(claude_dir "$2")/sessions/$2.json" 2>/dev/null || true) ;;
@@ -657,7 +714,8 @@ chat_log() {  # agent kind, agent pid, pane pid, folder -> the file afc-logs kee
   esac
   [[ "$chat" =~ ^[A-Za-z0-9_.-]+$ ]] || return 0
   "$HOME/.local/bin/afc-logs" run --force >/dev/null 2>&1 || true
-  { cd "$4" 2>/dev/null && "$HOME/.local/bin/afc-logs" show "$chat" 2>/dev/null || true; } | sed -n '1s/^(file: \(.*\))$/\1/p'
+  # the log is one database per project; `afc-logs file` writes this one chat out of it and prints the path
+  { cd "$4" 2>/dev/null && "$HOME/.local/bin/afc-logs" file "$chat" 2>/dev/null || true; } | head -n 1
 }
 
 # Every agent of the fleet, one line each, tab-separated: tab number (min = minimised), tab name, window
@@ -706,9 +764,10 @@ activity() {
   printf x > "$1"
   for id in "${!TRK[@]}"; do
     IFS=$TAB read -r kind p rf <<< "${TRK[$id]}"
-    if [[ ! -d "/proc/$p" ]]; then unset "TRK[$id]"; continue; fi
+    if ! kill -0 "$p" 2>/dev/null; then unset "TRK[$id]"; continue; fi
     if [[ -z "$rf" ]]; then   # no record yet: Codex opens one at its first turn
       [[ "$kind" == codex ]] || continue
+      pf -t "$p"
       agent_open "$p" '/sessions/.*rollout-[^/]*\.jsonl$'; [[ -n "$OF" ]] || continue
       rf=$OF; TRK[$id]="$kind$TAB$p$TAB$rf"
     fi
@@ -759,7 +818,7 @@ chat_open() {  # Claude chat id -> true when a running Claude has that chat open
     for f in "$dir"/sessions/*.json; do
       [[ -e "$f" ]] || continue
       p=${f##*/}; p=${p%.json}
-      [[ "$(cat "/proc/$p/comm" 2>/dev/null)" == claude ]] || continue
+      [[ "$(p_comm "$p")" == claude ]] || continue
       [[ "$(jq -r '.sessionId // empty' "$f" 2>/dev/null)" == "$1" ]] && return 0
     done
   done < <(account_list)
@@ -878,8 +937,27 @@ case "${1:-}" in
   --pick)
     start="${2:-${AGENTS_PICK_DIR:-/media/jmg/MyDrive/Codebase/\$\$AFocus}}"
     [[ -d "$start" ]] || start="$HOME"
+    if [[ -n "$MAC" ]]; then   # macOS: Finder's own folder dialog
+      dir=$(osascript -e 'POSIX path of (choose folder with prompt "Add a project to the fleet (New Folder button = new project)")' 2>/dev/null) || exit 0
+      dir=${dir%/}
+    elif [[ -n "$WSL" ]] && ! command -v kdialog >/dev/null; then   # Windows: its own folder dialog
+      w=$(wslpath -w "$start" 2>/dev/null || true)
+      got=$(win "Add-Type -AssemblyName System.Windows.Forms
+\$d = New-Object Windows.Forms.FolderBrowserDialog
+\$d.Description = 'Add a project to the fleet (New Folder button = new project)'
+\$d.ShowNewFolderButton = \$true
+\$d.SelectedPath = $(win_quote "$w")
+if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
+      [[ -n "$got" ]] || exit 0
+      dir=$(wslpath -u "$got" 2>/dev/null) || exit 0
+      case "$dir" in /mnt/[a-z]/*)
+        echo "That folder is on Windows ($got). Agents there are slow, because every file crosses" >&2
+        echo "between Windows and Linux. Keep projects inside WSL (under $HOME) instead." >&2 ;;
+      esac
+    else
     dir=$(kdialog --title "Add a project to the fleet (New Folder button = new project)" \
                   --getexistingdirectory "$start" 2>/dev/null) || exit 0
+    fi
     [[ -n "$dir" ]] || exit 0
     out=$("$0" --add "$dir" 2>&1) || { fleet_up && t display-message "agents: $out"; exit 1; }
     fleet_up && t display-message "${out//$'\n'/ — }"
@@ -903,7 +981,7 @@ case "${1:-}" in
     # never from a tmux format — tmux re-parses "$$" in paths (Codebase/$$AFocus -> Codebase/$),
     # which used to drop splits into $HOME. Usage: agents --pane <what> <source-pane-pid>, <what> being
 # claude|plan|bypass, gemini|gemini-plan|gemini-bypass, codex|codex-plan|codex-bypass, term or tab
-    dir=$(readlink "/proc/${3:-0}/cwd" 2>/dev/null || true)
+    pf "${3:-0}"; dir=$(readlink "$PROC/${3:-0}/cwd" 2>/dev/null || true)
     [[ -d "$dir" ]] || dir="$PWD"   # source pane gone: stay where tmux started us
     cd "$dir"
     [[ "${2:-}" == tab ]] && tmux rename-window -t "${TMUX_PANE:-}" "$(basename "$dir")" 2>/dev/null || true
@@ -1005,6 +1083,25 @@ case "${1:-}" in
     # which is Claude's own image paste; text is pasted as text (bracketed, as if typed).
     # Usage: agents --paste <pane-id> <tmux-socket-path>  (the binding passes both)
     pane="${2:?pane id}"; sock="${3:?socket path}"; ts() { tmux -S "$sock" "$@"; }
+    if [[ -n "$MAC" ]]; then   # macOS: osascript says what kind of thing is on the clipboard, pbpaste gives its text
+      if osascript -e 'clipboard info' 2>/dev/null | grep -qE 'PNGf|TIFF|JPEG|GIFf'; then ts send-keys -t "$pane" C-v
+      elif pbpaste 2>/dev/null | ts load-buffer -b fleet-paste - 2>/dev/null; then ts paste-buffer -p -d -b fleet-paste -t "$pane"
+      else ts send-keys -t "$pane" C-v; fi
+      exit 0
+    fi
+    if [[ -n "$WSL" ]] && { [[ -z "${DISPLAY:-}" ]] || ! command -v xclip >/dev/null; }; then
+      # Windows, with no WSLg X clipboard to read: ask Windows itself. (With WSLg, xclip below
+      # reads the same clipboard and is far quicker than starting PowerShell.)
+      if [[ -n "$(win 'if ((Get-Clipboard -Format Image) -ne $null) { "image" }' 5)" ]]; then
+        ts send-keys -t "$pane" C-v
+      else
+        txt=$(win 'Get-Clipboard -Raw' 5)   # $( ) drops the newline PowerShell adds, which would send the prompt
+        if [[ -n "$txt" ]] && printf '%s' "$txt" | ts load-buffer -b fleet-paste - 2>/dev/null; then
+          ts paste-buffer -p -d -b fleet-paste -t "$pane"
+        else ts send-keys -t "$pane" C-v; fi
+      fi
+      exit 0
+    fi
     if timeout 1 xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -q '^image/'; then
       ts send-keys -t "$pane" C-v
     elif timeout 1 xclip -selection clipboard -o 2>/dev/null | ts load-buffer -b fleet-paste - 2>/dev/null; then
@@ -1069,7 +1166,7 @@ case "${1:-}" in
         if [[ "$2" == done ]]; then
           # Walk up from this hook to the claude process; its Bash-tool shells are its direct children
           c=$PPID
-          while (( c > 1 )) && [[ "$(cat "/proc/$c/comm" 2>/dev/null)" != claude ]]; do
+          while (( c > 1 )) && [[ "$(p_comm "$c")" != claude ]]; do
             c=$(ps -o ppid= -p "$c" 2>/dev/null | tr -d ' '); c=${c:-1}   # not /proc/<pid>/stat: "tmux: server" has a space
           done
           if (( c > 1 )) && pgrep -P "$c" -f '/\.claude/shell-snapshots/' >/dev/null; then
@@ -1173,7 +1270,8 @@ case "${1:-}" in
           "Plain terminal"                   t "$(split term)"
         ) ;;
       wt)
-        git -C "$(readlink "/proc/$pid/cwd" 2>/dev/null || echo /)" rev-parse --git-dir >/dev/null 2>&1 ||
+        pf "$pid"
+        git -C "$(readlink "$PROC/$pid/cwd" 2>/dev/null || echo /)" rev-parse --git-dir >/dev/null 2>&1 ||
           { t display-message -d 4000 "This folder is not a git project, so a split cannot get a work folder of its own here"; exit 0; }
         title="Own work folder (a git worktree on a new branch)"
         items=("Claude" c "$(split wt-claude)" "Gemini" g "$(split wt-gemini)" "Codex" x "$(split wt-codex)"
@@ -1269,7 +1367,7 @@ case "${1:-}" in
       elif [[ "$kind" == "$to" && "$(agent_dir "$to" "$p")" == "$tdir" ]]; then
         t display-message "This agent is already $who"; exit 0
       fi
-      cwd=$(readlink "/proc/$p/cwd")
+      pf "$p"; cwd=$(readlink "$PROC/$p/cwd")
       # Another tool takes over. Chats do not carry over between tools, so the agent can be handed
       # this one instead: it is started with a single instruction, to read the log afc-logs keeps of
       # this chat (secrets already taken out) and say where the work stands. That costs the new agent
@@ -1334,7 +1432,7 @@ case "${1:-}" in
     # Usage: agents --notify <pane id> <done|wait> <seconds the turn took>
     set +e
     pane="${2:?pane id}"; kind="${3:-done}"; took="${4:-0}"; [[ "$took" =~ ^[0-9]+$ ]] || took=0
-    command -v notify-send >/dev/null || exit 0
+    command -v notify-send >/dev/null || [[ -n "$WSL" && -n "$PS" ]] || exit 0
     IFS=$TAB read -r win wname pid old from < <(t display -p -t "$pane" "#{window_id}$TAB#{?window_name,#{window_name},-}$TAB#{pane_pid}$TAB#{?#{@note},#{@note},0}$TAB#{?#{@min_from},#{@min_from},-}")
     [[ -n "$pid" ]] || exit 0
     who=$("$HOME/.local/bin/agents" --who "$pid" 2>/dev/null)   # "claude <account>", "codex <account>", "codex", or nothing
@@ -1349,7 +1447,9 @@ case "${1:-}" in
             [[ "$(setting notify-done on)" == on ]] && (( took >= after )) || send=0
             title="$wname: done"; body="$name finished after $(dur "$took")." ;;
     esac
-    if (( send )); then
+    if (( send )) && [[ -n "$WSL" ]] && ! command -v notify-send >/dev/null; then
+      toast "$title" "$body"
+    elif (( send )); then
       {
         read -r id; [[ "$id" =~ ^[0-9]+$ ]] && t set -p -t "$pane" @note "$id" 2>/dev/null   # the next one replaces this one
         read -r action
@@ -1375,7 +1475,8 @@ case "${1:-}" in
           done < <(tool_accounts "$tool")
           msg="$(tool_label "$tool") / $(label_of "$acct") has used $use of its plan limits"
           hint="Alt+G moves an agent to another account."; [[ -n "$best" ]] && hint="Most room: $best. Alt+G moves an agent there."
-          notify-send -a "Agentic CLI Fleet" -i dialog-warning -t 30000 "$msg" "$hint" 2>/dev/null
+          if [[ -n "$WSL" ]] && ! command -v notify-send >/dev/null; then toast "$msg" "$hint"
+          else notify-send -a "Agentic CLI Fleet" -i dialog-warning -t 30000 "$msg" "$hint" 2>/dev/null; fi
           t display-message -d 6000 "$msg. $hint" 2>/dev/null
         fi
       fi
@@ -1419,7 +1520,10 @@ case "${1:-}" in
     # and a branch that is not merged.
     prune=0; [[ "${2:-}" == --prune ]] && prune=1
     inuse=""
-    if fleet_up; then inuse=$(for p in $(t list-panes -a -F '#{pane_pid}' 2>/dev/null || true); do readlink "/proc/$p/cwd" 2>/dev/null || true; done); fi
+    if fleet_up; then
+      panes=$(t list-panes -a -F '#{pane_pid}' 2>/dev/null || true); pf $panes
+      inuse=$(for p in $panes; do readlink "$PROC/$p/cwd" 2>/dev/null || true; done)
+    fi
     found=0; gone=()
     while IFS=$'\t' read -r name dir <&3; do
       git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || continue
@@ -1463,7 +1567,10 @@ case "${1:-}" in
     here=$(dirname "$(readlink -f "$HOME/.local/bin/agents")"); miss=""; nprog=0
     for f in "$here"/*; do
       [[ -f "$f" ]] || continue
-      b=${f##*/}; nprog=$((nprog + 1))
+      b=${f##*/}
+      if [[ -n "$MAC" && " autonice jobq keepawake-agents " == *" $b "* ]]; then continue; fi   # the resource guard is Linux only
+      if [[ -n "$WSL" && "$b" == keepawake-agents ]]; then continue; fi                        # WSL has no screen to keep awake
+      nprog=$((nprog + 1))
       if [[ ! -x "$HOME/.local/bin/$b" ]]; then miss+=" $b"; fi
     done
     if [[ -z "$miss" ]]; then ok "$nprog programs of $here are in ~/.local/bin"; else no "not in ~/.local/bin, or not executable:$miss" "bash _tools/install.sh --apply sets the links"; fi
@@ -1474,8 +1581,19 @@ case "${1:-}" in
       if [[ "$(readlink -f "$(command -v tmux)")" == */.local/opt/tmux-3.8/* ]]; then ok "$(tmux -V), the patched build"
       else note "$(tmux -V) from $(command -v tmux): not the patched build, so no thin scrollbar, header buttons or hover"; fi
     else no "tmux is not installed"; fi
-    for c in jq flock git python3 ps systemd-run; do command -v "$c" >/dev/null || no "$c is not installed: the fleet needs it"; done
-    for c in notify-send xclip kdialog; do command -v "$c" >/dev/null || note "$c is not installed ($(case $c in notify-send) echo 'no desktop notifications' ;; xclip) echo 'no Ctrl+V paste, no mouse copy' ;; *) echo 'no Alt+N folder picker' ;; esac))"; done
+    for c in jq flock git python3 ps $([[ -n "$MAC" ]] || echo systemd-run); do command -v "$c" >/dev/null || no "$c is not installed: the fleet needs it"; done
+    if [[ -n "$WSL" ]]; then
+      for c in notify-send xclip kdialog; do
+        command -v "$c" >/dev/null && continue
+        case "$c" in
+          notify-send) [[ -n "$PS" ]] && note "notifications go to Windows' own (no $c here), so they have no \"Open the tab\" button" || no "no notifications: neither notify-send nor powershell.exe" ;;
+          xclip)       [[ -n "$PS" ]] && note "Ctrl+V reads Windows' clipboard through PowerShell (no $c here), which takes about a second; apt install xclip makes it instant under WSLg" || no "no Ctrl+V paste: neither xclip nor powershell.exe" ;;
+          *)           [[ -n "$PS" ]] && note "Alt+N opens Windows' folder dialog (no $c here)" || no "no Alt+N folder picker: neither kdialog nor powershell.exe" ;;
+        esac
+      done
+    else
+    for c in $([[ -n "$MAC" ]] || echo notify-send xclip kdialog); do command -v "$c" >/dev/null || note "$c is not installed ($(case $c in notify-send) echo 'no desktop notifications' ;; xclip) echo 'no Ctrl+V paste, no mouse copy' ;; *) echo 'no Alt+N folder picker' ;; esac))"; done
+    fi
     for tool in "${TOOLS[@]}"; do command -v "$(tool_bin "$tool")" >/dev/null || note "$(tool_label "$tool") is not installed ($(tool_bin "$tool"))"; done
     echo "Hooks"
     cs="$HOME/.claude/settings.json"
@@ -1490,16 +1608,43 @@ case "${1:-}" in
     else no "~/.claude/settings.json is missing"; fi
     if grep -qs 'agents --mark' "$HOME/.gemini/settings.json"; then ok "Gemini: hooks call agents --mark"; else note "Gemini: no agents --mark hook in ~/.gemini/settings.json: its tab signals are estimated from its chat file, and it sends no notification"; fi
     note "Codex needs no hook (the watcher reads each turn's start and end from its session file); Antigravity's tab signals are estimated"
+    if [[ -x "$HOME/.local/bin/afc-rules" ]]; then
+      if "$HOME/.local/bin/afc-rules" doctor >/dev/null 2>&1; then ok "the rule check of TokenOps projects (afc-rules) has its hooks in all four tools"
+      else note "the rule check of TokenOps projects (afc-rules) lacks hooks in some tools: afc-rules doctor says which"; fi
+    fi
     echo "Background services"
-    for u in autonice.service keepawake-agents.service afc-logs.timer; do
+    if [[ -n "$MAC" ]]; then
+      if launchctl print "gui/$(id -u)/io.github.acf.afc-logs" >/dev/null 2>&1; then ok "the chat log runs every 15 minutes (launchd: io.github.acf.afc-logs)"
+      else no "the chat log is not scheduled" "bash _tools/mac-setup.sh sets it up (launchd)"; fi
+      note "macOS has no agents.slice: nothing caps the fleet's memory or CPU here, and autonice and keepawake are Linux only"
+    elif [[ -n "$WSL" && "$(ps -p 1 -o comm= 2>/dev/null)" != systemd ]]; then
+      no "WSL is running without systemd: nothing caps the agents, and the chat log is not scheduled" \
+         "put [boot] systemd=true in /etc/wsl.conf, then from Windows: wsl --shutdown"
+    else
+    for u in autonice.service $([[ -n "$WSL" ]] || echo keepawake-agents.service) afc-logs.timer; do
       if [[ "$(systemctl --user is-active "$u" 2>/dev/null)" == active ]]; then ok "$u is running"; else no "$u is not running" "systemctl --user enable --now $u"; fi
     done
     high=$(systemctl --user show agents.slice -p MemoryHigh --value 2>/dev/null || true)
     if [[ "$high" =~ ^[0-9]+$ ]]; then ok "agents.slice slows the fleet at $(numfmt --to=iec "$high") of memory"; else no "agents.slice has no memory limit (MemoryHigh=$high)" "its unit is config/systemd/user/agents.slice"; fi
+    fi
+    if [[ -n "$WSL" ]]; then
+      echo "Windows"
+      if [[ -n "$PS" ]]; then ok "Windows is reachable: $PS (clipboard, notifications, folder dialog)"
+      else no "no powershell.exe on the PATH: Windows interop looks turned off" \
+              "put [interop] enabled=true and appendWindowsPath=true in /etc/wsl.conf, then: wsl --shutdown"; fi
+      if command -v wt.exe >/dev/null; then ok "Windows Terminal (wt.exe): the Agents window opens in it"
+      else note "no wt.exe: the Agents window falls back to the plain console. Windows Terminal is the one that draws the fleet properly"; fi
+      # the list is "<tab-name> <folder>", and a folder may hold spaces, so drop the name and look at the rest
+      onc=$(awk '!/^[[:space:]]*#/ && NF >= 2 { sub(/^[^ \t]+[ \t]+/, ""); if ($0 ~ /^\/mnt\/[a-z]\//) n++ } END { print n + 0 }' "$LIST" 2>/dev/null || echo 0)
+      if (( onc > 0 )); then note "$onc project(s) live on a Windows drive (/mnt/...): every file read crosses between Windows and Linux, which makes agents there slow. Keeping them under $HOME is several times quicker"; fi
+      memg=$(awk '/^MemTotal:/ { printf "%.0f", $2 / 1048576 }' /proc/meminfo)
+      note "WSL has ${memg}G of this PC's memory; the budget above is a share of that. Raise it in %UserProfile%\\.wslconfig ([wsl2] memory=...), then: wsl --shutdown"
+    fi
     echo "Fleet"
     if fleet_up; then
       spid=$(t display -p '#{pid}' 2>/dev/null || true)
-      if grep -qs 'agents\.slice' "/proc/$spid/cgroup"; then ok "running, inside agents.slice"; else no "running, but NOT inside agents.slice: nothing caps it" "it has to be started by agents (from the desktop), not by tmux directly"; fi
+      if [[ -n "$MAC" ]]; then ok "running"
+      elif grep -qs 'agents\.slice' "/proc/$spid/cgroup"; then ok "running, inside agents.slice"; else no "running, but NOT inside agents.slice: nothing caps it" "it has to be started by agents (from the desktop), not by tmux directly"; fi
       if flock -n "$LAYOUT.lock" true 2>/dev/null; then no "the watcher is not running: the layout is not being saved" "it starts again at the next finished turn, or when you run agents"; else ok "the watcher is running (saved layout, tab signals for Codex and Antigravity)"; fi
       if [[ -r "$LAYOUT" ]]; then ok "layout saved $(dur $(( EPOCHSECONDS - $(stat -c %Y "$LAYOUT") ))) ago: $(grep -c '^W' "$LAYOUT") tabs, $(grep -c '^P' "$LAYOUT") splits"; else note "no saved layout yet"; fi
       if [[ ",$(t list-clients -F '#{client_flags}' 2>/dev/null | tr '\n' ',')," == *,focused,* ]]; then ok "the terminal reports focus, so notifications stay quiet while you look at a tab"
@@ -1519,7 +1664,7 @@ case "${1:-}" in
       done < <(tool_accounts "$tool")
     done
     if [[ -r "$SETTINGS" ]]; then
-      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap)$/ { printf " %s", $1 }' "$SETTINGS")
+      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap|log-md|rules)$/ { printf " %s", $1 }' "$SETTINGS")
       if [[ -n "$odd" ]]; then no "unknown names in $SETTINGS:$odd"; else ok "settings: $SETTINGS"; fi
     fi
     echo
@@ -1578,7 +1723,7 @@ case "${1:-}" in
       acct=""; [[ "$(mode "$dir")" == continue* ]] && acct=$(chat_account "$dir" || true)
       printf '  %-18s %-20s on %-8s %s\n' "$name" "$(mode "$dir")" "${acct:-$(current_account)}" "$dir"
     done 3< <(projects)
-    echo "Would start: tmux server inside agents.slice, one tab per project above."
+    echo "Would start: tmux server$(command -v systemd-run >/dev/null && [[ -z "$MAC" ]] && echo ' inside agents.slice'), one tab per project above."
     acct=$(current_account)
     echo "Account: $acct ($(account_email "$(account_dir "$acct")"))"
     if [[ -r "$LAYOUT" ]] && ! fleet_up; then
@@ -1588,6 +1733,17 @@ case "${1:-}" in
     fi
     ;;
   --window)
+    if [[ -n "$MAC" ]]; then   # macOS: the fleet is in a Terminal window; bring Terminal forward, or open one
+      if [[ -n "$(t list-clients -t "$SESSION" 2>/dev/null || true)" ]]; then osascript -e 'tell application "Terminal" to activate' >/dev/null 2>&1 || true; exit 0; fi
+      exec "$0" --new-window
+    fi
+    if [[ -n "$WSL" ]]; then   # Windows: bring the Windows Terminal window holding the fleet forward
+      if [[ -n "$(t list-clients -t "$SESSION" 2>/dev/null || true)" ]] && [[ "$(win '
+$s = New-Object -ComObject WScript.Shell
+$p = Get-Process WindowsTerminal -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($p -and $s.AppActivate($p.Id)) { "ok" }' 10)" == ok ]]; then exit 0; fi
+      exec "$0" --new-window
+    fi
     # An Agents window is already open: raise it through a one-shot KWin script instead of opening another
     if pgrep -f '^alacritty --title Agents --class Agents' >/dev/null && command -v qdbus >/dev/null; then
       js="$HOME/.local/share/agents/kwin-focus.js"
@@ -1604,6 +1760,19 @@ case "${1:-}" in
     # Not readlink -f: this file is reached through the link ~/.local/bin/agents, and its real path
     # (in the project folder) holds "$$" and spaces, which tmux and shells mangle. Use the link.
     self="$HOME/.local/bin/agents"
+    if [[ -n "$MAC" ]]; then
+      exec osascript -e "tell application \"Terminal\" to do script \"exec '$self'\"" -e 'tell application "Terminal" to activate' >/dev/null
+    fi
+    if [[ -n "$WSL" ]]; then
+      # Windows Terminal, in a window of its own. It is started from a Windows folder on purpose:
+      # from a WSL path it refuses with 0x80070002. Without it, the plain console window.
+      d="${WSL_DISTRO_NAME:-$(wslpath -w / 2>/dev/null | sed -E 's|^\\\\wsl[^\\]*\\([^\\]*).*|\1|')}"
+      cd /mnt/c 2>/dev/null || cd /
+      if command -v wt.exe >/dev/null; then
+        exec wt.exe -w new --title Agents wsl.exe -d "$d" --cd "~" -- "$self"
+      fi
+      exec cmd.exe /c start "Agents" wsl.exe -d "$d" --cd "~" -- "$self"
+    fi
     if command -v alacritty >/dev/null; then exec alacritty --title Agents --class Agents -e "$self"
     else exec konsole -e "$self"; fi
     ;;

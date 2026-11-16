@@ -36,7 +36,15 @@ HOME = os.path.expanduser("~")
 PRICES = os.environ.get("AGENTS_PRICES") or f"{HOME}/.config/agents/prices"
 
 
+MAC = sys.platform == "darwin"
+if MAC:     # no /proc on a Mac: lib/afc/macproc.py asks the system instead
+    sys.path.insert(0, os.path.join(HOME, ".local/lib/afc"))
+    import macproc
+
+
 def descendants(pid):
+    if MAC:
+        return macproc.under(pid, macproc.table(), levels=8)[1:]
     kids = {}
     for p in os.listdir("/proc"):
         if not p.isdigit():
@@ -57,6 +65,8 @@ def descendants(pid):
 
 
 def proc_env(pid):
+    if MAC:
+        return macproc.argv_env(pid)[1]
     try:
         raw = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
         return dict(x.decode(errors="replace").split("=", 1) for x in raw if b"=" in x)
@@ -66,6 +76,13 @@ def proc_env(pid):
 
 def agent_proc(pane_pid, tool):
     """(env, cwd) of the tool's process under the pane, or of the pane's shell if none is found."""
+    if MAC:     # Antigravity's program is called antigravity there, and agy is only a link to it
+        for pid in descendants(pane_pid):
+            args, env = macproc.argv_env(pid)
+            words = args[:3] + ([macproc.info(pid)[1]] if macproc.info(pid) else [])
+            if any(tool in os.path.basename(w) for w in words):
+                return env, macproc.cwd(pid)
+        return proc_env(pane_pid), macproc.cwd(pane_pid)
     for pid in descendants(pane_pid):
         try:
             cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")

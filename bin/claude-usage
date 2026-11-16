@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
 ACCOUNTS = os.environ.get("AGENTS_ACCOUNTS", f"{HOME}/.config/agents/accounts")
-CACHE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "claude-usage")
+CACHE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp", "claude-usage")   # TMPDIR: a Mac's own private one
 TTL = int(os.environ.get("CLAUDE_USAGE_TTL", "300"))
 URL = "https://api.anthropic.com/api/oauth/usage"
 PROFILE = "https://api.anthropic.com/api/oauth/profile"
@@ -38,10 +38,18 @@ def email(cfg):
     except Exception:
         return None
 
+# On a Mac Claude keeps its sign-in in the Keychain, not in .credentials.json, and this does not read
+# the Keychain. So there the plan usage cannot be asked for: the table says so, and --short prints
+# nothing (the pane header then shows the limits Claude itself reports, saved by afc-statusline).
+KEYCHAIN = "sign-in is in the Mac's Keychain: plan usage not read here"
+
+
 def token(cfg):
     try:
         o = json.load(open(f"{cfg}/.credentials.json"))["claudeAiOauth"]
     except Exception:
+        if sys.platform == "darwin" and not os.path.exists(f"{cfg}/.credentials.json"):
+            return None, KEYCHAIN
         return None, "not signed in"
     if o.get("expiresAt", 0) / 1000 < time.time():
         return None, "token expired (open claude on this account)"
@@ -152,6 +160,7 @@ def main(argv):
         if not sel: return 0
         n, c = sel[0]
         d = cached(n, c, refresh, nonblocking=True)
+        if d.get("error") == KEYCHAIN: return 0
         if d.get("error"): print(f"{n}: {d['error']}"); return 0
         s = summarize(d)
         bits = [f"S{pct(s['session'])}", f"W{pct(s['weekly'])}{'!' if (s['weekly'] or 0) >= 80 else ''}"]

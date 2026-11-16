@@ -8,9 +8,16 @@ No model is asked anything: it reads files, so it costs no tokens.
   afc-logs threads [--all] [--today] [--tool T]      list threads (this project, or every project)
   afc-logs search WORDS [--all] [--tool T] [--since YYYY-MM-DD] [--limit N]
   afc-logs show THREAD                               print one thread (id, or the start of one)
+  afc-logs file THREAD                               write one thread to a readable file, print its path
+  afc-logs prune-md [--all] [--dry-run]              remove the readable .md files of earlier runs
 
-Where it goes, per project:   <project>/logs/acf/acf.db                   searchable database
-                              <project>/logs/acf/<date>_<tool>_<words>.md one readable file per thread
+Where it goes, per project:   <project>/logs/acf/acf.db     one file: the searchable database
+With "log-md on" in ~/.config/agents/settings a readable <date>_<tool>_<words>.md is written beside
+it for every thread as well. Off by default: every sub-agent is a thread of its own, so one chat
+that starts 200 sub-agents left 200 files. `afc-logs show` prints any thread from the database.
+`afc-logs file` (used when a chat is handed to another tool) writes logs/acf/handover-<id>.md; a
+run removes those again after a day. prune-md deletes only files the database lists as its own,
+and only after the database passed a check: their text stays in acf.db.
 "Project" is the fleet project the agent ran in (~/.config/agents/projects), else the nearest
 folder above with a .git, else the folder itself. Threads run in the home folder, temp or scratch
 folders go to ~/logs/acf/. A git project gets "logs/acf/" added to its .gitignore.
@@ -38,8 +45,25 @@ LIST = os.environ.get("AFC_LOGS_LIST") or f"{CFG}/log-projects"
 HOME_PROJECT = os.environ.get("AFC_LOGS_HOME") or HOME
 SUB = "logs/acf"
 BUSY = 85
-NOT_PROJECTS = ("/tmp", "/run", "/var", "/proc", "/dev", f"{HOME}/.cache", f"{HOME}/.config",
-                f"{HOME}/.local", f"{HOME}/.claude")
+KEEP_HANDOVER = 86400      # seconds a file written by `afc-logs file` stays
+
+
+def setting(name, default):
+    """A "name value" line of the fleet's settings file, read the way `agents` reads it."""
+    try:
+        with open(os.environ.get("AGENTS_SETTINGS") or f"{CFG}/settings", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == name:
+                    return parts[1]
+    except OSError:
+        pass
+    return default
+
+
+MD = setting("log-md", "off") == "on"      # also one readable .md file per thread
+NOT_PROJECTS = ("/tmp", "/run", "/var", "/proc", "/dev", "/private", "/mnt/wsl", "/mnt/wslg",
+                f"{HOME}/Library", f"{HOME}/.cache", f"{HOME}/.config", f"{HOME}/.local", f"{HOME}/.claude")
 
 # ---------------------------------------------------------------------------------------------
 # secrets
@@ -387,7 +411,10 @@ class Store:
             first = next((l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith(NOTES)), "")
             if first:
                 self.thread(tid, title_if_empty=first[:90])
-        self.md(tid, ts).write(md_entry(ts, kind, who, model, text))
+        if MD:
+            self.md(tid, ts).write(md_entry(ts, kind, who, model, text))
+        elif ts:
+            self.thread(tid, first_ts=ts)      # md() used to note the thread's start
 
     def clear(self, tid):
         """Remove a thread's entries (for tools whose files are rewritten, not appended)."""
@@ -434,12 +461,7 @@ class Store:
             new = not os.path.exists(os.path.join(self.dir, name))
         f = open(os.path.join(self.dir, name), "a", encoding="utf-8")
         if new and row:
-            f.write(f"# {row[4] or tid}\n\n"
-                    f"- thread: `{tid}`{f' (inside `{row[6]}`)' if row[6] else ''}\n"
-                    f"- tool: {row[1]}, account: {row[2]}\n- folder: `{row[3] or ''}`\n"
-                    f"- started: {local(row[5])}\n\n"
-                    "Copied by afc-logs from the tool's own files; secrets replaced by [redacted]. "
-                    "Model, tokens and cost: `afc-logs threads`.\n\n---\n")
+            f.write(md_head(tid, row[1], row[2], row[3], row[4], row[5], row[6]))
         self.md_handles[tid] = f
         return f
 
@@ -506,6 +528,25 @@ LABEL = {"user": "You", "assistant": "AI", "thinking": "Thinking", "tool_call": 
 def fence(text):
     run = max((len(m) for m in re.findall(r"`{3,}", text)), default=2)
     return "`" * (run + 1)
+
+
+def md_head(tid, tool, account, cwd, title, first_ts, parent):
+    return (f"# {title or tid}\n\n"
+            f"- thread: `{tid}`{f' (inside `{parent}`)' if parent else ''}\n"
+            f"- tool: {tool}, account: {account}\n- folder: `{cwd or ''}`\n"
+            f"- started: {local(first_ts)}\n\n"
+            "Copied by afc-logs from the tool's own files; secrets replaced by [redacted]. "
+            "Model, tokens and cost: `afc-logs threads`.\n\n---\n")
+
+
+def write_thread(db, tid, out):
+    """One thread, as its readable file would hold it, from the database."""
+    row = db.execute("SELECT tool, account, cwd, title, first_ts, parent FROM threads WHERE id=?", (tid,)).fetchone()
+    if row:
+        out.write(md_head(tid, *row))
+    for ts, kind, who, model, text in db.execute(
+            "SELECT ts, kind, who, model, text FROM entries WHERE thread=? ORDER BY id", (tid,)):
+        out.write(md_entry(ts, kind, who, model, text))
 
 
 def md_entry(ts, kind, who, model, text):
@@ -1025,6 +1066,10 @@ def src_cwd(src):
 # run
 
 def machine_busy():
+    if sys.platform == "darwin":        # no /proc: the load over the last minute against the cores
+        c = min(100, int(100 * os.getloadavg()[0] / (os.cpu_count() or 1)))
+        return (c, 0) if c >= BUSY else None
+
     def cpu():
         with open("/proc/stat") as f:
             v = [int(x) for x in f.readline().split()[1:]]
@@ -1110,6 +1155,13 @@ def run(dry=False, force=False):
         s.close()
     if not dry:
         save_state(state_file, state)
+        for p in all_projects():
+            for f in glob.glob(os.path.join(glob.escape(os.path.join(p, SUB)), "handover-*.md")):
+                try:
+                    if time.time() - os.path.getmtime(f) > KEEP_HANDOVER:
+                        os.remove(f)
+                except OSError:
+                    pass
     took = time.time() - t0
     verb = "would add" if dry else "added"
     print(f"{'DRY RUN: ' if dry else ''}{done} changed source file(s), {verb} {sum(per_tool.values())} entries in {took:.1f}s")
@@ -1280,10 +1332,8 @@ def cmd_search(args):
     return 0
 
 
-def cmd_show(args):
-    if not args:
-        print("usage: afc-logs show THREAD"); return 2
-    want = args[0]
+def find_thread(want):
+    """(project, read-only database, thread id, its .md file or None) of the newest thread matching an id or its start."""
     for p in all_projects() or [project_here()]:
         db = open_db(p)
         if not db:
@@ -1291,17 +1341,92 @@ def cmd_show(args):
         r = db.execute("SELECT id, md_file FROM threads WHERE id=? OR id LIKE ? ORDER BY last_ts DESC LIMIT 1",
                        (want, f"%:{want}%")).fetchone()
         if r:
-            if r[1] and os.path.exists(os.path.join(p, SUB, r[1])):
-                print(f"(file: {os.path.join(p, SUB, r[1])})\n")
-                sys.stdout.write(open(os.path.join(p, SUB, r[1]), encoding="utf-8").read())
-            else:
-                for ts, kind, who, model, text in db.execute(
-                        "SELECT ts, kind, who, model, text FROM entries WHERE thread=? ORDER BY id", (r[0],)):
-                    sys.stdout.write(md_entry(ts, kind, who, model, text))
-            return 0
+            # with log-md off a file left by an earlier run no longer grows: the database is the whole thread
+            md = os.path.join(p, SUB, r[1]) if MD and r[1] and os.path.exists(os.path.join(p, SUB, r[1])) else None
+            return p, db, r[0], md
         db.close()
-    print(f"no thread matching {want}")
-    return 1
+    return None
+
+
+def cmd_show(args):
+    if not args:
+        print("usage: afc-logs show THREAD"); return 2
+    found = find_thread(args[0])
+    if not found:
+        print(f"no thread matching {args[0]}")
+        return 1
+    _, db, tid, md = found
+    if md:
+        print(f"(file: {md})\n")
+        sys.stdout.write(open(md, encoding="utf-8").read())
+    else:
+        write_thread(db, tid, sys.stdout)
+    return 0
+
+
+def cmd_file(args):
+    """The path of a readable file of one thread: its .md when those are kept, else written now."""
+    if not args:
+        print("usage: afc-logs file THREAD"); return 2
+    found = find_thread(args[0])
+    if not found:
+        print(f"no thread matching {args[0]}", file=sys.stderr)
+        return 1
+    p, db, tid, md = found
+    if not md:
+        md = os.path.join(p, SUB, f"handover-{re.sub(r'[^A-Za-z0-9]', '', tid.split(':')[-1])[:12] or 'thread'}.md")
+        with open(md + ".tmp", "w", encoding="utf-8") as f:
+            write_thread(db, tid, f)
+        os.replace(md + ".tmp", md)
+    print(md)
+    return 0
+
+
+def cmd_prune_md(args):
+    """Remove the readable files earlier runs wrote. Only a file the database lists as its own, only
+    when that thread's entries are in the database, and only after the database passed a check."""
+    dry = "--dry-run" in args
+    os.makedirs(CACHE, exist_ok=True)
+    lock = open(os.path.join(CACHE, "run.lock"), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)                # wait for a run that is going
+    gone = size = kept = 0
+    for p in targets(args):
+        d = os.path.join(p, SUB)
+        path = os.path.join(d, "acf.db")
+        if not os.path.exists(path):
+            print(f"{p}: no log"); continue
+        db = sqlite3.connect(path, timeout=30)
+        check = db.execute("PRAGMA quick_check").fetchone()[0]
+        if check != "ok":
+            print(f"{p}\n  !! the database did not pass its check ({check}): nothing removed here")
+            db.close(); continue
+        n = b = 0; left = []; mine = set()
+        for tid, name in db.execute("SELECT id, md_file FROM threads WHERE md_file IS NOT NULL AND md_file<>''").fetchall():
+            f = os.path.join(d, name)
+            if os.path.basename(name) != name or not name.endswith(".md"):
+                left.append(f"{name}: not a file name of this log"); continue
+            if not os.path.exists(f):
+                if not dry:
+                    db.execute("UPDATE threads SET md_file=NULL WHERE id=?", (tid,))
+                continue
+            if not db.execute("SELECT 1 FROM entries WHERE thread=? LIMIT 1", (tid,)).fetchone():
+                left.append(f"{name}: its thread has no entries in the database"); continue
+            b += os.path.getsize(f); n += 1; mine.add(name)
+            if not dry:
+                os.remove(f)
+                db.execute("UPDATE threads SET md_file=NULL WHERE id=?", (tid,))
+        if not dry:
+            db.commit()
+        db.close()
+        other = sorted(x for x in os.listdir(d) if x != "acf.db" and x not in mine)
+        print(f"{p}\n  {'would remove' if dry else 'removed'} {n} readable file(s), {b / 1e6:.0f} MB"
+              + (f"; not this log's, so left beside acf.db: {', '.join(other[:5])}{' ...' if len(other) > 5 else ''}" if other else ""))
+        for l in left:
+            print(f"  left: {l}")
+        gone += n; size += b; kept += len(left)
+    print(f"\n{'DRY RUN: would remove' if dry else 'Removed'} {gone} file(s), {size / 1e6:.0f} MB"
+          + (f"; {kept} left alone (see above)" if kept else "") + ". Their text is in each project's acf.db.")
+    return 0
 
 
 def main(argv):
@@ -1322,6 +1447,10 @@ def main(argv):
             return cmd_search(args)
         if cmd == "show":
             return cmd_show(args)
+        if cmd == "file":
+            return cmd_file(args)
+        if cmd == "prune-md":
+            return cmd_prune_md(args)
     except BrokenPipeError:
         return 0
     print(__doc__)

@@ -15,6 +15,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.local/bin/afc-rules hook claude prompt",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "Stop": [
@@ -24,6 +33,15 @@
             "type": "command",
             "command": "~/.local/bin/agents --mark done 2>/dev/null || true",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.local/bin/afc-rules hook claude stop",
+            "timeout": 30
           }
         ]
       }

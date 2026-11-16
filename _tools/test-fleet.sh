@@ -125,8 +125,8 @@ exit 0
 EOF
 stub afc-logs <<'EOF'
 #!/bin/bash
-# stand-in for the chat log: "show <chat>" names the file kept for that chat, when the test made one
-if [[ "${1:-}" == show && -e "$HOME/thread-$2.md" ]]; then echo "(file: $HOME/thread-$2.md)"; fi
+# stand-in for the chat log: "file <chat>" prints the readable file of that chat, when the test made one
+if [[ "${1:-}" == file && -e "$HOME/thread-$2.md" ]]; then echo "$HOME/thread-$2.md"; fi
 exit 0
 EOF
 

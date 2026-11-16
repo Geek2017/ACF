@@ -1,0 +1,101 @@
+#!/usr/bin/env -S python3 -I
+"""afc-procfs: macOS has no /proc. This writes, for the processes asked about, the few files the
+fleet's shell programs read there on Linux. They land under $TMPDIR/afc-proc/<pid>/ :
+
+  comm      the short name, as Linux shows it (claude, codex, agy, node, zsh ...)
+  cmdline   the arguments, each ended by a NUL
+  environ   NUL-ended too, but ONLY the variables the fleet asks for, never the whole
+            environment: that may hold keys, and this is a file on disk
+  cwd       a link to the folder the process is in
+  fd/<n>    a link per file it holds open (the agents' own records; system files are left out)
+
+  afc-procfs [-t] PID...     -t: also everything running under each PID, four levels down
+
+The files are a snapshot: the shell programs ask again each time they look (their pf function).
+Folders of processes that are gone are removed on the way. On Linux this does nothing.
+"""
+import os, shutil, sys
+
+if sys.platform != "darwin":
+    sys.exit(0)
+sys.path.insert(0, os.path.join(os.path.expanduser("~"), ".local/lib/afc"))
+import macproc  # noqa: E402
+
+BASE = os.path.join((os.environ.get("TMPDIR") or "/tmp").rstrip("/"), "afc-proc")
+KEEP_ENV = ("CLAUDE_CONFIG_DIR", "GEMINI_CLI_HOME", "CODEX_HOME", "HOME", "TMUX_PANE")
+SKIP_FILES = ("/dev/", "/System/", "/usr/", "/opt/", "/Library/", "/private/var/db/", "/Applications/")
+
+
+def put(path, data):
+    tmp = f"{path}.{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def link(path, target):
+    tmp = f"{path}.{os.getpid()}"
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    os.symlink(target, tmp)
+    os.replace(tmp, path)
+
+
+def write(pid, name):
+    d = os.path.join(BASE, str(pid))
+    os.makedirs(os.path.join(d, "fd"), exist_ok=True)
+    argv, env = macproc.argv_env(pid)
+    put(os.path.join(d, "comm"), (name + "\n").encode())
+    put(os.path.join(d, "cmdline"), b"".join(a.encode() + b"\0" for a in argv))
+    put(os.path.join(d, "environ"), b"".join(f"{k}={env[k]}".encode() + b"\0" for k in KEEP_ENV if k in env))
+    where = macproc.cwd(pid)
+    if where:
+        link(os.path.join(d, "cwd"), where)
+    else:
+        try:
+            os.unlink(os.path.join(d, "cwd"))
+        except OSError:
+            pass
+    files = {str(fd): p for fd, p in macproc.open_files(pid) if not p.startswith(SKIP_FILES)}
+    fdir = os.path.join(d, "fd")
+    for old in os.listdir(fdir):
+        if old not in files:
+            try:
+                os.unlink(os.path.join(fdir, old))
+            except OSError:
+                pass
+    for fd, p in files.items():
+        try:
+            if os.readlink(os.path.join(fdir, fd)) == p:
+                continue
+        except OSError:
+            pass
+        link(os.path.join(fdir, fd), p)
+
+
+def main(argv):
+    tree = "-t" in argv
+    pids = [int(a) for a in argv if a.isdigit() and int(a) > 0]
+    if not pids:
+        return 0
+    os.makedirs(BASE, mode=0o700, exist_ok=True)
+    procs = macproc.table()
+    want = []
+    for pid in pids:
+        want += macproc.under(pid, procs) if tree else [pid]
+    for pid in dict.fromkeys(want):
+        if pid in procs:
+            try:
+                write(pid, procs[pid][1])
+            except OSError:
+                pass
+    for old in os.listdir(BASE):                      # processes that are gone
+        if old.isdigit() and int(old) not in procs:
+            shutil.rmtree(os.path.join(BASE, old), ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

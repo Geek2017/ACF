@@ -1,0 +1,1030 @@
+#!/usr/bin/env -S python3 -I
+"""afc-rules: does the agent keep to the rules of the project it works in? (TokenOps projects)
+
+The rules are the project's own: the files TokenOps installed in it, which _ai/TOKENOPS.json lists.
+They are looked up from the folder the agent works in (that folder, or one above it up to its git
+root), never from a global file. A folder without _ai/TOKENOPS.json has no rules here: the check
+does nothing there and adds nothing to the prompt.
+
+Each agent's own hooks call it twice a turn (`afc-rules install` adds them):
+  afc-rules hook <tool> prompt   a prompt is sent: a short reminder of this project's rules goes with it
+  afc-rules hook <tool> stop     the turn ends: what the agent did is checked against those rules
+  tool: claude, codex, gemini or agy. The hook's JSON comes on stdin, the answer goes to stdout.
+
+What is checked, from the agent's own chat file (the tool calls it made; no model is asked):
+  hard  index-first   files were changed and _ai/INDEX.md was never read. An entry file with the
+                      line @_ai/INDEX.md loads it by itself (Claude, Gemini), which counts as read.
+  hard  fix-check     a file that a fix record protects (_ai/fixes/FIX-*.md, affected_paths) was
+                      changed with no check: no check-fixes.py --path for it, no read of _ai/FIXES.md
+                      or of the record
+  hard  index-budget  _ai/INDEX.md was changed and is now over its character budget
+  soft  record-work   files were changed this turn and the chat has not written _ai/UPDATES.md
+  soft  rule-files    a rule file TokenOps generates (CLAUDE.md, AGENTS.md, _ai/WORKFLOW.md...) was edited
+  soft  outside       a file outside the project was written (temp folders and the tools' own folders
+                      are fine; Claude's memory folder is not: "keep memory inside this project")
+  soft  all-skills    every skill was read in one turn ("never preload all skills")
+
+What happens: "rules" in ~/.config/agents/settings, off | report | enforce (default enforce)
+  enforce  a hard finding made in this turn sends the agent back, once per turn, with what to fix
+           (Claude and Codex: "block", Gemini: "deny", Antigravity: "continue")
+  report   nothing is sent back
+  both     the pane header shows the result; each finding is a line in <project>/logs/acf/rules.log;
+           the next prompt's reminder names what is still open
+
+Not seen: files changed by shell commands (sed -i, cat >, a script) and by Claude's sub-agents.
+
+Other commands:
+  afc-rules check <tool> <chat file> [--cwd DIR]   the findings of one chat, turn by turn
+  afc-rules replay [--days N] [-v]                 every recent chat in a TokenOps project
+  afc-rules show [--all] [-n N]                    the latest lines of rules.log
+  afc-rules install [--dry-run] [--remove]         add (or take out) the hooks in each tool's settings
+  afc-rules doctor                                 what is in place
+"""
+import datetime, fnmatch, glob, importlib.machinery, importlib.util, json, os, re, shutil, signal, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+CFG = f"{HOME}/.config/agents"
+HERE = os.path.dirname(os.path.realpath(__file__))
+MARK = "[ACF rule check]"       # starts every message that sends an agent back
+NUDGE = "[ACF rules]"           # starts every reminder
+TOOLS = ("claude", "codex", "gemini", "agy")
+ENTRY = {"claude": ("CLAUDE.md",), "codex": ("AGENTS.md",), "gemini": ("GEMINI.md",), "agy": ("GEMINI.md", "AGENTS.md")}
+IMPORTS = {"claude", "gemini"}  # tools whose entry file can pull a file in with an @path line
+WORK_ONLY = ("_ai/", "logs/")   # the project's memory and logs: not "code"
+GENERATED = re.compile(r"^(CLAUDE\.md|AGENTS\.md|GEMINI\.md|\.clinerules|\.cursor/rules/.+|\.windsurf/rules/.+"
+                       r"|\.github/copilot-instructions\.md|_ai/WORKFLOW\.md)$")
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit",                       # Claude
+              "apply_patch",                                                     # Codex (older builds)
+              "replace", "write_file", "edit", "edit_file", "multi_edit",        # Gemini, Antigravity
+              "create_file", "write_to_file", "replace_file_content", "multi_replace_file_content"}
+PATH_KEYS = ("file_path", "path", "Path", "TargetFile", "AbsolutePath", "absolute_path", "notebook_path", "filePath")
+PATCH = re.compile(r"\*\*\* (?:Update|Add|Delete) File: ([^\n\r\"\\]+)|\*\*\* Move to: ([^\n\r\"\\]+)")
+FIX_JSON = re.compile(r"^```json\s*\n(.*?)^```\s*$", re.M | re.S)
+FIX_ID = re.compile(r"\bFIX-\d+\b")
+FIX_ARG = re.compile(r"--path(?:=|\s+)([\"']?)([^\s\"';|&)]+)\1")
+SKILL = re.compile(r"_ai/skills/([A-Za-z0-9_.-]+)/SKILL\.md")
+TOKEN = re.compile(r"[^\s\"'`;|&<>()=,{}\[\]]+")
+READS = {"INDEX.md": "_ai/INDEX.md", "FIXES.md": "_ai/FIXES.md", "brief.sh": "_tools/brief.sh", "brief.ps1": "_tools/brief.ps1"}
+SOCK = os.environ.get("AGENTS_SOCK") or "agents"
+
+
+def setting(name, default):
+    """A "name value" line of the fleet's settings file, read the way `agents` reads it."""
+    try:
+        with open(os.environ.get("AGENTS_SETTINGS") or f"{CFG}/settings", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == name:
+                    return parts[1]
+    except OSError:
+        pass
+    return default
+
+
+def mode():
+    m = setting("rules", "enforce")
+    return m if m in ("off", "report", "enforce") else "enforce"
+
+
+def state_dir():
+    # Not $XDG_RUNTIME_DIR: Gemini runs its hooks with a cleaned environment, and the prompt and
+    # stop hooks of one chat have to find the same file
+    run = f"/run/user/{os.getuid()}"
+    d = os.environ.get("AFC_RULES_STATE") or (f"{run}/afc-rules" if os.path.isdir(run) else f"{HOME}/.cache/afc-rules")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+# ---------------------------------------------------------------------------------------------
+# the chat readers of afc-logs, reused: each tool's chat file -> (kind, who, text) entries
+
+_LOGS = None
+
+
+def logs():
+    global _LOGS
+    if _LOGS is None:
+        path = os.environ.get("AFC_RULES_LOGS") or os.path.join(HERE, "afc-logs")
+        for d in (os.path.join(HERE, "..", "lib", "afc"), os.path.join(os.path.dirname(os.path.realpath(path)), "..", "lib", "afc"),
+                  f"{HOME}/.local/lib/afc"):
+            if os.path.isfile(os.path.join(d, "pb.py")):
+                sys.path.insert(0, d)
+                break
+        loader = importlib.machinery.SourceFileLoader("afc_logs", path)
+        spec = importlib.util.spec_from_loader("afc_logs", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        _LOGS = mod
+    return _LOGS
+
+
+class Mem:
+    """Stands in for afc-logs' Store: keeps the entries in memory, writes nothing."""
+    def __init__(self):
+        self.entries, self.cwd = [], None
+
+    def add(self, tid, ts, kind, who, model, text, dedupe=False):
+        if text:
+            self.entries.append((kind, who, text, ts or ""))
+
+    def thread(self, tid, **cols):
+        if cols.get("cwd") and not self.cwd:
+            self.cwd = cols["cwd"]
+
+    def clear(self, tid):
+        self.entries = []
+
+    def usage(self, *_):
+        pass
+
+
+def read_chat(tool, path, offset=0):
+    """Entries of a chat file from offset on (Claude and Codex files only grow; the others are
+    read whole), and the offset to start from next time."""
+    L = logs()
+    m = Mem()
+    start = offset if tool in L.APPEND else 0
+    end = L.READ[tool](m, (tool, "", path, None), "rules", start)
+    return m, end
+
+
+def is_prompt(text):
+    t = (text or "").lstrip()
+    return bool(t) and not t.startswith(logs().NOT_A_PROMPT) and MARK not in t[:600] and not t.startswith("Stop hook feedback")
+
+
+# ---------------------------------------------------------------------------------------------
+# the project and its TokenOps files
+
+def find_root(cwd):
+    """The folder whose _ai/TOKENOPS.json rules the agent working in cwd: cwd itself, or the
+    nearest folder above it, up to the git root. None: no TokenOps rules here."""
+    if not cwd:
+        return None
+    d = os.path.realpath(os.path.expanduser(cwd))
+    while True:
+        if os.path.isfile(os.path.join(d, "_ai", "TOKENOPS.json")):
+            return d
+        if os.path.exists(os.path.join(d, ".git")) or d == HOME or os.path.dirname(d) == d:
+            return None
+        d = os.path.dirname(d)
+
+
+def matches_path(changed, recorded):
+    """TokenOps' own rule (_tools/check-fixes.py): same path, inside it, above it, or a glob."""
+    changed = changed.replace("\\", "/")
+    recorded = recorded.replace("\\", "/").rstrip("/")
+    if recorded.startswith("./"):
+        recorded = recorded[2:]
+    if changed.startswith("./"):
+        changed = changed[2:]
+    return (changed == recorded or changed.startswith(recorded + "/")
+            or recorded.startswith(changed.rstrip("/") + "/")
+            or fnmatch.fnmatchcase(changed, recorded))
+
+
+class Project:
+    def __init__(self, root):
+        self.root = root
+        try:
+            with open(os.path.join(root, "_ai", "TOKENOPS.json"), encoding="utf-8") as f:
+                man = json.load(f)
+        except (OSError, ValueError):
+            man = {}
+        listed = [f.get("path") for f in (man.get("files") or []) if isinstance(f, dict) and isinstance(f.get("path"), str)]
+        self.index = "_ai/INDEX.md" if self.has("_ai/INDEX.md") else None
+        self.fixes = "_ai/FIXES.md" if self.has("_ai/FIXES.md") else None
+        ups = [p for p in listed if p == "UPDATES.md" or p.endswith("/UPDATES.md")] + ["_ai/UPDATES.md"]
+        self.updates = next((p for p in ups if self.has(p)), None)
+        self.rule_files = {p for p in listed if GENERATED.match(p)}
+        self.skills = sorted({p for p in listed if p.startswith("_ai/skills/") and p.endswith("/SKILL.md")})
+        self.records = self.read_records()
+        self.budget = self.read_budget()
+
+    def has(self, rel):
+        return os.path.isfile(os.path.join(self.root, rel))
+
+    def entry(self, tool):
+        return next((n for n in ENTRY[tool] if self.has(n)), None)
+
+    def imports_index(self, tool):
+        """The tool loads _ai/INDEX.md by itself: its entry file has an @_ai/INDEX.md line."""
+        e = self.entry(tool)
+        if tool not in IMPORTS or not e or not self.index:
+            return False
+        try:
+            with open(os.path.join(self.root, e), encoding="utf-8", errors="replace") as f:
+                return re.search(r"^\s*@(?:\./)?_ai/INDEX\.md\s*$", f.read(), re.M) is not None
+        except OSError:
+            return False
+
+    def read_records(self):
+        """Fix records, read the way check-fixes.py reads them (its one JSON block), without running it."""
+        out = []
+        for f in sorted(glob.glob(os.path.join(self.root, "_ai", "fixes", "FIX-*.md"))):
+            try:
+                with open(f, encoding="utf-8-sig") as fh:
+                    m = FIX_JSON.search(fh.read())
+                d = json.loads(m.group(1)) if m else {}
+            except (OSError, ValueError):
+                continue
+            paths = [p for p in d.get("affected_paths") or [] if isinstance(p, str) and p.strip()]
+            if not isinstance(d, dict) or not paths or d.get("status") == "superseded":
+                continue
+            rid = d.get("id") if isinstance(d.get("id"), str) else os.path.basename(f)[:-3]
+            out.append((rid, paths, datetime.datetime.fromtimestamp(os.path.getmtime(f), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")))
+        return out
+
+    def read_budget(self):
+        for rel, pat in (("_tools/check-index.py", r"^MAX_CHARACTERS\s*=\s*(\d+)"), (self.index, r"Budget:\s*<=\s*([\d,]+)")):
+            if not rel:
+                continue
+            try:
+                with open(os.path.join(self.root, rel), encoding="utf-8", errors="replace") as f:
+                    m = re.search(pat, f.read(), re.M)
+                if m:
+                    return int(m.group(1).replace(",", ""))
+            except (OSError, ValueError):
+                pass
+        return 4000
+
+    def covering(self, rel, at=""):
+        """The fix records that protect rel. at (replay): only records whose file was written by then."""
+        return [rid for rid, paths, written in self.records
+                if (not at or written <= at) and any(matches_path(rel, p) for p in paths)]
+
+    def rel(self, path):
+        """Path -> project-relative, or None when it is outside the project."""
+        p = os.path.realpath(path)
+        if p == self.root or p.startswith(self.root + "/"):
+            return os.path.relpath(p, self.root)
+        return None
+
+
+def global_md(tool):
+    """Instruction files that load in every project for this tool (they come on top of the
+    project's own). On the machine this was written on there are none."""
+    env = os.environ
+    found = []
+    if tool == "claude":
+        d = env.get("CLAUDE_CONFIG_DIR") or f"{HOME}/.claude"
+        found = [f"{d}/CLAUDE.md"] + glob.glob(f"{d}/rules/*.md")
+    elif tool == "codex":
+        d = env.get("CODEX_HOME") or f"{HOME}/.codex"
+        found = [f"{d}/AGENTS.md", f"{d}/AGENTS.override.md"]
+    elif tool == "gemini":
+        d = env.get("GEMINI_CLI_HOME") or HOME
+        found = [f"{d}/.gemini/GEMINI.md", f"{d}/.gemini/AGENTS.md"]
+    elif tool == "agy":
+        found = [f"{HOME}/.gemini/GEMINI.md", f"{HOME}/.gemini/config/GEMINI.md", f"{HOME}/.gemini/config/AGENTS.md"] \
+            + glob.glob(f"{HOME}/.gemini/config/rules/*.md")
+    return [p for p in found if os.path.isfile(p)]
+
+
+# ---------------------------------------------------------------------------------------------
+# what a chat did: built up entry by entry, kept between turns
+
+class Facts:
+    def __init__(self, d=None):
+        d = d or {}
+        self.seq = d.get("seq", 0)          # entries seen
+        self.turn = d.get("turn", 0)        # seq of this turn's prompt
+        self.prompts = d.get("prompts", 0)
+        self.edits = d.get("edits", [])     # [seq, absolute path]
+        self.marks = d.get("marks", {})     # what was read or run -> first seq
+        self.skills = d.get("skills", [])   # [seq, skill name]
+        self.turn_ts = ""                   # when this turn's prompt was sent (replay only)
+
+    def dump(self):
+        return {"seq": self.seq, "turn": self.turn, "prompts": self.prompts, "edits": self.edits[-2000:],
+                "marks": self.marks, "skills": self.skills[-200:]}
+
+    def mark(self, name):
+        self.marks.setdefault(name, self.seq)
+
+    def feed(self, entries, cwd, P, on_turn=None):
+        for kind, who, text, *ts in entries:
+            self.seq += 1
+            if kind == "user" and is_prompt(text):
+                if on_turn and self.prompts:
+                    on_turn()
+                self.turn = self.seq
+                self.turn_ts = ts[0] if ts else ""
+                self.prompts += 1
+            elif kind == "tool_call":
+                self.call(who or "", text or "", cwd, P)
+
+    def call(self, name, text, cwd, P):
+        args = None
+        if text.lstrip().startswith("{"):
+            try:
+                args = json.loads(text)
+            except ValueError:
+                args = None
+        args = args if isinstance(args, dict) else {}
+        target = next((args[k] for k in PATH_KEYS if isinstance(args.get(k), str) and args[k].strip()), None)
+        paths = [target] if name in EDIT_TOOLS and target else []
+        paths += [(a or b).strip() for a, b in PATCH.findall(text)]
+        for p in paths:
+            self.edits.append([self.seq, resolve(cwd, p)])
+        if paths:
+            return      # an edit carries the new text, which can name anything: not counted as reading it
+        # what was read or run: the call's own words (a JSON call's string values; a Codex cell's code
+        # with its string escapes undone), not the JSON around them
+        scan = "\n".join(v for v in args.values() if isinstance(v, str)) if args else text
+        scan = scan.replace('\\"', '"').replace("\\'", "'").replace("\\n", "\n").replace("\\t", " ")
+        for tok in TOKEN.findall(scan):
+            base = tok.rsplit("/", 1)[-1]
+            if base not in READS:
+                continue
+            # a bare name counts too: read from inside _ai/ (cd _ai && cat INDEX.md)
+            if tok == base or P.rel(resolve(cwd, tok)) == READS[base]:
+                self.mark("fixes" if base == "FIXES.md" else "index")   # brief.sh prints the index
+        if "check-fixes" in scan:
+            self.mark("fixrun")
+            for _, arg in FIX_ARG.findall(scan):
+                a = P.rel(resolve(cwd, arg)) or arg
+                self.mark("fixrun:" + a)
+        for rid in set(FIX_ID.findall(scan)):
+            self.mark("fixid:" + rid)
+        for s in SKILL.findall(scan):
+            self.skills.append([self.seq, s])
+
+    def fix_checked(self, rel):
+        return any(k.startswith("fixrun:") and matches_path(rel, k[7:]) for k in self.marks)
+
+
+def resolve(cwd, p):
+    p = os.path.expanduser(p.strip().strip("'\""))
+    return os.path.normpath(p if os.path.isabs(p) else os.path.join(cwd or "/", p))
+
+
+TEMP = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/user/")
+
+
+def outside_ok(path):
+    """Writes outside the project that break no rule: temp folders, the tools' own plan and
+    artifact folders. Claude's memory folder is not one of them."""
+    p = path
+    if re.search(r"/\.claude[^/]*/projects/[^/]+/memory/", p):
+        return False
+    if p.startswith(TEMP) or (os.environ.get("TMPDIR") and p.startswith(os.environ["TMPDIR"].rstrip("/") + "/")):
+        return True
+    return bool(re.search(r"/\.claude[^/]*/(plans|todos|tasks)/|/\.gemini/(tmp|antigravity[^/]*)/|/\.codex[^/]*/", p))
+
+
+def short(items, n=3):
+    items = list(items)
+    return ", ".join(items[:n]) + (f" and {len(items) - n} more" if len(items) > n else "")
+
+
+def evaluate(P, tool, F, at=""):
+    """Findings for the chat as it stands: [{rule, hard, new, what, fix}]. new = made in this turn.
+    at: judge as of that time (replay), see Project.covering."""
+    inside, outside = [], []
+    for seq, path in F.edits:
+        r = P.rel(path)
+        (outside if r is None else inside).append((seq, path if r is None else r))
+    now = [(s, r) for s, r in inside if s > F.turn]
+    found = []
+
+    def add(rule, hard, new, what, fix):
+        found.append({"rule": rule, "hard": hard, "new": bool(new), "what": what, "fix": fix})
+
+    if P.index and inside and "index" not in F.marks and not P.imports_index(tool):
+        files = sorted({r for _, r in inside})
+        add("index-first", True, now, f"{len(files)} file(s) changed ({short(files)}) and _ai/INDEX.md was never read",
+            "Read _ai/INDEX.md, this project's own index, and check what you changed against it.")
+    if P.records and "fixes" not in F.marks:
+        for r in sorted({r for _, r in inside if not r.startswith(WORK_ONLY)}):
+            ids = P.covering(r, at)
+            if not ids or F.fix_checked(r) or any("fixid:" + i in F.marks for i in ids):
+                continue
+            add("fix-check", True, any(rr == r for _, rr in now),
+                f"{r} was changed without a fix check, and {short(ids)} protect{'s' if len(ids) == 1 else ''} it",
+                f"Run python3 _tools/check-fixes.py --path {r}, read the record it lists, and make sure your change keeps the behaviour it protects.")
+    if P.index and any(r == P.index for _, r in inside):
+        try:
+            with open(os.path.join(P.root, P.index), encoding="utf-8") as f:
+                n = len(f.read())
+        except OSError:
+            n = 0
+        if n > P.budget:
+            add("index-budget", True, any(r == P.index for _, r in now),
+                f"_ai/INDEX.md is {n} characters, over its budget of {P.budget}",
+                "Move detail out to the linked files (never cut history), then run python3 _tools/check-index.py.")
+    work = sorted({r for _, r in now if not r.startswith(WORK_ONLY)})
+    if work and P.updates and not any(r == P.updates for _, r in inside):
+        add("record-work", False, True, f"{len(work)} file(s) changed and the work is not in {P.updates} yet",
+            f"When the work is done, add a short entry at the top of {P.updates}.")
+    gen = sorted({r for _, r in now if r in P.rule_files})
+    if gen:
+        add("rule-files", False, True, f"edited {short(gen)}, which TokenOps generates",
+            "Change it in TokenOps instead: a TokenOps re-install puts the generated file back.")
+    out = sorted({p for s, p in outside if s > F.turn and not outside_ok(p)})
+    if out:
+        add("outside", False, True, f"wrote outside the project: {short(out, 2)}",
+            "Keep memory, skills and scripts inside this project.")
+    sk = {n for s, n in F.skills if s > F.turn}
+    if P.skills and len(sk) >= max(3, len(P.skills)):
+        add("all-skills", False, True, f"read all {len(sk)} skills in one turn", "Open a skill only for the job it is for.")
+    return found
+
+
+def sends_back(found):
+    return [f for f in found if f["hard"] and f["new"]]
+
+
+def reason(P, tool, back, soft):
+    e = P.entry(tool)
+    lines = [f"{MARK} Before you finish: this turn broke rules of this project's own files"
+             f" ({os.path.join(P.root, e) if e else P.root}, _ai/INDEX.md):"]
+    for i, f in enumerate(back, 1):
+        lines.append(f"{i}. {f['what']}. {f['fix']}")
+    if soft:
+        lines.append("Also (notes, not blocking): " + "; ".join(f["what"] for f in soft) + ".")
+    lines.append("Fix these now, or say plainly why a rule does not apply here.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------------------------
+# the hooks
+
+def emit(obj):
+    if obj is not None:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def allow(tool):
+    # Gemini and Antigravity read stdout as JSON every time; Claude and Codex are fine with nothing
+    emit({} if tool in ("gemini", "agy") else None)
+
+
+def chat_file(tool, data):
+    if tool == "agy":
+        cid = data.get("conversationId") or ""
+        for home in (HOME, os.environ.get("HOME") or HOME):
+            p = f"{home}/.gemini/antigravity-cli/conversations/{cid}.db"
+            if cid and os.path.isfile(p):
+                return p
+        return None
+    p = data.get("transcript_path") or data.get("transcriptPath")
+    if p and os.path.isfile(os.path.expanduser(p)):
+        return os.path.expanduser(p)
+    sid = data.get("session_id") or ""
+    if tool == "codex" and sid:
+        home = os.environ.get("CODEX_HOME") or f"{HOME}/.codex"
+        hits = glob.glob(f"{home}/sessions/*/*/*/rollout-*{sid}*.jsonl")
+        return max(hits, key=os.path.getmtime) if hits else None
+    return None
+
+
+def load_state(key):
+    try:
+        with open(os.path.join(state_dir(), key + ".json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(key, st):
+    path = os.path.join(state_dir(), key + ".json")
+    tmp = f"{path}.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.replace(tmp, path)
+
+
+def state_key(tool, data):
+    cid = data.get("session_id") or data.get("conversationId") or data.get("transcript_path") or "none"
+    return tool + "-" + re.sub(r"[^A-Za-z0-9_.-]", "_", str(cid))[-80:]
+
+
+def nudge(P, tool, st):
+    e = P.entry(tool)
+    files = ", ".join(x for x in (e, P.index) if x)
+    parts = [f"{NUDGE} Follow this project's own rule files in {P.root}" + (f": {files}." if files else ".")]
+    marks = (st.get("facts") or {}).get("marks") or {}
+    if P.index and "index" not in marks and not P.imports_index(tool):
+        parts.append("Read _ai/INDEX.md before changing anything.")
+    if P.records:
+        parts.append(f"Before editing existing code check _ai/FIXES.md ({len(P.records)} fix records;"
+                     " python3 _tools/check-fixes.py --path <file>).")
+    if P.index:
+        parts.append(f"Keep _ai/INDEX.md within {P.budget} characters.")
+    if P.updates:
+        parts.append(f"Record finished work at the top of {P.updates}.")
+    if st.get("open"):
+        parts.append("Still open from the last turn: " + "; ".join(st["open"][:3]) + ".")
+    glob_md = global_md(tool)
+    if glob_md:
+        parts.append(f"Global instruction files also load ({short(glob_md, 2)}); where they disagree, this project's files win.")
+    return " ".join(parts)
+
+
+def tmux_cmd():
+    exe = shutil.which("tmux") or next((p for p in (f"{HOME}/.local/bin/tmux", "/usr/bin/tmux", "/opt/homebrew/bin/tmux")
+                                        if os.path.exists(p)), "tmux")
+    return exe
+
+
+def ppid(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        try:
+            return int(subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=3).stdout.strip() or 1)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return 1
+
+
+def fleet_pane():
+    """(tmux command, pane id) of the fleet pane this hook runs under, or None."""
+    exe = tmux_cmd()
+    if os.environ.get("TMUX") and os.environ.get("TMUX_PANE"):
+        return [exe], os.environ["TMUX_PANE"]
+    cmd = [exe, "-L", SOCK]
+    try:
+        out = subprocess.run(cmd + ["list-panes", "-a", "-F", "#{pane_pid} #{pane_id}"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    panes = dict(line.split()[:2] for line in out.splitlines() if len(line.split()) >= 2)
+    pid, hops = os.getppid(), 0
+    while pid > 1 and hops < 40:
+        if str(pid) in panes:
+            return cmd, panes[str(pid)]
+        pid, hops = ppid(pid), hops + 1
+    return None
+
+
+def show_in_pane(found):
+    """The pane header's rule mark (tmux.conf draws @rules in @rules_c)."""
+    where = fleet_pane()
+    if not where:
+        return
+    cmd, pane = where
+    hard = [f for f in found if f["hard"]]
+    if hard:
+        text, colour = f"✗ {len(found)} rule{'s' if len(found) != 1 else ''}", "#f7768e"
+    elif found:
+        text, colour = f"△ {len(found)} note{'s' if len(found) != 1 else ''}", "#e0af68"
+    else:
+        text, colour = "✓ rules", "#9ece6a"
+    try:
+        subprocess.run(cmd + ["set", "-p", "-t", pane, "@rules", text, ";", "set", "-p", "-t", pane, "@rules_c", colour],
+                       capture_output=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def log_findings(P, tool, chat, found, sent):
+    if not found:
+        return
+    d = os.path.join(P.root, "logs", "acf")
+    try:
+        if not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+            logs().ignore_in_git(P.root)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(os.path.join(d, "rules.log"), "a", encoding="utf-8") as f:
+            for x in found:
+                f.write("\t".join((stamp, tool, chat[:8], "hard" if x["hard"] else "soft", x["rule"],
+                                   x["what"].replace("\t", " "), "sent back" if x in sent else "")) + "\n")
+    except OSError:
+        pass
+
+
+def hook(tool, event):
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict) or mode() == "off":
+        return allow(tool)
+    cwd = data.get("cwd") or next(iter(data.get("workspacePaths") or []), None) or os.getcwd()
+    root = find_root(cwd)
+    if not root:
+        return allow(tool)
+    P = Project(root)
+    key = state_key(tool, data)
+    st = load_state(key)
+    if event == "prompt":
+        if tool == "agy":
+            # PreInvocation comes before every model call of a turn: remind once, at the turn's first
+            # (initialNumSteps stays the same through a turn and grows with the next one)
+            turn = data.get("initialNumSteps")
+            if turn is None and data.get("invocationNum") not in (None, 0, 1):
+                return allow(tool)
+            if turn is not None and st.get("nudged") == turn:
+                return allow(tool)
+            st["nudged"] = turn
+            save_state(key, st)
+            return emit({"injectSteps": [{"systemMessage": {"systemMessage": nudge(P, tool, st)}}]})
+        name = "BeforeAgent" if tool == "gemini" else "UserPromptSubmit"
+        return emit({"hookSpecificOutput": {"hookEventName": name, "additionalContext": nudge(P, tool, st)}})
+    # stop
+    path = chat_file(tool, data)
+    if not path:
+        return allow(tool)
+    same = st.get("path") == path and tool in logs().APPEND and st.get("offset", 0) <= os.path.getsize(path)
+    F = Facts(st.get("facts") if same else None)
+    mem, end = read_chat(tool, path, st.get("offset", 0) if same else 0)
+    F.feed(mem.entries, cwd, P)
+    found = evaluate(P, tool, F)
+    back = sends_back(found)
+    active = bool(data.get("stop_hook_active") or data.get("continuationActive"))
+    if tool == "agy" and data.get("terminationReason") not in (None, "", "NO_TOOL_CALL", "TERMINAL_STEP_TYPE"):
+        active = True       # cancelled, failed or out of budget: not the moment to send it back
+    sent = back if (back and mode() == "enforce" and not active) else []
+    # each finding is logged once per turn, however many times the turn ends
+    done = set(st.get("logged") or []) if st.get("logged_turn") == F.turn else set()
+    fresh = [f for f in found if f["new"] and f["rule"] + f["what"] not in done]
+    log_findings(P, tool, (data.get("session_id") or data.get("conversationId") or ""), fresh, sent)
+    show_in_pane(found)
+    st.update({"path": path, "offset": end, "facts": F.dump(), "open": [f["what"] for f in found if f["hard"]] +
+               [f["what"] for f in found if not f["hard"]], "logged_turn": F.turn,
+               "logged": sorted(done | {f["rule"] + f["what"] for f in fresh})})
+    save_state(key, st)
+    if not sent:
+        return allow(tool)
+    text = reason(P, tool, sent, [f for f in found if not f["hard"]])
+    if tool == "gemini":
+        return emit({"decision": "deny", "reason": text})
+    if tool == "agy":
+        return emit({"decision": "continue", "reason": text})
+    return emit({"decision": "block", "reason": text})
+
+
+# ---------------------------------------------------------------------------------------------
+# check, replay, show
+
+def check_chat(tool, path, cwd=None, since=""):
+    """(project, [(turn number, findings)]) for a whole chat, judged at the end of each turn as the
+    stop hook would have; None when the chat ran outside a TokenOps project. since: an ISO time;
+    turns whose prompt came before it are left out (a replay of chats from before TokenOps came
+    into the project would judge them by rules and fix records written later)."""
+    mem, _ = read_chat(tool, path, 0)
+    cwd = cwd or mem.cwd or logs().src_cwd((tool, "", path, None))
+    root = find_root(cwd)
+    if not root:
+        return None
+    P = Project(root)
+    F = Facts()
+    turns = []
+
+    def judge():
+        if not since or (F.turn_ts and F.turn_ts >= since):
+            turns.append((F.prompts, evaluate(P, tool, F, F.turn_ts if since else "")))
+    F.feed(mem.entries, cwd, P, on_turn=judge)
+    if F.prompts:
+        judge()
+    return P, turns
+
+
+def print_turns(turns, all_turns=False):
+    for n, found in turns:
+        new = [f for f in found if f["new"]]
+        if not new and not all_turns:
+            continue
+        back = sends_back(found)
+        print(f"  turn {n}: {'SENT BACK' if back else 'ok' if not new else 'notes'}")
+        for f in new:
+            print(f"    {'hard' if f['hard'] else 'soft'}  {f['rule']:<13} {f['what']}")
+
+
+def cmd_check(args):
+    if len(args) < 2 or args[0] not in TOOLS:
+        print("usage: afc-rules check <claude|codex|gemini|agy> <chat file> [--cwd DIR]", file=sys.stderr)
+        return 2
+    cwd = args[args.index("--cwd") + 1] if "--cwd" in args else None
+    r = check_chat(args[0], args[1], cwd)
+    if r is None:
+        print("not in a TokenOps project: nothing to check")
+        return 0
+    P, turns = r
+    print(f"{args[0]} chat in {P.root}: {len(turns)} turns, {sum(1 for _, f in turns if sends_back(f))} would be sent back")
+    print_turns(turns)
+    return 0
+
+
+def cmd_replay(args):
+    days = float(args[args.index("--days") + 1]) if "--days" in args else 14
+    verbose = "-v" in args
+    L = logs()
+    cutoff = time.time() - days * 86400
+    totals = {"chats": 0, "turns": 0, "back": 0}
+    rules = {}
+    for src in L.sources():
+        tool, _, path, parent = src
+        if parent is not None:
+            continue
+        try:
+            if os.path.getmtime(path) < cutoff:
+                continue
+        except OSError:
+            continue
+        cwd = L.src_cwd(src)
+        root = find_root(cwd)
+        if not root:
+            continue
+        try:        # a chat that ended before TokenOps came into the project had no rules to keep
+            installed = os.path.getmtime(os.path.join(root, "_ai", "TOKENOPS.json"))
+            if os.path.getmtime(path) < installed:
+                continue
+        except OSError:
+            continue
+        since = datetime.datetime.fromtimestamp(installed, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            r = check_chat(tool, path, cwd, since)
+        except Exception as e:      # one unreadable chat must not end the replay
+            print(f"  ! {tool} {os.path.basename(path)}: {e}", file=sys.stderr)
+            continue
+        if not r:
+            continue
+        P, turns = r
+        back = sum(1 for _, f in turns if sends_back(f))
+        totals["chats"] += 1; totals["turns"] += len(turns); totals["back"] += back
+        for _, found in turns:
+            for f in found:
+                if f["new"]:
+                    k = (f["rule"], f["hard"])
+                    rules[k] = rules.get(k, 0) + 1
+        print(f"{tool:6} {os.path.basename(P.root):14} {os.path.basename(path)[:44]:44} {len(turns):4} turns  {back:3} sent back")
+        if verbose:
+            print_turns(turns)
+    print(f"\n{totals['chats']} chats, {totals['turns']} turns, {totals['back']} turns would have been sent back")
+    for (rule, hard), n in sorted(rules.items(), key=lambda x: (not x[0][1], -x[1])):
+        print(f"  {'hard' if hard else 'soft'}  {rule:<13} {n} turns")
+    return 0
+
+
+def projects():
+    out = []
+    try:
+        with open(f"{CFG}/projects", encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(None, 1)
+                if len(parts) == 2 and not parts[0].startswith("#"):
+                    d = os.path.expanduser(parts[1].strip())
+                    if os.path.isfile(os.path.join(d, "_ai", "TOKENOPS.json")):
+                        out.append(os.path.realpath(d))
+    except OSError:
+        pass
+    return out
+
+
+def cmd_show(args):
+    n = int(args[args.index("-n") + 1]) if "-n" in args else 20
+    roots = projects() if "--all" in args else [find_root(os.getcwd())]
+    roots = [r for r in roots if r]
+    if not roots:
+        print("not in a TokenOps project (afc-rules show --all: every project in the fleet)")
+        return 0
+    for r in roots:
+        try:
+            with open(os.path.join(r, "logs", "acf", "rules.log"), encoding="utf-8") as f:
+                lines = f.readlines()[-n:]
+        except OSError:
+            lines = []
+        print(f"{r}: {len(lines) and 'latest' or 'no'} findings")
+        for line in lines:
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 6:
+                print(f"  {p[0][:16].replace('T', ' ')}  {p[1]:6} {p[3]}  {p[4]:<13} {p[5]}{'  (sent back)' if len(p) > 6 and p[6] else ''}")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------
+# install, doctor
+
+def bin_path():
+    return f"{HOME}/.local/bin/afc-rules"
+
+
+def cmd(tool, event):
+    return f"{bin_path()} hook {tool} {event}"
+
+
+def json_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def write_json(path, data, dry):
+    real = os.path.realpath(path)           # the accounts' copies are links to it: keep them links
+    if dry:
+        return
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    if os.path.exists(real) and not os.path.exists(real + ".bak-afc-rules"):
+        shutil.copy2(real, real + ".bak-afc-rules")
+    tmp = f"{real}.afc-rules.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    if os.path.exists(real):
+        shutil.copymode(real, tmp)
+    os.replace(tmp, real)
+
+
+def has_cmd(groups, needle):
+    for g in groups or []:
+        for h in (g.get("hooks") if isinstance(g, dict) and "hooks" in g else [g]):
+            if isinstance(h, dict) and needle in str(h.get("command", "")):
+                return True
+    return False
+
+
+def drop_cmd(groups, needle):
+    out = []
+    for g in groups or []:
+        if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+            hs = [h for h in g["hooks"] if needle not in str(h.get("command", ""))]
+            if hs:
+                out.append({**g, "hooks": hs})
+        elif not (isinstance(g, dict) and needle in str(g.get("command", ""))):
+            out.append(g)
+    return out
+
+
+CODEX_BEGIN = "# >>> afc-rules: this project's rules on every prompt, checked at every turn end (afc-rules install)"
+CODEX_END = "# <<< afc-rules"
+
+
+def codex_block():
+    return "\n".join([CODEX_BEGIN,
+                      "[[hooks.UserPromptSubmit]]", "[[hooks.UserPromptSubmit.hooks]]", 'type = "command"',
+                      f'command = "{cmd("codex", "prompt")}"', "timeout = 10", "",
+                      "[[hooks.Stop]]", "[[hooks.Stop.hooks]]", 'type = "command"',
+                      f'command = "{cmd("codex", "stop")}"', "timeout = 30", CODEX_END, ""])
+
+
+def cmd_install(args):
+    dry, remove = "--dry-run" in args, "--remove" in args
+    say = (lambda m: print(("would " if dry else "") + m))
+    tag = "afc-rules hook"
+    # Claude: ~/.claude/settings.json (the other accounts' settings.json are links to it)
+    p = f"{HOME}/.claude/settings.json"
+    if os.path.exists(p):
+        d = json_file(p); hooks = d.setdefault("hooks", {}); changed = False
+        for ev, what, t in (("UserPromptSubmit", "prompt", 10), ("Stop", "stop", 30)):
+            if remove:
+                if has_cmd(hooks.get(ev), tag):
+                    hooks[ev] = drop_cmd(hooks.get(ev), tag); changed = True
+            elif not has_cmd(hooks.get(ev), tag):
+                hooks.setdefault(ev, []).append({"hooks": [{"type": "command", "command": f"~/.local/bin/afc-rules hook claude {what}", "timeout": t}]})
+                changed = True
+        if changed:
+            say(f"{'take the hooks out of' if remove else 'add UserPromptSubmit and Stop hooks to'} {p}")
+            write_json(p, d, dry)
+        else:
+            print(f"Claude: {p} already {'has no' if remove else 'has the'} hooks")
+    # Gemini: ~/.gemini/settings.json (linked into the other accounts' homes)
+    p = f"{HOME}/.gemini/settings.json"
+    if os.path.exists(p) or shutil.which("gemini"):
+        d = json_file(p); hooks = d.setdefault("hooks", {}); changed = False
+        for ev, what, t in (("BeforeAgent", "prompt", 10000), ("AfterAgent", "stop", 30000)):
+            if remove:
+                if has_cmd(hooks.get(ev), tag):
+                    hooks[ev] = drop_cmd(hooks.get(ev), tag); changed = True
+            elif not has_cmd(hooks.get(ev), tag):
+                hooks.setdefault(ev, []).append({"matcher": "*", "hooks": [{"name": f"acf-rules-{what}", "type": "command",
+                                                                            "command": cmd("gemini", what), "timeout": t}]})
+                changed = True
+        if changed:
+            say(f"{'take the hooks out of' if remove else 'add BeforeAgent and AfterAgent hooks to'} {p}")
+            write_json(p, d, dry)
+        else:
+            print(f"Gemini: {p} already {'has no' if remove else 'has the'} hooks")
+    # Antigravity: ~/.gemini/config/hooks.json (every account's .gemini/config is a link to it)
+    p = f"{HOME}/.gemini/config/hooks.json"
+    if os.path.isdir(f"{HOME}/.gemini/config") or shutil.which("agy"):
+        d = json_file(p)
+        if remove:
+            if "acf-rules" in d:
+                del d["acf-rules"]; say(f"take the hook acf-rules out of {p}"); write_json(p, d, dry)
+            else:
+                print(f"Antigravity: {p} has no acf-rules hook")
+        elif "acf-rules" not in d:
+            d["acf-rules"] = {"PreInvocation": [{"type": "command", "command": cmd("agy", "prompt"), "timeout": 10}],
+                              "Stop": [{"type": "command", "command": cmd("agy", "stop"), "timeout": 30}]}
+            say(f"add the hook acf-rules (PreInvocation, Stop) to {p}")
+            write_json(p, d, dry)
+        else:
+            print(f"Antigravity: {p} already has the hook acf-rules")
+    # Codex: ~/.codex/config.toml (linked into the other accounts' homes)
+    p = f"{HOME}/.codex/config.toml"
+    if os.path.exists(p):
+        real = os.path.realpath(p)
+        with open(real, encoding="utf-8") as f:
+            text = f.read()
+        there = CODEX_BEGIN in text
+        new = None
+        if remove and there:
+            new = re.sub(r"\n?" + re.escape(CODEX_BEGIN) + r".*?" + re.escape(CODEX_END) + r"\n?", "\n", text, flags=re.S)
+        elif not remove and not there:
+            new = text.rstrip("\n") + "\n\n" + codex_block()
+        if new is None:
+            print(f"Codex: {p} already {'has no' if remove else 'has the'} hooks")
+        else:
+            import tomllib
+            tomllib.loads(new)      # refuse to write a file Codex could not read
+            say(f"{'take the hooks out of' if remove else 'add UserPromptSubmit and Stop hooks to'} {p}")
+            if not dry:
+                if not os.path.exists(real + ".bak-afc-rules"):
+                    shutil.copy2(real, real + ".bak-afc-rules")
+                tmp = f"{real}.afc-rules.{os.getpid()}"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(new)
+                shutil.copymode(real, tmp)
+                os.replace(tmp, real)
+            if not remove:
+                print("  Codex runs a new hook only after you trust it: type /hooks in a Codex pane and trust the two afc-rules hooks.")
+    if not remove:
+        print("Agents started from now on use the hooks; running ones pick them up when they restart.")
+    return 0
+
+
+def cmd_doctor(_args):
+    bad = 0
+    print(f"Mode: {mode()} (rules in ~/.config/agents/settings: off, report, enforce)")
+    checks = [
+        ("Claude", f"{HOME}/.claude/settings.json", lambda d: has_cmd((d.get("hooks") or {}).get("UserPromptSubmit"), "afc-rules hook")
+         and has_cmd((d.get("hooks") or {}).get("Stop"), "afc-rules hook")),
+        ("Gemini", f"{HOME}/.gemini/settings.json", lambda d: has_cmd((d.get("hooks") or {}).get("BeforeAgent"), "afc-rules hook")
+         and has_cmd((d.get("hooks") or {}).get("AfterAgent"), "afc-rules hook")),
+        ("Antigravity", f"{HOME}/.gemini/config/hooks.json", lambda d: "acf-rules" in d),
+    ]
+    for name, p, ok in checks:
+        try:
+            good = ok(json_file(p))
+        except (OSError, ValueError, AttributeError):
+            good = False
+        print(f"  {'ok' if good else '!!':4}  {name}: {'hooks in' if good else 'no hooks in'} {p}")
+        bad += not good
+    p = f"{HOME}/.codex/config.toml"
+    try:
+        good = CODEX_BEGIN in open(p, encoding="utf-8").read()
+    except OSError:
+        good = False
+    print(f"  {'ok' if good else '!!':4}  Codex: {'hooks in' if good else 'no hooks in'} {p}" + ("  (trust them once with /hooks in Codex)" if good else ""))
+    bad += not good
+    if bad:
+        print("        afc-rules install adds what is missing")
+    print("Global instruction files (they load on top of every project's own)")
+    any_global = False
+    for t in TOOLS:
+        for g in global_md(t):
+            print(f"  note  {t}: {g}"); any_global = True
+    if not any_global:
+        print("  ok    none: each agent reads only the rule files of the project it works in")
+    print("TokenOps projects in the fleet")
+    roots = projects()
+    for r in roots:
+        P = Project(r)
+        print(f"  ok    {os.path.basename(r)}: {len(P.records)} fix records, index budget {P.budget}, "
+              f"entry files {', '.join(n for n in ('CLAUDE.md', 'AGENTS.md', 'GEMINI.md') if P.has(n)) or 'none'}")
+    if not roots:
+        print("  note  none: the check has nothing to do")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "hook":
+        tool = argv[1] if len(argv) > 1 else ""
+        event = argv[2] if len(argv) > 2 else ""
+        if tool not in TOOLS or event not in ("prompt", "stop"):
+            return 0
+        # a hook must never break or hold up a turn: any failure, or 20 seconds, and the turn goes on
+        def too_long(*_):
+            raise TimeoutError("took over 20 seconds")
+        signal.signal(signal.SIGALRM, too_long)
+        signal.alarm(20)
+        try:
+            hook(tool, event)
+        except BaseException as e:      # noqa: BLE001 - deliberately everything
+            if isinstance(e, SystemExit):
+                raise
+            try:
+                sys.stderr.write(f"afc-rules: {type(e).__name__}: {e}\n")
+                allow(tool)
+            except Exception:
+                pass
+        return 0
+    commands = {"check": cmd_check, "replay": cmd_replay, "show": cmd_show, "install": cmd_install, "doctor": cmd_doctor}
+    if argv[0] not in commands:
+        print(f"afc-rules: unknown command {argv[0]} (afc-rules --help)", file=sys.stderr)
+        return 2
+    return commands[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

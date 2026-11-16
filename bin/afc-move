@@ -15,6 +15,7 @@
 # wrap-around to the far side is not followed. A maximised tab is put back to normal first, so the
 # move is visible. Agents keep running through all of it; Claude panes redraw to their new width
 # by themselves (afc-reflow).
+MAC=''; [[ "$OSTYPE" != darwin* ]] || . "$HOME/.local/lib/afc/mac.sh"   # macOS: Homebrew's bash and GNU tools (lib/afc/mac.sh)
 t() { tmux "$@"; }
 say() { t display-message -d 3000 "$1" 2>/dev/null; }
 

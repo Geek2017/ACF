@@ -15,6 +15,7 @@
 # Called from bindings in ~/.tmux.conf, inside tmux. A split goes back to the tab it came from
 # (remembered in the pane option @min_from), as a column on the right; if that tab is gone, it
 # joins the tab you are looking at. A tab's only pane cannot be minimised: the tab would vanish.
+MAC=''; [[ "$OSTYPE" != darwin* ]] || . "$HOME/.local/lib/afc/mac.sh"   # macOS: Homebrew's bash and GNU tools (lib/afc/mac.sh)
 STASH=afcmin
 t() { tmux "$@"; }
 say() { t display-message -d 3500 "$1" 2>/dev/null; }
