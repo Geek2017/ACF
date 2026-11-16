@@ -15,14 +15,15 @@ Moved here: 2026-11-16, on the Kubuntu 24.04 workstation.
 | Capability | What you get |
 |---|---|
 | **Many agents, one window** | One tab per project and any number of splits inside it. Each split runs Claude Code, Codex, Gemini CLI, Antigravity or a plain terminal, started fresh, in plan mode (read-only for Codex) or with no permission prompts. |
-| **Picks up where you stopped** | `agents` reopens every project on its list and continues each one's last chat. A folder whose chat is already open in another window gets a note instead of a second agent. |
-| **Several accounts per tool** | Alt+G moves the agent in a pane to another account (Claude keeps the same chat) or to another tool. A new split starts on the account of the pane it came from. A label can stand in for an account name on a shared screen. |
-| **Shows what every agent is doing** | A tab's name is underlined while an agent in it works, and the tab blinks when one has finished or is waiting for an answer. Each pane's header shows tool, account, model, effort, tokens, share of the model's window, cost and plan limits. |
+| **Picks up where you stopped** | After a restart `agents` reopens every tab and every split as it was: each agent on its own account and chat, the same sizes, minimised splits still minimised. A chat that is already open in another window gets a note instead of a second agent. |
+| **Several accounts per tool** | Alt+G moves the agent in a pane to another account (Claude keeps the same chat) or to another tool. A new split starts on the account of the pane it came from. The Alt+G list shows what each Claude account has used of its plan limits and which has the most room, and a warning comes when a pane's account passes 90%. An agent moved to another tool can be handed the chat so far. A label can stand in for an account name on a shared screen. |
+| **Shows what every agent is doing** | A tab's name is underlined while an agent in it works, and the tab blinks when one has finished or is waiting for an answer. When you are not looking at that tab, a desktop notification says so, and a click on it brings the tab up. Alt+L lists every agent in the fleet with what it is doing. Each pane's header shows tool, account, model, effort, tokens, share of the model's window, cost and plan limits. |
 | **A window manager for splits** | Move, merge, minimise, maximise and close with a key or a click on the pane header. A thin scrollbar through the chat, copy longer than one screen, paste of text or an image. |
+| **A folder of its own for a split** | A split can start in its own git worktree, on its own branch. Two agents in one project then no longer write over each other's files; one agent's work comes back with an ordinary `git merge`. |
 | **A resource budget** | Every agent and everything it starts runs in one capped group: 3 CPU cores, slowed at 12 GB of memory, stopped at 14 GB. Builds, tests and agents get lower priority. At most 2 heavy jobs and 3 dev servers run at once; the rest wait their turn. The machine stays awake while agents work. |
 | **A permanent chat log** | Every 15 minutes each tool's chat records are copied into the project they belong to: a searchable database and one readable file per thread, with secrets replaced by `[redacted]`. No model is asked, so it costs no tokens. |
 | **Plan limits and cost at a glance** | Session and weekly limits per account for Claude, Codex and Antigravity, and what each conversation would cost at list prices. |
-| **Rebuilds from this folder** | `install.sh` sets a machine up; `build-tmux.sh` builds the patched tmux with no download and no sudo. |
+| **Rebuilds from this folder** | `install.sh` sets a machine up; `build-tmux.sh` builds the patched tmux with no download and no sudo. `agents --doctor` checks that everything is in place; `test-fleet.sh` tries the launcher on a throw-away fleet. |
 
 ## What you see
 
@@ -52,6 +53,7 @@ Moved here: 2026-11-16, on the Kubuntu 24.04 workstation.
 | Alt+\ / Alt+- | split right / below, with a menu of what to start there |
 | Alt+G | change the agent or account in this pane |
 | Alt+M | pick the model or effort (Claude, Gemini) without the agent's own tall picker |
+| Alt+L | list every agent in the fleet with what it is doing; pick one to go to it |
 | Alt+J | move this split: left, right, up, down, merge under a neighbour, own column |
 | Alt+H / Alt+U | minimise this split / bring a minimised one back |
 | Alt+Z | maximise this split to the whole tab, and back |
@@ -68,7 +70,12 @@ Everything with a button also lights up under the pointer and can be clicked, me
 
 | Command | Does |
 |---|---|
-| `agents` | open the fleet, or attach to it if it is running |
+| `agents` | open the fleet, or attach to it if it is running; a start reopens the saved tabs and splits |
+| `agents --fresh` | start with one pane per project instead of the saved splits |
+| `agents --layout` | show the saved tabs and splits: what the next start reopens |
+| `agents --overview` | every agent in one list: tab, working / waiting / done, tokens, cost, limits |
+| `agents --worktrees` | the work folders made for splits; `--prune` removes the finished ones |
+| `agents --doctor` | check that links, hooks, services and the watcher are in place; changes nothing |
 | `agents --add [folder] [name]` | add a project (default: this folder); opens its tab if the fleet is up |
 | `agents --status` | list the tabs and the fleet's memory |
 | `agents --dry-run` | show what would open, start nothing |
@@ -80,6 +87,7 @@ Everything with a button also lights up under the pointer and can be clicked, me
 | `afc-logs threads`, `afc-logs show THREAD` | list the threads, print one |
 | `jobq <command>` | run a heavy command when a slot is free, instead of being paused |
 | `jobq --status`, `autonice --status` | who holds the slots, what is throttled |
+| `bash _tools/test-fleet.sh` | try the launcher on a throw-away fleet: about 80 checks in three minutes, nothing real is touched |
 
 ## How it works
 
@@ -143,9 +151,10 @@ The fleet runs no model and sits in none of these requests. It decides where an 
 
 **Changing the account or tool in a pane** (Alt+G)
 
-1. The menu lists every account of every tool, with who is signed in.
+1. The menu lists every account of every tool, with who is signed in. Each Claude account shows what it has used of its plan limits, and the one with the most room is marked.
 2. Another Claude account: the pane restarts on that account and resumes the same chat. All Claude accounts share one chat store through links; only the sign-in differs. The move is remembered, so a restart reopens that chat on that account.
-3. Another tool: that agent starts in the same folder with a fresh chat.
+3. Another tool: chats do not carry over between tools, so a second menu asks what the new agent starts from. "This chat" brings the chat log up to date and starts the agent with one instruction: read that chat's log (secrets already taken out) and say where the work stands. That costs the new agent the tokens of what it reads. The other choice is a new chat.
+4. When an agent ends a turn and its account has used 90% or more of a plan limit, a notification says so and names the account with the most room. It is said once per account in half an hour.
 
 ### 2 · The ACF agents
 
@@ -155,8 +164,15 @@ An agent is one of the four tools running in a split of the fleet's tmux window:
 
 1. `agents` reads the project list, `~/.config/agents/projects`: one `<tab name> <folder>` per line.
 2. It starts the tmux server inside `agents.slice`, so everything started from a tab falls under the budget.
-3. Each project gets a tab. A folder with an earlier chat continues it, on the account that chat belongs to; otherwise a new chat starts.
+3. Each tab in the saved layout that is still on the list comes back with all its splits (below). Any other project gets a tab with one pane: a folder with an earlier chat continues it, on the account that chat belongs to; otherwise a new chat starts.
 4. The window attaches. If the fleet is already running, `agents` attaches to it; a second window gets its own view of the same agents.
+
+**The saved layout** (`~/.local/state/afc/layout`, looked at every 20 seconds)
+
+1. While the fleet runs, a watcher asks tmux every 20 seconds whether a tab or a split changed, and `agents --mark` leaves it a note when an agent ends a turn. Only then does it read the whole fleet and rewrite the file: per tab its name, project and tmux layout; per split the tool, the account, the chat and the folder.
+2. The chat is exact for Claude (its own record of the run) and Codex (the session file it holds open). Antigravity: the conversation it holds open, else the folder's newest one, for the first Antigravity split in that folder. Gemini can only be told "the latest": the first Gemini split in a folder gets that. Any further Antigravity or Gemini split in the same folder comes back with a new chat.
+3. Nothing is written unless the whole fleet could be read and did not change during the read. A layout with fewer splits than the one on file is written only after it has held still for three looks, so a closed split leaves the file about a minute later and a fleet that is going down never replaces the last good layout with half of one. `agents --kill` saves once more before it stops.
+4. At the next start each split is reopened in its place, at its size, with the focus where it was, and minimised splits go back to minimised. A split started in plan mode comes back in plan mode. The agents start 2 seconds apart, not all at once; Enter in a waiting pane starts that one now. A project taken off the list stays closed. A project tab in which every agent had ended still opens with one, on the folder's last chat. `agents --fresh` starts without the saved layout.
 
 **One turn**
 
@@ -164,6 +180,13 @@ An agent is one of the four tools running in a split of the fleet's tmux window:
 2. The model answers with text and with tool calls: read this file, edit that one, run this command.
 3. The agent carries the tool calls out in the project folder and sends the results back to the model. Steps 2 and 3 repeat until the model asks for nothing more. Then the turn ends and the reply stands in the pane.
 4. An agent started in plan mode only proposes changes. One with permission prompts on stops and asks before a tool call that needs your yes.
+
+**A work folder of its own** (split menu: "New agent in its own work folder")
+
+1. The launcher makes a git worktree of the project beside it, `<parent>/.acf-worktrees/<project>-<n>`, on a new branch `acf/<project>-<n>`, from the commit the split it came from is on. The agent starts there.
+2. The pane header shows the branch after its figures, as `⎇ acf/<project>-<n>`. The chat log still files that split's chats under the project.
+3. To bring the work back: `git merge acf/<project>-<n>` in the project folder. `agents --worktrees` lists the folders with their state; `agents --worktrees --prune` removes those that are finished: nothing uncommitted, every commit already in the project, no split in it. It asks first, and git does the removing without force.
+4. A folder that is not a git project gets no work folder: the pane says so and starts no agent.
 
 ### 3 · The ACF programs
 
@@ -178,9 +201,11 @@ Four pieces stand between the agents and the output, one per arrow that leaves t
 
 **Tab signals** (`agents --mark`)
 
-1. Hooks in each tool's settings call `agents --mark`: `busy` when a prompt is sent or a tool runs, `done` when the turn ends, `wait` when it asks for permission, `end` when it closes.
-2. `--mark` sets a flag on the pane and tmux draws it: the tab's name is underlined while any agent in it is busy, and the tab blinks when one finishes or waits while you are looking elsewhere. Looking at the tab clears the blink.
-3. A turn that ends with a background command still running stays underlined until that command ends.
+1. Hooks in Claude's settings call `agents --mark`: `busy` when a prompt is sent or a tool runs, `done` when the turn ends, `wait` when it asks for permission, `end` when it closes.
+2. Codex has no such hooks, so the fleet's watcher reads the same from Codex's session file, which names the start and the end of every turn. Antigravity keeps no such marks, and Gemini only reports when its settings carry the hooks: for those the watcher takes "its chat file is being written" as working and 20 quiet seconds as done. That is an estimate.
+3. `--mark` sets a flag on the pane and tmux draws it: the tab's name is underlined while any agent in it is busy, and the tab blinks when one finishes or waits while you are looking elsewhere. Looking at the tab clears the blink.
+4. A turn that ends with a background command still running stays underlined until that command ends.
+5. When an agent asks you something, or ends a turn that took 30 seconds or more, and you are not looking at its tab in a focused window, a desktop notification says which tab. "Open the tab" in it brings the Agents window and that split to the front. Estimated signals send none. `~/.config/agents/settings` turns these off or changes the 30 seconds.
 
 **The pane header** (`afc-bar`, redrawn about once a second)
 
@@ -203,7 +228,8 @@ What a turn leaves behind, and where.
 |---|---|---|
 | The work | the project folder: the files the agent edited and whatever its commands produced | the agent's tool calls, inside the budget |
 | The reply | the pane; tmux keeps the chat history for the scrollbar | the agent |
-| Tab signals | the tab's name in the bottom bar: underlined while an agent works, blinking when one is done or waiting | the tools' hooks, then `agents --mark` |
+| Tab signals | the tab's name in the bottom bar: underlined while an agent works, blinking when one is done or waiting | Claude's hooks or the watcher, then `agents --mark` |
+| Notifications | the desktop, when an agent is done or waiting and you are not looking at its tab | `agents --mark`, then `agents --notify` |
 | Figures | the pane header and the bottom bar: tool, account, model, effort, tokens, cost, plan limits, fleet memory | `afc-statusline` or `afc-agent-info`, then `afc-bar` |
 | The chat log | `<project>/logs/acf/`: `acf.db` and one `.md` file per thread, secrets redacted | `afc-logs` |
 
@@ -213,7 +239,7 @@ What a turn leaves behind, and where.
 
 | Path | Home path | What it is |
 |---|---|---|
-| `bin/agents` | link: `~/.local/bin/agents` (also as `afc`) | the launcher: opens the fleet, tabs, splits, account and split menus |
+| `bin/agents` | link: `~/.local/bin/agents` (also as `afc`) | the launcher: opens the fleet, tabs, splits, account and split menus; saves the layout and reopens it |
 | `bin/afc-bar` | link: `~/.local/bin/` (so are all `bin/afc-*` and the two usage tools) | draws the pane header and the bottom bar's figures |
 | `bin/afc-statusline` | | Claude's status-line hook: records model, effort, limits, tokens, cost per pane |
 | `bin/afc-agent-info` | | the same facts for Codex, Gemini and Antigravity, read from their own chat records |
@@ -227,13 +253,13 @@ What a turn leaves behind, and where.
 | `tmux/tmux.conf` | link: `~/.tmux.conf` | all keys, bars, hooks and the scrollbar |
 | `tmux/afc-tmux-3.8.patch` | copy: `~/.local/opt/tmux-3.8/` | the changes to tmux 3.8 the fleet needs (below) |
 | `tmux/src/`, `tmux/deps/`, `tmux/SHA256SUMS` | | the tmux 3.8 source, the build packages, and their checksums: what `build-tmux.sh` builds from |
-| `config/agents/` | copy: `~/.config/agents/` | account lists per tool, project list, price table, labels |
+| `config/agents/` | copy: `~/.config/agents/` | account lists per tool, project list, price table, labels, `settings` (notifications, limit warning, start gap) |
 | `config/systemd/user/` | copy: `~/.config/systemd/user/` | `agents.slice` (the budget), `autonice`, the chat-log timer |
 | `config/autonice/rules` | copy: `~/.config/autonice/` | which programs get throttled or queued |
 | `config/alacritty/` | copy: `~/.config/alacritty/` | the terminal the fleet window runs in |
 | `config/claude/`, `config/gemini/` | | only the fleet's keys from those tools' settings, to merge by hand |
 | `share/` | link: `~/.local/share/` | the desktop launcher, the window-raise script, the no-browser stand-ins |
-| `_tools/` | | `collect.sh`, `install.sh`, `build-tmux.sh` |
+| `_tools/` | | `collect.sh`, `install.sh`, `build-tmux.sh`, `test-fleet.sh` |
 | `logs/acf/` | | this folder's own chat log, written by `afc-logs` when an agent works here (raw transcripts: they name the real account) |
 
 Not here, on purpose: sign-ins, other projects' chats and logs, and the built tmux program (it is rebuilt from `tmux/` and stays on the home disk, so tmux itself starts even without this drive).
@@ -267,7 +293,8 @@ To change tmux itself: unpack the source, apply the patch, edit, then write the 
 
 - **Claude runs in classic mode** (`"tui": "default"`): that is what lets tmux keep the chat history for the scrollbar. The price is that Claude does not re-wrap on its own; `afc-reflow` and `afc-gap` press Ctrl+L for it.
 - **A chat belongs to an account.** A restart reopens each chat on the account that owns it, and a new split takes the account of the pane it came from. Resuming a chat on another organisation's account makes Claude drop its earlier thinking.
-- **A fleet restart stops every agent.** Chats resume; the step in progress, extra splits, minimised splits and jobs in terminal splits do not.
+- **A fleet restart stops every agent.** Tabs, splits and chats come back (the saved layout, above). The step an agent was in the middle of, jobs in terminal splits and a maximised split do not, and a terminal split comes back as an empty shell in its folder. A split that ran with no permission prompts comes back in normal mode on purpose: nothing should run unasked after a restart you may not have watched.
+- **A work folder starts from the last commit.** Changes not yet committed in the project are not in it, and neither is anything git ignores (`node_modules`, `.env`), so the agent there may have to install first.
 - **Start the fleet from the desktop**, not from inside an agent's shell: that shell's environment would leak into every agent.
 - **Claude deletes its own chat files after 30 days.** `afc-logs` is the permanent copy.
 

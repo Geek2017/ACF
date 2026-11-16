@@ -1,0 +1,8 @@
+# Fleet settings: one "name value" per line. Every line is optional; each line below shows what the
+# fleet does when it is missing. Take the # off a line to change it. Read at each use: a change
+# applies at once, with no restart.
+#notify-wait on        # desktop notification when an agent asks you something
+#notify-done on        # ... and when an agent finishes a turn that took a while
+#notify-after 30       # how many seconds a turn must have taken for that
+#limit-warn 90         # warn once the pane's account has used this share (percent) of a plan limit
+#start-gap 2           # seconds between one agent's start and the next after a restart

@@ -179,6 +179,21 @@ def is_workspace(d):
     return _ws[d]
 
 
+def worktree_main(d):
+    """For a git worktree (its .git is a file that names <main>/.git/worktrees/<name>): the main
+    checkout it belongs to. The fleet gives a split its own worktree (agents --pane wt-...), and
+    what an agent says there belongs in the log of the project it was split from."""
+    g = os.path.join(d, ".git")
+    try:
+        if os.path.isfile(g):
+            line = open(g).readline().strip()
+            if line.startswith("gitdir:") and "/.git/worktrees/" in line:
+                return os.path.realpath(line[7:].strip().split("/.git/worktrees/")[0])
+    except OSError:
+        pass
+    return None
+
+
 def project_for(cwd):
     """The project folder a thread belongs to: walk up from where the agent ran to the first folder
     that is a fleet project or carries a project marker (.git, CLAUDE.md, AGENTS.md, _ai). If that
@@ -194,6 +209,9 @@ def project_for(cwd):
         return HOME_PROJECT
     d, child = cwd, None
     while d not in ("/", HOME) and len(d) > 1:
+        main = worktree_main(d)
+        if main and main != d and os.path.isdir(main):
+            return project_for(main)
         if is_project(d):
             if child and is_workspace(d):
                 return child

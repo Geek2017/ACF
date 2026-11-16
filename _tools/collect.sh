@@ -43,7 +43,7 @@ for f in agents.slice agents-pool.service autonice.service keepawake-agents.serv
 done
 
 A="$HOME/.config/agents"
-for f in accounts accounts-agy accounts-codex accounts-gemini account-labels prices projects log-projects; do
+for f in accounts accounts-agy accounts-codex accounts-gemini account-labels prices projects log-projects settings; do
   put "$A/$f" "config/agents/$f"
 done
 put "$HOME/.config/autonice/rules" "config/autonice/rules"

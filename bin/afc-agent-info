@@ -6,6 +6,7 @@ for Claude):
   afc-agent-info codex  <pane pid>     gpt-5.6-luna|medium||14k 5% ~$0.02
   afc-agent-info gemini <pane pid>     gemini-3.8-flash|||12k ~$0.31
   afc-agent-info agy    <pane pid>     Gemini 4 Hydrogen|high||131k 51% ~$1.96
+  afc-agent-info --chat <tool> <pane pid>   <chat id><TAB><its record file>: the chat that line is read from
 
 Nothing is asked of any provider. The numbers come from the chat record each tool keeps on disk:
   Codex   <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl: the newest one started in the pane's folder.
@@ -289,7 +290,57 @@ def agy(env, cwd):
 READERS = {"codex": codex, "gemini": gemini, "agy": agy}
 
 
+def chat_of(tool, env, cwd):
+    """(chat id, record file) of the newest chat that tool has for this folder, found the way the
+    readers above find it; ("", "") when there is none."""
+    if tool == "codex":
+        home = env.get("CODEX_HOME") or f"{HOME}/.codex"
+        files = sorted(glob.glob(f"{home}/sessions/*/*/*/rollout-*.jsonl"), key=os.path.getmtime, reverse=True)
+        for path in files[:40]:
+            try:
+                first = json.loads(open(path).readline())
+            except Exception:
+                continue
+            if os.path.realpath((first.get("payload") or {}).get("cwd") or "") == cwd:
+                return os.path.basename(path)[-42:-6], path      # the id is the last 36 characters of the name
+    elif tool == "gemini":
+        home = env.get("GEMINI_CLI_HOME") or HOME
+        for root in glob.glob(f"{home}/.gemini/tmp/*/.project_root"):
+            try:
+                if os.path.realpath(open(root).read().strip()) != cwd:
+                    continue
+            except Exception:
+                continue
+            chats = sorted(glob.glob(f"{os.path.dirname(root)}/chats/*.jsonl"), key=os.path.getmtime, reverse=True)
+            for path in chats[:1]:
+                try:
+                    return json.loads(open(path).readline()).get("sessionId") or "", path
+                except Exception:
+                    return "", path
+    elif tool == "agy":
+        store = f"{env.get('HOME') or HOME}/.gemini/antigravity-cli"
+        try:
+            for line in reversed(tail_lines(f"{store}/history.jsonl", 200_000)):
+                if not line.strip():
+                    continue
+                try:
+                    h = json.loads(line)
+                except Exception:
+                    continue
+                if os.path.realpath(h.get("workspace") or "") == cwd and h.get("conversationId"):
+                    return h["conversationId"], f"{store}/conversations/{h['conversationId']}.db"
+        except Exception:
+            pass
+    return "", ""
+
+
 def main(argv):
+    if len(argv) == 3 and argv[0] == "--chat" and argv[1] in READERS and argv[2].isdigit():
+        env, cwd = agent_proc(int(argv[2]), argv[1])
+        chat, path = chat_of(argv[1], env, cwd)
+        if chat or path:
+            print(f"{chat}\t{path}")
+        return 0
     if len(argv) != 2 or argv[0] not in READERS or not argv[1].isdigit():
         print(__doc__, file=sys.stderr)
         return 2

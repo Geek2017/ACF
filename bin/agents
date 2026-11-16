@@ -2,7 +2,12 @@
 # agents — the Claude agent fleet: one tmux tab per project, Claude already running,
 # everything inside agents.slice (slows at 10G, hard stop at 12G, max 3 cores).
 #
-#   agents                  open the fleet, or reattach if it is already running
+#   agents                  open the fleet, or reattach if it is already running; a start reopens the saved splits
+#   agents --fresh          start with one pane per project instead of the saved splits
+#   agents --layout         show the saved tabs and splits (what the next start reopens)
+#   agents --overview       every agent in one list: tab, working / waiting / done, tokens, cost, limits (Alt+L in the fleet)
+#   agents --worktrees [--prune]  the work folders made for splits (git worktrees); --prune removes the finished ones
+#   agents --doctor         check that the links, hooks, services and the watcher are in place (changes nothing)
 #   agents --add [dir] [name]  add a project (default: this folder); opens its tab if the fleet is up
 #   agents --pick           choose (or create) a project folder in a KDE dialog, then --add it (Alt+N in the fleet)
 #   agents --status         list tabs and fleet memory
@@ -78,8 +83,34 @@ mode() {
 # Puts "bypass permissions" in the Shift+Tab cycle (as the desktop app does); agents still START in normal mode
 BYPASS=--allow-dangerously-skip-permissions
 
-pane_cmd() {
-  local claude acct=""
+# What a person may want to change, one "name value" per line in ~/.config/agents/settings (all optional):
+#   notify-wait on|off       desktop notification when an agent asks you something          (default on)
+#   notify-done on|off       ... and when an agent finishes a turn that took a while         (on)
+#   notify-after <seconds>   how long a turn must have taken for that                         (30)
+#   limit-warn <percent>     warn once the pane's account has used this much of a plan limit  (90)
+#   start-gap <seconds>      pause between one agent's start and the next after a restart     (2)
+SETTINGS="${AGENTS_SETTINGS:-$HOME/.config/agents/settings}"
+setting() {  # name default -> its value
+  local n v _
+  if [[ -r "$SETTINGS" ]]; then
+    while read -r n v _; do
+      if [[ "$n" == "$1" && -n "$v" ]]; then echo "$v"; return 0; fi
+    done < "$SETTINGS"
+  fi
+  echo "$2"
+}
+
+# After a restart the agents start a moment apart (start-gap), not all in the same second: ten agents
+# loading at once used every core the fleet has and all its memory headroom. Enter starts this one now.
+start_wait() {  # seconds
+  [[ "${1:-0}" =~ ^[0-9]+$ ]] && (( $1 > 0 )) || return 0
+  echo "Starts in $1 s: after a restart the agents start a moment apart, so the machine stays usable. Enter starts this one now."
+  read -r -t "$1" _ || true
+}
+
+pane_cmd() {  # folder [seconds to wait first]
+  local claude acct="" wait=""
+  if (( ${2:-0} > 0 )); then wait="$HOME/.local/bin/agents --wait $2; "; fi
   # Guardrail: a chat that is continued goes back on the account it belongs to, not on whatever
   # account happens to be the current default (chat_account, below). Without this a fleet restart
   # reopened every tab on one account, and Claude refused the earlier thinking of chats that
@@ -88,8 +119,8 @@ pane_cmd() {
   claude="$(account_prefix "$acct")claude $BYPASS"
   case "$(mode "$1")" in
     skip*)     echo "echo 'Claude is already open for this folder in another window. Close it there, then type: claude --continue'; exec bash" ;;
-    continue*) echo "$claude --continue; exec bash" ;;
-    *)         echo "$claude; exec bash" ;;
+    continue*) echo "$wait$claude --continue; exec bash" ;;
+    *)         echo "$wait$claude; exec bash" ;;
   esac
 }
 
@@ -112,7 +143,7 @@ account_name() { account_list | awk -F'\t' -v d="$1" '$2 == d { print $1; f = 1;
 
 current_account() {
   local name; name=$(cat "$ACCOUNT_NOW" 2>/dev/null || true)
-  if [[ -n "$name" ]] && account_dir "$name" >/dev/null; then echo "$name"; else account_list | head -1 | cut -f1; fi
+  if [[ -n "$name" ]] && account_dir "$name" >/dev/null; then echo "$name"; else account_list | awk -F'\t' 'NR == 1 { print $1 }'; fi
 }
 
 account_email() {  # folder -> who is signed in there
@@ -262,7 +293,7 @@ tool_count() { tool_accounts "$1" | wc -l; }
 tool_current() {  # tool -> the account new agents of that tool start on
   [[ "$1" == claude ]] && { current_account; return; }
   local name; name=$(cat "$(tool_now "$1")" 2>/dev/null || true)
-  if [[ -n "$name" ]] && tool_dir "$1" "$name" >/dev/null; then echo "$name"; else tool_accounts "$1" | head -1 | cut -f1; fi
+  if [[ -n "$name" ]] && tool_dir "$1" "$name" >/dev/null; then echo "$name"; else tool_accounts "$1" | awk -F'\t' 'NR == 1 { print $1 }'; fi
 }
 tool_email() {  # tool folder -> who is signed in there
   case "$1" in
@@ -355,18 +386,22 @@ in_list() {
   return 1
 }
 
-open_tab() {  # name dir
-  local cmd win; cmd=$(pane_cmd "$2")
+new_tab() {  # name dir command [tmux size options, used when this tab starts the fleet] -> prints the tab's window id
+  local name="$1" dir="$2" cmd="$3"; shift 3
   if fleet_up; then
-    win=$(t new-window -P -F '#{window_id}' -t "$SESSION:" -n "$1" -c "$2" "$cmd")
-  else
-    # The tmux server starts inside agents.slice, so every agent and everything it runs is capped
-    if ! win=$(systemd-run --user --scope --slice=agents.slice --quiet \
-         tmux -L "$SOCK" new-session -d -P -F '#{window_id}' -s "$SESSION" -n "$1" -c "$2" "$cmd"); then
-      echo "warning: could not start inside agents.slice; fleet is running uncapped" >&2
-      win=$(t new-session -d -P -F '#{window_id}' -s "$SESSION" -n "$1" -c "$2" "$cmd")
-    fi
+    t new-window -P -F '#{window_id}' -t "$SESSION:" -n "$name" -c "$dir" "$cmd"
+  # The tmux server starts inside agents.slice, so every agent and everything it runs is capped
+  elif ! systemd-run --user --scope --slice=agents.slice --quiet \
+         tmux -L "$SOCK" new-session -d "$@" -P -F '#{window_id}' -s "$SESSION" -n "$name" -c "$dir" "$cmd"; then
+    echo "warning: could not start inside agents.slice; fleet is running uncapped" >&2
+    t new-session -d "$@" -P -F '#{window_id}' -s "$SESSION" -n "$name" -c "$dir" "$cmd"
   fi
+}
+
+open_tab() {  # name dir
+  local win wait=$(( ${started:-0} * ${START_GAP:-0} ))
+  started=$(( ${started:-0} + 1 ))
+  win=$(new_tab "$1" "$2" "$(pane_cmd "$2" "$wait")")
   # @project marks a project tab: Alt+Q on its last pane takes the project off the list (--close)
   [[ -n "$win" ]] && t set-option -w -t "$win" @project "$1"
   return 0
@@ -379,15 +414,442 @@ drop_project() {  # name: comment its line out of the list, so the next start do
   cat "$tmp" > "$LIST"; rm -f "$tmp"
 }
 
+# A folder of its own for a split: a new git worktree of the project, on a new branch, made from the
+# commit the split it came from is on. Two agents in one project then no longer write over each
+# other's files; what one of them did comes back with an ordinary git merge of its branch.
+# They sit beside the project, in <parent>/.acf-worktrees/<project>-<n>, on branch acf/<project>-<n>.
+# `agents --worktrees` lists them, `agents --worktrees --prune` removes the finished ones.
+worktree_new() {  # folder in a git project -> prints the new folder; on failure prints why and fails
+  local common top name base n=1 path branch err
+  common=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || { echo "this folder is not in a git project"; return 1; }
+  git -C "$1" rev-parse --verify -q HEAD >/dev/null 2>&1 || { echo "this git project has no commit yet"; return 1; }
+  top=${common%/.git}
+  [[ "$top" != "$common" && -d "$top" ]] || { echo "cannot tell where the project's main folder is ($common)"; return 1; }
+  name=$(basename "$top"); name=${name//[^A-Za-z0-9._-]/-}
+  base="${AGENTS_WORKTREES:-$(dirname "$top")/.acf-worktrees}"
+  while [[ -e "$base/$name-$n" ]] || git -C "$top" show-ref --verify --quiet "refs/heads/acf/$name-$n"; do n=$((n + 1)); done
+  path="$base/$name-$n"; branch="acf/$name-$n"
+  mkdir -p "$base" 2>/dev/null || { echo "cannot make $base"; return 1; }
+  err=$(git -C "$1" worktree add -q -b "$branch" "$path" HEAD 2>&1) || { echo "git: $err"; return 1; }
+  echo "$path"
+}
+
+# The saved layout: the fleet's tabs and splits as they stand, so that a restart (a reboot, agents --kill,
+# a new tmux build) reopens every split with its own agent, account and chat, instead of one pane per
+# project. One line per tab, then one per split in it, tab-separated, "-" for nothing:
+#   W  <tab name>  <project, or ->  <tmux layout of the tab>
+#   P  <claude|codex|gemini|agy|term>  <account>  <chat id>  <a focused, m minimised, p plan mode>  <folder>
+# Kept current by --layout-watch while the fleet runs, written once more by --kill, read by the next
+# start (layout_restore). `agents --layout` prints it; `agents --fresh` starts without it.
+# The chat is exact for Claude (its own record of the run) and Codex (the session file it holds open).
+# Antigravity: the conversation it holds open, else the folder's newest one, for the first such split in
+# that folder. Gemini can only be told "the latest": the first Gemini split in a folder gets that. Any
+# further Antigravity or Gemini split in the same folder comes back with a new chat.
+# A split started in plan mode comes back in plan mode. One started with no permission prompts comes
+# back in normal mode on purpose: nothing should run unasked after a restart you may not have watched.
+LAYOUT="${AGENTS_LAYOUT:-${XDG_STATE_HOME:-$HOME/.local/state}/afc/layout}"
+LAYOUT_EVERY="${AGENTS_LAYOUT_EVERY:-20}"   # seconds between the watcher's looks
+TAB=$'\t'
+
+# One look at every process per save: who is whose child, what each is called, and which account each
+# home or config folder is. Asking pgrep and ps about each split instead cost over a second of CPU for
+# ten splits; this way a save is a small fraction of that.
+declare -A KIDS=() COMM=() ACCT=() SEEN=() TRK=()
+scan_procs() {
+  local pid ppid comm tool name dir k
+  KIDS=(); COMM=(); ACCT=(); SEEN=(); TRK=()
+  GEMINI_HOOKED=""; if grep -qs 'agents --mark' "$HOME/.gemini/settings.json"; then GEMINI_HOOKED=1; fi
+  while read -r pid ppid comm; do
+    [[ -n "$pid" ]] || continue
+    COMM[$pid]=$comm; KIDS[$ppid]+="$pid "
+  done < <(ps -e -o pid=,ppid=,comm=)
+  for tool in "${TOOLS[@]}"; do
+    while IFS=$TAB read -r name dir; do
+      k="$tool$TAB$dir"; [[ -n "${ACCT[$k]:-}" ]] || ACCT[$k]=$name
+    done < <(tool_accounts "$tool")
+  done
+}
+
+scan_agent() {  # pane pid -> AP and AK: its agent's pid and kind, found as pane_agent finds them, from scan_procs' table
+  local pids="$1" p next _ re='/bin/gemini |gemini-cli/'
+  local -a args
+  AP=""; AK=""
+  for _ in 1 2 3 4; do
+    next=""
+    for p in $pids; do
+      case "${COMM[$p]:-}" in
+        claude|codex|agy|gemini) AP=$p; AK=${COMM[$p]}; return 0 ;;
+        node) args=(); mapfile -d '' args 2>/dev/null < "/proc/$p/cmdline" || true   # Gemini is a node script
+              if [[ "${args[*]} " =~ $re ]]; then AP=$p; AK=gemini; return 0; fi ;;
+      esac
+      next+="${KIDS[$p]:-}"
+    done
+    pids=$next; [[ -n "$pids" ]] || break
+  done
+  return 1
+}
+
+proc_env() {  # pid, variable -> PV: its value in that process's environment (the last one, as claude_dir takes it)
+  local -a env; local e
+  PV=""; env=(); mapfile -d '' env 2>/dev/null < "/proc/$1/environ" || true
+  for e in "${env[@]}"; do [[ "$e" == "$2="* ]] && PV=${e#*=}; done
+  return 0
+}
+
+arg_after() {  # pid, word -> PV: the argument that follows that word on the process's command line
+  local -a args; local i
+  PV=""; args=(); mapfile -d '' args 2>/dev/null < "/proc/$1/cmdline" || true
+  for ((i = 0; i + 1 < ${#args[@]}; i++)); do
+    if [[ "${args[i]}" == "$2" ]]; then PV=${args[i + 1]}; return 0; fi
+  done
+  return 0
+}
+
+agent_open() {  # agent pid, pattern -> OF: a file matching it that the agent, or a process under it, holds open
+  local pids="$1" p next line _
+  OF=""
+  for _ in 1 2 3; do
+    next=""
+    for p in $pids; do
+      while read -r line; do
+        line=${line##* -> }
+        if [[ "$line" =~ $2 ]]; then OF=$line; return 0; fi
+      done < <(ls -l "/proc/$p/fd" 2>/dev/null)
+      next+="${KIDS[$p]:-}"
+    done
+    pids=$next; [[ -n "$pids" ]] || break
+  done
+  return 0
+}
+
+pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its agent is still starting
+  local p kind dir acct="" chat="" cwd rec re k mode="" rf="" out f
+  local -a args
+  if scan_agent "$1"; then
+    p=$AP; kind=$AK
+    proc_env "$p" "$(tool_var "$kind")"; dir=${PV:-$(tool_default "$kind")}
+    k="$kind$TAB$dir"; acct=${ACCT[$k]:-}
+    cwd=$(readlink "/proc/$p/cwd" 2>/dev/null || true)
+    case "$kind" in
+      claude) rec=""; IFS= read -r -d '' rec 2>/dev/null < "$dir/sessions/$p.json" || true   # Claude's own record of this run
+              re='"sessionId"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_-]+)"'
+              if [[ "$rec" =~ $re ]]; then chat=${BASH_REMATCH[1]}
+              # No record yet and the agent is under two minutes old: it is still starting. Saving now would
+              # write this split down without its chat, so the whole save waits for the next look.
+              elif (( $(ps -o etimes= -p "$p" 2>/dev/null || echo 999) < 120 )); then return 1
+              else arg_after "$p" --resume; chat=$PV; fi
+              arg_after "$p" --permission-mode; [[ "$PV" == plan ]] && mode=p ;;
+      # A resumed Codex or Antigravity opens its record only at its next turn; until then the id is on its command line
+      codex)  agent_open "$p" '/sessions/.*rollout-[^/]*\.jsonl$'; re='-([0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$'
+              if [[ "$OF" =~ $re ]]; then chat=${BASH_REMATCH[1]}; rf=$OF; else arg_after "$p" resume; chat=$PV; fi
+              arg_after "$p" --sandbox; [[ "$PV" == read-only ]] && mode=p ;;
+      agy)    agent_open "$p" '/antigravity-cli/conversations/[^/]*\.db$'; re='/([^/]+)\.db$'
+              if [[ "$OF" =~ $re ]]; then chat=${BASH_REMATCH[1]}; rf=$OF; else arg_after "$p" --conversation; chat=$PV; fi
+              arg_after "$p" --mode; [[ "$PV" == plan ]] && mode=p ;;
+      gemini) arg_after "$p" --approval-mode; [[ "$PV" == plan ]] && mode=p ;;
+    esac
+    # Antigravity and Gemini may hold nothing open that names their chat. afc-agent-info then finds the
+    # folder's newest chat, as it does for the pane header. That is this split's chat only for the first
+    # such split in a folder, so only that one is given it. (Gemini can only be told "the latest", so
+    # for Gemini the id is not kept; layout_restore gives the first Gemini split in a folder that.)
+    if [[ "$kind" == agy && ! "$chat" =~ ^[A-Za-z0-9_.]+ ]]; then
+      k="$kind$TAB$acct$TAB$cwd"
+      if [[ -z "${SEEN[$k]:-}" ]]; then
+        SEEN[$k]=1
+        out=$("$HOME/.local/bin/afc-agent-info" --chat agy "$1" 2>/dev/null || true)
+        if [[ "$out" == *$TAB* ]]; then chat=${out%%$TAB*}; rf=${out#*$TAB}; fi
+      fi
+    fi
+    # Gemini tells the fleet about its turns through hooks, when its settings have them. Without, its
+    # tab is read from its chat file like Antigravity's (the folder's newest: the first Gemini split there).
+    if [[ "$kind" == gemini && -z "$GEMINI_HOOKED" ]]; then
+      k="$kind$TAB$acct$TAB$cwd"
+      if [[ -z "${SEEN[$k]:-}" ]]; then
+        SEEN[$k]=1
+        out=$("$HOME/.local/bin/afc-agent-info" --chat gemini "$1" 2>/dev/null || true)
+        if [[ "$out" == *$TAB* ]]; then rf=${out#*$TAB}; fi
+      fi
+    fi
+    # Codex and Antigravity have no hooks that tell the fleet a turn began: the watcher reads that
+    # from the record each keeps (activity). Which pane, which agent, which file:
+    if [[ "$kind" == codex || "$kind" == agy || ( "$kind" == gemini && -z "$GEMINI_HOOKED" ) ]]; then TRK[$3]="$kind$TAB$p$TAB$rf"; fi
+  else
+    kind=term; cwd=$(readlink "/proc/$1/cwd" 2>/dev/null || true)
+    # No agent, but the pane's own command is still the launcher, not yet the shell it ends in: an
+    # agent that waits its turn after a restart (start_wait), or one between two lines of its start.
+    # It is not a terminal, so the save waits. Ten minutes on, it is taken for what it looks like.
+    args=(); mapfile -d '' args 2>/dev/null < "/proc/$1/cmdline" || true
+    if [[ " ${args[*]} " == *" --pane "* || "${args[*]}" == *"claude "*"exec bash"* ]] &&
+       (( $(ps -o etimes= -p "$1" 2>/dev/null || echo 999) < 600 )); then return 1; fi
+  fi
+  [[ "$acct" =~ ^[A-Za-z0-9_.-]+$ ]] || acct=-
+  [[ "$chat" =~ ^[A-Za-z0-9_.-]+$ && "$chat" != -* ]] || chat=-
+  f="${2#-}$mode"; [[ -n "$f" ]] || f=-      # a = the focused split, m = minimised, p = started in plan mode
+  printf 'P\t%s\t%s\t%s\t%s\t%s\n' "$kind" "$acct" "$chat" "$f" "${cwd:-$HOME}"
+}
+
+layout_scan() {  # prints the running fleet as W and P lines; fails when it cannot be read whole
+  local wins panes hidden win name project layout w pid flag id
+  wins=$(t list-windows -t "$SESSION" -F "#{window_id}$TAB#{?window_name,#{window_name},-}$TAB#{?#{@project},#{@project},-}$TAB#{window_layout}") || return 1
+  panes=$(t list-panes -s -t "$SESSION" -F "#{window_id}$TAB#{pane_pid}$TAB#{?pane_active,a,-}$TAB#{pane_id}") || return 1
+  # Minimised splits wait in the holding session afcmin (afc-min); @min_from is the tab each came from
+  hidden=$(t list-panes -s -t "=afcmin" -F "#{?#{@min_from},#{@min_from},-}$TAB#{pane_pid}${TAB}m$TAB#{pane_id}" 2>/dev/null || true)
+  scan_procs
+  while IFS=$TAB read -r win name project layout; do
+    [[ -n "$win" ]] || continue
+    printf 'W\t%s\t%s\t%s\n' "$name" "$project" "$layout"
+    while IFS=$TAB read -r w pid flag id; do
+      [[ "$w" == "$win" && -n "$pid" ]] || continue
+      pane_line "$pid" "$flag" "$id" || return 1
+    done <<< "$panes"$'\n'"$hidden"
+  done <<< "$wins"
+}
+
+# What tells one arrangement of the fleet from another: one cheap question to tmux, which the watcher asks first
+layout_sig() { t list-panes -a -F '#{window_id} #{window_name} #{@project} #{window_layout} #{pane_pid} #{@min_from}' 2>/dev/null; }
+
+# Nothing is written unless the whole fleet was read and did not change meanwhile. A fleet that is
+# going down (panes closing one after another, the server gone) therefore never replaces the last
+# good layout with half of one. "careful" (the watcher's way) also declines, with status 2, to write a
+# layout that has fewer splits than the one on file: the watcher writes that only once it has held
+# still for three looks, which a fleet on its way out does not do.
+layout_save() {  # [careful]
+  local tmp before after
+  fleet_up || return 1
+  [[ -d "${LAYOUT%/*}" ]] || mkdir -p "${LAYOUT%/*}"
+  before=$(layout_sig) || return 1
+  tmp=$(mktemp "$LAYOUT.XXXXXX") || return 1
+  if layout_scan > "$tmp" && fleet_up && after=$(layout_sig) && [[ "$before" == "$after" ]] && grep -q '^P' "$tmp"; then
+    if [[ "${1:-}" == careful && -r "$LAYOUT" ]] && (( $(grep -c '^P' "$tmp") < $(grep -c '^P' "$LAYOUT") )); then
+      rm -f "$tmp"; return 2
+    fi
+    mv -f "$tmp" "$LAYOUT"
+  else
+    rm -f "$tmp"; return 1
+  fi
+}
+
+dur() {  # seconds -> "45 s", "12 min", "2 h 5 min"
+  local s=${1:-0}
+  if (( s >= 3600 )); then echo "$((s / 3600)) h $((s % 3600 / 60)) min"; elif (( s >= 60 )); then echo "$((s / 60)) min"; else echo "$s s"; fi
+}
+
+usage_of() {  # tool account -> that account's plan limits as the pane header shows them ("S12% W30%"), or nothing
+  local u=""
+  case "$1" in
+    claude) u=$("$HOME/.local/bin/claude-usage" --short "claude $2" 2>/dev/null || true) ;;
+    codex)  u=$("$HOME/.local/bin/llm-usage" "codex $2" 2>/dev/null || true) ;;
+  esac
+  if [[ "$u" =~ ^S[0-9]+%\ W[0-9]+% ]]; then echo "$u"; fi
+}
+usage_top() {  # "S92% W30%! O5%" -> 92: the higher of session and week
+  local s=0 w=0
+  if [[ "$1" =~ S([0-9]+)% ]]; then s=${BASH_REMATCH[1]}; fi
+  if [[ "$1" =~ W([0-9]+)% ]]; then w=${BASH_REMATCH[1]}; fi
+  echo $(( s > w ? s : w ))
+}
+
+chat_log() {  # agent kind, agent pid, pane pid, folder -> the file afc-logs keeps of that agent's chat (brought up to date first)
+  local chat="" out
+  case "$1" in
+    claude) chat=$(jq -r '.sessionId // empty' "$(claude_dir "$2")/sessions/$2.json" 2>/dev/null || true) ;;
+    *)      out=$("$HOME/.local/bin/afc-agent-info" --chat "$1" "$3" 2>/dev/null || true); chat=${out%%$TAB*} ;;
+  esac
+  [[ "$chat" =~ ^[A-Za-z0-9_.-]+$ ]] || return 0
+  "$HOME/.local/bin/afc-logs" run --force >/dev/null 2>&1 || true
+  { cd "$4" 2>/dev/null && "$HOME/.local/bin/afc-logs" show "$chat" 2>/dev/null || true; } | sed -n '1s/^(file: \(.*\))$/\1/p'
+}
+
+# Every agent of the fleet, one line each, tab-separated: tab number (min = minimised), tab name, window
+# id, pane id, the tab a minimised one came from (or -), what it is doing, its header figures (tmux
+# styles kept). The figures come from afc-bar, so they read the same as the pane headers.
+overview() {
+  local T=$TAB F rows dir i=0 idx name win id pid state busy unseen since from st hdr now=$EPOCHSECONDS
+  F="#{window_index}$T#{?window_name,#{window_name},-}$T#{window_id}$T#{pane_id}$T#{pane_pid}$T#{?#{@state},#{@state},idle}$T#{?#{@busy},#{@busy},0}$T#{?#{@unseen},1,0}$T#{?#{@since},#{@since},0}"
+  rows=$(t list-panes -s -t "$SESSION" -F "$F$T-" 2>/dev/null || true)
+  rows+=$'\n'$(t list-panes -s -t "=afcmin" -F "$F$T#{?#{@min_from},#{@min_from},-}" 2>/dev/null | grep -v -- "$T-\$" || true)
+  dir=$(mktemp -d) || return 1
+  while IFS=$T read -r idx name win id pid state busy unseen since from; do
+    [[ -n "$id" ]] || continue
+    i=$((i + 1)); "$HOME/.local/bin/afc-bar" "$pid" "$id" 200 0 > "$dir/$i" 2>/dev/null &
+  done <<< "$rows"
+  wait
+  i=0
+  while IFS=$T read -r idx name win id pid state busy unseen since from; do
+    [[ -n "$id" ]] || continue
+    i=$((i + 1)); hdr=""; IFS= read -r hdr < "$dir/$i" || true
+    [[ -n "${hdr//[[:space:]]/}" ]] || continue   # no header figures: a plain terminal, not an agent
+    if [[ "$busy" == 1 ]]; then st="working"; if (( since > 0 )); then st+=" $(dur $((now - since)))"; fi
+    elif [[ "$state" == wait ]]; then st="waiting for you"
+    elif [[ "$state" == done && "$unseen" == 1 ]]; then st="done, not looked at"
+    elif [[ "$state" == done ]]; then st="done"
+    else st="idle"; fi
+    [[ "$from" == - ]] || idx=min
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$name" "$win" "$id" "$from" "$st" "${hdr# }"
+  done <<< "$rows"
+  rm -rf "$dir"
+}
+
+# Tab signals for the agents that have no hooks to give them (Codex says only "done", Antigravity
+# nothing, Gemini nothing unless its settings carry the hooks): the watcher reads them from the record
+# each keeps, for the panes layout_scan noted in TRK.
+#   Codex        its session file names the start and the end of every turn (task_started, task_complete)
+#   Antigravity, keep no such marks: the chat file being written is taken as working, and five looks
+#   Gemini       (20 seconds) with nothing written as done. An estimate, where Codex's is exact.
+# A change of state goes through --mark like any hook's, so the tab and its blink are the same as for
+# Claude. Only an exact signal also sends a desktop notification: an estimate that is wrong would
+# announce a turn as done while the agent is still thinking. $1 and $2 are two stamp files, written turn about: a record is "written
+# since the last look" when it is newer than the stamp of the look before.
+declare -A WAS=() QUIET=()
+activity() {
+  local id kind p rf last state
+  printf x > "$1"
+  for id in "${!TRK[@]}"; do
+    IFS=$TAB read -r kind p rf <<< "${TRK[$id]}"
+    if [[ ! -d "/proc/$p" ]]; then unset "TRK[$id]"; continue; fi
+    if [[ -z "$rf" ]]; then   # no record yet: Codex opens one at its first turn
+      [[ "$kind" == codex ]] || continue
+      agent_open "$p" '/sessions/.*rollout-[^/]*\.jsonl$'; [[ -n "$OF" ]] || continue
+      rf=$OF; TRK[$id]="$kind$TAB$p$TAB$rf"
+    fi
+    state=""
+    if [[ "$rf" -nt "$2" || "$rf-wal" -nt "$2" ]]; then
+      QUIET[$id]=0; state=busy
+      if [[ "$kind" == codex ]]; then
+        last=$(tail -c 65536 "$rf" 2>/dev/null | grep -oE '"type":"(task_started|task_complete|turn_aborted)"' | tail -1)
+        case "$last" in *task_complete*|*turn_aborted*) state=done ;; esac
+      fi
+    elif [[ "$kind" != codex && "${WAS[$id]:-}" == busy ]]; then
+      QUIET[$id]=$(( ${QUIET[$id]:-0} + 1 ))
+      if (( QUIET[$id] >= 5 )); then state=done; fi
+    fi
+    [[ -n "$state" && "$state" != "${WAS[$id]:-}" ]] || continue
+    WAS[$id]=$state
+    if [[ "$kind" == codex ]]; then TMUX_PANE=$id "$HOME/.local/bin/agents" --mark "$state" >/dev/null 2>&1
+    else AGENTS_NO_NOTIFY=1 TMUX_PANE=$id "$HOME/.local/bin/agents" --mark "$state" >/dev/null 2>&1; fi
+  done
+}
+
+layout_watch_start() {  # start the watcher unless one is running (it holds the lock)
+  [[ -d "${LAYOUT%/*}" ]] || mkdir -p "${LAYOUT%/*}" 2>/dev/null || return 0
+  flock -n "$LAYOUT.lock" true 2>/dev/null || return 0
+  t run-shell -b "$HOME/.local/bin/agents --layout-watch >/dev/null 2>&1" 2>/dev/null || true
+}
+
+layout_show() {  # the saved layout, readable (accounts by their label, as the fleet shows them)
+  local kind a b c d e
+  while IFS=$TAB read -r kind a b c d e || [[ -n "$kind" ]]; do
+    case "$kind" in
+      W) printf '  %s%s\n' "$a" "$([[ "$b" == - ]] && echo '   (not a project tab)' || true)" ;;
+      P) case "$a" in term) a=terminal; b=""; c="" ;; *) b=$(label_of "$b")
+            if [[ "$c" != - ]]; then c="chat ${c:0:8}"; elif [[ "$a" == gemini ]]; then c="latest chat"; else c="new chat"; fi ;;
+         esac
+         printf '      %-9s %-10s %-14s %s%s%s\n' "$a" "$b" "$c" "$e" "$([[ "$d" == *m* ]] && echo '   (minimised)' || true)" "$([[ "$d" == *p* ]] && echo '   (plan mode)' || true)" ;;
+    esac
+  done < "$LAYOUT"
+}
+
+project_dir() {  # project name -> its folder, when it is on the list and the folder is there
+  projects 2>/dev/null | awk -F'\t' -v n="$1" '$1 == n && !f { print $2; f = 1 } END { exit !f }'
+}
+
+chat_open() {  # Claude chat id -> true when a running Claude has that chat open (two on one chat collide)
+  local dir f p _
+  while IFS=$TAB read -r _ dir; do
+    for f in "$dir"/sessions/*.json; do
+      [[ -e "$f" ]] || continue
+      p=${f##*/}; p=${p%.json}
+      [[ "$(cat "/proc/$p/comm" 2>/dev/null)" == claude ]] || continue
+      [[ "$(jq -r '.sessionId // empty' "$f" 2>/dev/null)" == "$1" ]] && return 0
+    done
+  done < <(account_list)
+  return 1
+}
+
+restore_tab() {  # reopens one saved tab from the caller's name, project, layout and panes[]
+  [[ -n "$name" && ${#panes[@]} -gt 0 ]] || return 0
+  local dir="" line tool acct chat flag cwd cmd win="" id last="" focus="" pass agents_in=0 mode wait
+  local -a size=()
+  if [[ "$project" != - ]]; then
+    dir=$(project_dir "$project") || return 0   # off the list since, or its folder is gone: it stays closed
+  fi
+  # The fleet starts with no window attached: give the tab the size it had, so every split fits.
+  # tmux 3.8 writes a layout as JSON ("w":160,"h":44 first, for the whole tab); older ones as "c5d4,160x44,0,0{...".
+  local json='"w":([0-9]+),"h":([0-9]+)'
+  if [[ "$layout" =~ $json || "$layout" =~ ^[0-9a-f]+,([0-9]+)x([0-9]+), ]]; then size=(-x "${BASH_REMATCH[1]}" -y "${BASH_REMATCH[2]}"); fi
+  for line in "${panes[@]}"; do [[ "$line" == term$TAB* ]] || agents_in=1; done
+  for pass in shown minimised; do   # the splits on screen first, in their order: the layout is dealt out in that order
+    for line in "${panes[@]}"; do
+      IFS=$TAB read -r tool acct chat flag cwd <<< "$line"
+      if [[ "$flag" == *m* ]]; then [[ $pass == minimised ]] || continue; else [[ $pass == shown ]] || continue; fi
+      [[ "$tool$acct$chat" =~ ^[A-Za-z0-9_.-]+$ ]] || continue   # a damaged line
+      [[ -d "$cwd" ]] || cwd="${dir:-$HOME}"
+      if [[ "$tool" == gemini && "$chat" == - && "$gem" != *"|$acct$TAB$cwd|"* ]]; then chat=last; gem+="|$acct$TAB$cwd|"; fi
+      mode=-; [[ "$flag" == *p* ]] && mode=plan
+      wait=0
+      # A project tab always comes back with an agent: when none was left in it (they had all ended),
+      # its first pane opens the way a fresh start opens it, on the folder's last chat.
+      if [[ -z "$win" && -n "$dir" && $agents_in == 0 ]]; then
+        wait=$(( started * START_GAP )); started=$((started + 1)); cwd=$dir; cmd=$(pane_cmd "$dir" "$wait")
+      else
+        if [[ "$tool" != term ]]; then wait=$(( started * START_GAP )); started=$((started + 1)); fi
+        cmd="$HOME/.local/bin/agents --pane restore 0 $tool $acct $chat $mode $wait"
+      fi
+      if [[ -z "$win" ]]; then
+        win=$(new_tab "$name" "$cwd" "$cmd" "${size[@]}") || return 0
+        [[ -n "$win" ]] || return 0
+        id=$(t display -p -t "$win" '#{pane_id}')
+      else
+        # split off the split before it: tmux then lists them in this order, which is the order the
+        # saved layout is dealt out in
+        id=$(t split-window -d -P -F '#{pane_id}' -t "$last" -c "$cwd" "$cmd" 2>/dev/null) || continue
+        t select-layout -t "$win" tiled >/dev/null 2>&1 || true   # keeps room for the next split
+      fi
+      [[ "$flag" == *a* ]] && focus=$id
+      if [[ "$flag" == *m* ]]; then t run-shell "$HOME/.local/bin/afc-min hide $id" >/dev/null 2>&1 || true
+      else last=$id; fi   # a minimised split leaves the tab at once, so the next one is not split off it
+    done
+  done
+  [[ -n "$win" ]] || return 0
+  if [[ "$project" != - ]]; then t set-option -w -t "$win" @project "$project"; restored+=("$project"); fi
+  t select-layout -t "$win" "$layout" >/dev/null 2>&1 || true
+  if [[ -n "$focus" ]]; then t select-pane -t "$focus" 2>/dev/null || true; fi
+  n=$((n + 1))
+}
+
+layout_restore() {  # reopens the saved tabs; adds each project it opened to restored[] and counts tabs in n
+  local kind a b c d e name="" project="" layout=""
+  local -a panes=()
+  local gem=""   # the Gemini account and folder pairs already given the folder's latest chat
+  [[ -r "$LAYOUT" ]] || return 0
+  cp -f "$LAYOUT" "$LAYOUT.at-start" 2>/dev/null || true   # what this start worked from, should it go wrong
+  while IFS=$TAB read -r -u 3 kind a b c d e || [[ -n "$kind" ]]; do
+    case "$kind" in
+      W) restore_tab; name=$a; project=$b; layout=$c; panes=() ;;
+      P) panes+=("$a$TAB$b$TAB$c$TAB$d$TAB$e") ;;
+    esac
+    kind=""
+  done 3< "$LAYOUT"
+  restore_tab
+}
+
 case "${1:-}" in
-  "")
+  ""|--fresh)
     command -v tmux >/dev/null || { echo "tmux is not installed: sudo apt install tmux" >&2; exit 1; }
     if ! fleet_up; then
-      n=0
-      while IFS=$'\t' read -r name dir <&3; do open_tab "$name" "$dir"; n=$((n + 1)); done 3< <(projects)
+      n=0; restored=(); started=0
+      START_GAP=$(setting start-gap 2); [[ "$START_GAP" =~ ^[0-9]+$ ]] || START_GAP=2
+      # The saved tabs and splits first, in the order they had; then any project on the list that was
+      # not among them, one pane each. --fresh skips the saved layout: one pane per project.
+      [[ "${1:-}" == --fresh ]] || layout_restore
+      while IFS=$'\t' read -r name dir <&3; do
+        [[ " ${restored[*]:-} " == *" $name "* ]] && continue
+        open_tab "$name" "$dir"; n=$((n + 1))
+      done 3< <(projects)
       if (( n == 0 )); then echo "No projects opened. Add one: cd <project> && agents --add" >&2; exit 1; fi
       t select-window -t "$SESSION:=1"
     fi
+    layout_watch_start
     if [[ -t 0 && -z "${TMUX:-}" ]]; then
       # Fleet already on screen in another window: open an independent view (its own current tab,
       # same agents) that disappears when this window closes, instead of mirroring the other window
@@ -445,16 +907,33 @@ case "${1:-}" in
     [[ -d "$dir" ]] || dir="$PWD"   # source pane gone: stay where tmux started us
     cd "$dir"
     [[ "${2:-}" == tab ]] && tmux rename-window -t "${TMUX_PANE:-}" "$(basename "$dir")" 2>/dev/null || true
+    # wt-<what>: the same, in a folder of its own (worktree_new). Not a git project: say so, leave a shell.
+    what="${2:-term}"
+    if [[ "$what" == wt-* ]]; then
+      what=${what#wt-}
+      if made=$(worktree_new "$dir"); then
+        cd "$made"
+        echo "Own work folder: $made"
+        echo "Branch $(git branch --show-current 2>/dev/null || true), from the commit $(basename "$dir") is on; changes not committed there are not in it."
+        echo "agents --worktrees lists these folders; agents --worktrees --prune removes the finished ones."
+      else
+        echo "No work folder was made: $made"; exec bash
+      fi
+    fi
+    # A split in a work folder of its own shows its branch in the pane header (@wt, see ~/.tmux.conf)
+    if [[ "$PWD" == */.acf-worktrees/* && -n "${TMUX_PANE:-}" ]]; then
+      tmux set -p -t "$TMUX_PANE" @wt "$(git branch --show-current 2>/dev/null || true)" 2>/dev/null || true
+    fi
     # resume <chat id|last>: the agent restarted on another account by --switch
     # claude|plan|bypass <pid> <account>: Claude on that account instead (--split-menu's "another account")
     acct=$(current_account)
-    case "${2:-term}" in
+    case "$what" in
       claude|plan|bypass) acct="${4:-$(pane_account "${3:-0}")}" ;;   # the pane it was split from decides
       gemini*) acct="${4:-$(tool_current gemini)}" ;;   # gemini|gemini-plan|gemini-bypass <pid> [account]
       codex*)  acct="${4:-$(tool_current codex)}" ;;
       agy*)    acct="${4:-$(tool_current agy)}" ;;
     esac
-    case "${2:-term}" in
+    case "$what" in
       claude) claude_as "$acct" $BYPASS || true ;;                  # AGENTS_CLAUDE: test stub
       plan)   claude_as "$acct" $BYPASS --permission-mode plan || true ;;
       bypass) claude_as "$acct" $BYPASS --permission-mode bypassPermissions || true ;;
@@ -470,6 +949,50 @@ case "${1:-}" in
       agy)           tool_run agy "$acct" || true ;;
       agy-plan)      tool_run agy "$acct" --mode plan || true ;;
       agy-bypass)    tool_run agy "$acct" --dangerously-skip-permissions || true ;;
+      handoff)
+        # Alt+G to another tool, "this chat": agents --pane handoff 0 <tool> <account>. The log of the
+        # chat that is handed on was noted for this pane by --switch.
+        tool="${4:?tool}"; acct="${5:-}"; ask=()
+        note="${XDG_RUNTIME_DIR:-/tmp}/afc-handoff-${TMUX_PANE#%}"; file=$(cat "$note" 2>/dev/null || true); rm -f "$note"
+        if [[ -r "$file" ]]; then
+          ask=("The work in this folder was being done with another agent. The log of that conversation is the file $file . Read the last part of it first, and earlier parts only as far as you need them. Then tell me in a few lines where the work stands, and wait for my next message.")
+          echo "Handing on the chat in $file"
+        else echo "No log of the earlier chat was found: this is a new chat."; fi
+        tool_dir "$tool" "$acct" >/dev/null 2>&1 || acct=$(tool_current "$tool" || true)
+        case "$tool" in
+          claude) claude_as "$acct" $BYPASS "${ask[@]}" || true ;;
+          codex)  tool_run codex "$acct" "${ask[@]}" || true ;;
+          gemini) if (( ${#ask[@]} )); then tool_run gemini "$acct" -i "${ask[0]}" || true; else tool_run gemini "$acct" || true; fi ;;
+          agy)    if (( ${#ask[@]} )); then tool_run agy "$acct" --prompt-interactive "${ask[0]}" || true; else tool_run agy "$acct" || true; fi ;;
+        esac ;;
+      restore)
+        # A split the fleet had open when it last stopped (layout_restore), back on its own account and chat.
+        # Usage: agents --pane restore 0 <tool> <account|-> <chat id|last|-> [plan|-] [seconds to wait first]
+        tool="${4:-term}"; acct="${5:--}"; chat="${6:--}"; plan=()
+        case "$tool" in claude|gemini|codex|agy) ;; *) tool=term ;; esac
+        case "$tool:${7:--}" in   # a split that was started in plan mode comes back in plan mode
+          claude:plan) plan=(--permission-mode plan) ;; gemini:plan) plan=(--approval-mode plan) ;;
+          codex:plan)  plan=(--sandbox read-only) ;;    agy:plan)    plan=(--mode plan) ;;
+        esac
+        if [[ "$tool" != term ]]; then
+          start_wait "${8:-0}"
+          tool_dir "$tool" "$acct" >/dev/null 2>&1 || acct=$(tool_current "$tool" || true)   # that account left the list
+          case "$tool:$chat" in
+            claude:-) claude_as "$acct" $BYPASS "${plan[@]}" || true ;;
+            claude:*) if ! compgen -G "$HOME/.claude/projects/*/$chat.jsonl" >/dev/null; then
+                        claude_as "$acct" $BYPASS "${plan[@]}" || true   # nothing had been said in it yet, or Claude has deleted it since
+                      elif chat_open "$chat"; then
+                        echo "This chat is already open in another window. Close it there, then type: claude --resume $chat"
+                      else claude_as "$acct" $BYPASS "${plan[@]}" --resume "$chat" || true; fi ;;
+            codex:-)  tool_run codex "$acct" "${plan[@]}" || true ;;
+            codex:*)  tool_run codex "$acct" resume "$chat" "${plan[@]}" || true ;;
+            agy:-)    tool_run agy "$acct" "${plan[@]}" || true ;;
+            agy:*)    tool_run agy "$acct" --conversation "$chat" "${plan[@]}" || true ;;
+            # the folder's latest chat; when there is none Gemini stops at once, and a new chat starts instead
+            gemini:last) began=$SECONDS; tool_run gemini "$acct" "${plan[@]}" --resume latest || (( SECONDS - began > 10 )) || tool_run gemini "$acct" "${plan[@]}" || true ;;
+            gemini:*) tool_run gemini "$acct" "${plan[@]}" || true ;;
+          esac
+        fi ;;
     esac
     exec bash
     ;;
@@ -533,9 +1056,15 @@ case "${1:-}" in
       tm=(command tmux -L "$SOCK"); pane=$(fleet_pane_of $$) || exit 0
     fi
     TMUX_PANE="$pane"; tmux() { "${tm[@]}" "$@"; }
+    # A turn ended: the pane's chat may be a new one (/clear, /resume), so the saved layout is due
+    # another look; this also starts the watcher should it not be running.
+    if [[ "${2:-}" == done ]]; then { : > "$LAYOUT.dirty"; } 2>/dev/null || true; layout_watch_start || true; fi
     case "${2:-}" in
-      busy) tmux set -p -t "$TMUX_PANE" @busy 1 \; set -pu -t "$TMUX_PANE" @bgshell ;;
-      end)  tmux set -p -t "$TMUX_PANE" @busy 0 \; set -pu -t "$TMUX_PANE" @bgshell ;;
+      # @state says what the agent is doing (busy, wait, done; unset = idle) and @since when the turn
+      # began: the overview (Alt+L) shows both, and the notification says how long the turn took.
+      busy) tmux set -p -F -t "$TMUX_PANE" @since "#{?#{==:#{@state},busy},#{@since},$EPOCHSECONDS}" \; \
+                 set -p -t "$TMUX_PANE" @state busy \; set -p -t "$TMUX_PANE" @busy 1 \; set -pu -t "$TMUX_PANE" @bgshell ;;
+      end)  tmux set -p -t "$TMUX_PANE" @busy 0 \; set -pu -t "$TMUX_PANE" @bgshell \; set -pu -t "$TMUX_PANE" @state ;;
       done|wait)
         if [[ "$2" == done ]]; then
           # Walk up from this hook to the claude process; its Bash-tool shells are its direct children
@@ -549,8 +1078,23 @@ case "${1:-}" in
           fi
         fi
         tmux set -p -t "$TMUX_PANE" @busy 0 \; set -pu -t "$TMUX_PANE" @bgshell
-        win=$(tmux display -p -t "$TMUX_PANE" '#{window_id}')
-        tmux list-clients -F '#{window_id}' | grep -qxF "$win" || tmux set -w -t "$TMUX_PANE" @unseen 1
+        win=""; since=0; was=idle
+        read -r win since was < <(tmux display -p -t "$TMUX_PANE" '#{window_id} #{?#{@since},#{@since},0} #{?#{@state},#{@state},idle}') || true
+        tmux set -p -t "$TMUX_PANE" @state "$2"
+        # Is anybody looking? shown: a window of the fleet has this tab in front. watched: and that
+        # window is the one in focus on the desktop (tmux knows: focus-events on).
+        shown=0; watched=0
+        while read -r w flags; do
+          [[ "$w" == "$win" ]] || continue
+          shown=1; if [[ ",$flags," == *,focused,* ]]; then watched=1; fi
+        done < <(tmux list-clients -F '#{window_id} #{client_flags}' 2>/dev/null || true)
+        if (( ! shown )); then tmux set -w -t "$TMUX_PANE" @unseen 1; fi
+        # Not watched, and news (not a second "done" for one turn): a desktop notification. It is sent
+        # by a job of the fleet's own (--notify), so the agent's hook returns at once.
+        if (( ! watched )) && [[ "$was" != "$2" && -z "${AGENTS_NO_NOTIFY:-}" ]]; then
+          took=0; if [[ "$since" =~ ^[0-9]+$ ]] && (( since > 0 )); then took=$(( EPOCHSECONDS - since )); fi
+          tmux run-shell -b "$HOME/.local/bin/agents --notify $TMUX_PANE $2 $took >/dev/null 2>&1" 2>/dev/null || true
+        fi
         ;;
     esac
     exit 0
@@ -623,9 +1167,17 @@ case "${1:-}" in
           "New Antigravity, bypass (no asking)" u "$(split agy-bypass)"
           "New Antigravity on another account..." e "$(again pick:agy)"
           ""
+          "New agent in its own work folder..." k "$(again wt)"
+          ""
           "Agent from another tab"           a "choose-tree -Zw \"join-pane $how -t %$pane -s '%%' ; select-layout -E -t $win\""
           "Plain terminal"                   t "$(split term)"
         ) ;;
+      wt)
+        git -C "$(readlink "/proc/$pid/cwd" 2>/dev/null || echo /)" rev-parse --git-dir >/dev/null 2>&1 ||
+          { t display-message -d 4000 "This folder is not a git project, so a split cannot get a work folder of its own here"; exit 0; }
+        title="Own work folder (a git worktree on a new branch)"
+        items=("Claude" c "$(split wt-claude)" "Gemini" g "$(split wt-gemini)" "Codex" x "$(split wt-codex)"
+               "Antigravity" n "$(split wt-agy)" "" "Plain terminal" t "$(split wt-term)") ;;
       pick)
         title="New Claude on which account?"; items=(); key=0; mine=$(pane_account "$pid")
         while IFS=$'\t' read -r name dir; do
@@ -660,12 +1212,18 @@ case "${1:-}" in
     here=$("$0" --who "$pid" || true)
     item() {  # label key target
       local label="$1"; [[ "$4" == "$here" ]] && { label="$label   (this agent)"; start=$(( ${#items[@]} / 3 )); }
-      items+=("$label" "$2" "run-shell -b '$HOME/.local/bin/agents --switch $3 $pane $pid'")
+      items+=("$label" "$2" "run-shell -b '$HOME/.local/bin/agents --switch $3 $pane $pid ask $client'")
     }
-    items=(); key=0
+    # Each Claude account with what it has used of its plan limits, and which has the most room left
+    items=(); key=0; best=""; low=101; declare -A use=()
     while IFS=$'\t' read -r name dir; do
-      key=$((key + 1))
-      item "Claude  $(shown "$name" "$(account_email "$dir")")" "$key" "$name" "claude $name"
+      use[$name]=$(usage_of claude "$name")
+      if [[ -n "${use[$name]}" ]]; then top=$(usage_top "${use[$name]}"); if (( top < low )); then low=$top; best=$name; fi; fi
+    done < <(account_list)
+    while IFS=$'\t' read -r name dir; do
+      key=$((key + 1)); u=${use[$name]:-}; room=""
+      if [[ -n "$u" && "$name" == "$best" ]]; then room="  (most room)"; fi
+      item "Claude  $(shown "$name" "$(account_email "$dir")")${u:+   $u}$room" "$key" "$name" "claude $name"
     done < <(account_list)
     items+=("")   # separator
     for tool in gemini codex agy; do
@@ -687,6 +1245,7 @@ case "${1:-}" in
     # A pane with an idle shell gets the agent too; a pane busy with anything else is left alone.
     # Usage: agents --switch <account|gemini|codex> <pane-id> <pane-pid>
     to="${2:?account, gemini[:account], codex[:account] or agy[:account]}"; pane="%${3#%}"; pid="${4:?pane pid}"; dir="" tdir=""
+    orig="$2"; how="${5:-}"; client="${6:-}"   # ask <client>: from the Alt+G menu; handoff | fresh: its answer
     case "$to" in
       gemini|codex|agy|gemini:*|codex:*|agy:*)
         tool="${to%%:*}"; name="${to#*:}"; [[ "$name" == "$to" ]] && name=$(tool_current "$tool")
@@ -711,6 +1270,29 @@ case "${1:-}" in
         t display-message "This agent is already $who"; exit 0
       fi
       cwd=$(readlink "/proc/$p/cwd")
+      # Another tool takes over. Chats do not carry over between tools, so the agent can be handed
+      # this one instead: it is started with a single instruction, to read the log afc-logs keeps of
+      # this chat (secrets already taken out) and say where the work stands. That costs the new agent
+      # the tokens of what it reads, so it is asked first.
+      target=$to; if [[ -n "$dir" ]]; then target=claude; fi
+      if [[ "$kind" != "$target" ]]; then
+        if [[ "$how" == ask && -n "$client" ]]; then
+          other="A new chat"; if [[ -n "$dir" ]]; then other="This folder's last Claude chat"; fi
+          t display-menu -M -c "$client" -t "$pane" -T "#[align=centre] $who: start from what? " -x C -y C \
+            "This chat: it reads the chat's log first" c "run-shell -b '$HOME/.local/bin/agents --switch $orig $pane $pid handoff'" \
+            "$other" n "run-shell -b '$HOME/.local/bin/agents --switch $orig $pane $pid fresh'"
+          exit 0
+        elif [[ "$how" == handoff ]]; then
+          t display-message -d 4000 "Bringing this chat's log up to date..." 2>/dev/null || true
+          file=$(chat_log "$kind" "$p" "$pid" "$cwd")
+          if [[ -n "$file" && -r "$file" ]]; then
+            printf '%s\n' "$file" > "${XDG_RUNTIME_DIR:-/tmp}/afc-handoff-${pane#%}"
+            if [[ -n "$dir" ]]; then run="--pane handoff 0 claude $to"; else run="--pane handoff 0 $to $name"; fi
+          else
+            t display-message -d 5000 "No log of this chat was found, so it cannot be handed on" 2>/dev/null || true
+          fi
+        fi
+      fi
     else
       case "$(t display -p -t "$pane" '#{pane_current_command}')" in
         bash|zsh|sh|fish) cwd=$(t display -p -t "$pane" '#{pane_current_path}') ;;
@@ -736,8 +1318,259 @@ case "${1:-}" in
     fleet_up || { echo "Fleet is not running."; exit 0; }
     read -r -p "Stop every agent in the fleet? [y/N] " answer
     [[ "$answer" == [yY]* ]] || { echo "Left running."; exit 0; }
+    # One last look at the tabs and splits, so the next start reopens them as they are now
+    if layout_save; then echo "Layout saved: the next start reopens these splits (agents --fresh: one pane per project)."
+    elif [[ -r "$LAYOUT" ]]; then echo "Layout kept from $(date -r "$LAYOUT" '+%H:%M:%S') (an agent was still starting)."; fi
     t kill-server
     echo "Fleet stopped."
+    ;;
+  --wait)
+    start_wait "${2:-0}"
+    ;;
+  --notify)
+    # A desktop notification for an agent that finished, or asks you something, while you were not looking
+    # at it; "Open the tab" in it brings the Agents window and that split to the front. Also the warning
+    # that the pane's account is close to a plan limit. Run by --mark as a job of the fleet's own.
+    # Usage: agents --notify <pane id> <done|wait> <seconds the turn took>
+    set +e
+    pane="${2:?pane id}"; kind="${3:-done}"; took="${4:-0}"; [[ "$took" =~ ^[0-9]+$ ]] || took=0
+    command -v notify-send >/dev/null || exit 0
+    IFS=$TAB read -r win wname pid old from < <(t display -p -t "$pane" "#{window_id}$TAB#{?window_name,#{window_name},-}$TAB#{pane_pid}$TAB#{?#{@note},#{@note},0}$TAB#{?#{@min_from},#{@min_from},-}")
+    [[ -n "$pid" ]] || exit 0
+    who=$("$HOME/.local/bin/agents" --who "$pid" 2>/dev/null)   # "claude <account>", "codex <account>", "codex", or nothing
+    tool=${who%% *}; acct=""; [[ "$who" == *" "* ]] && acct=${who#* }
+    name=$(tool_label "$tool"); [[ -n "$name" ]] || name="The agent"
+    [[ -n "$acct" ]] && name+=" / $(label_of "$acct")"
+    send=1; ms=15000
+    case "$kind" in
+      wait) [[ "$(setting notify-wait on)" == on ]] || send=0
+            title="$wname: waiting for you"; body="$name asks before it goes on."; ms=60000 ;;
+      *)    after=$(setting notify-after 30); [[ "$after" =~ ^[0-9]+$ ]] || after=30
+            [[ "$(setting notify-done on)" == on ]] && (( took >= after )) || send=0
+            title="$wname: done"; body="$name finished after $(dur "$took")." ;;
+    esac
+    if (( send )); then
+      {
+        read -r id; [[ "$id" =~ ^[0-9]+$ ]] && t set -p -t "$pane" @note "$id" 2>/dev/null   # the next one replaces this one
+        read -r action
+        if [[ "$action" == open ]]; then
+          setsid -f "$HOME/.local/bin/agents" --window >/dev/null 2>&1
+          if [[ "$from" != - ]]; then t run-shell "$HOME/.local/bin/afc-min show '' $from $pane" 2>/dev/null
+          else t select-window -t "$win" \; select-pane -t "$pane" 2>/dev/null; fi
+        fi
+      } < <(notify-send -a "Agentic CLI Fleet" -i utilities-terminal -p -r "$old" -t "$ms" -A "open=Open the tab" "$title" "$body" 2>/dev/null)
+    fi
+    # Close to a plan limit: said once per account in half an hour, with the account that has the most room
+    if [[ "$kind" == done && ( "$tool" == claude || "$tool" == codex ) ]]; then
+      [[ -n "$acct" ]] || acct=$(tool_current "$tool")
+      warn=$(setting limit-warn 90); use=$(usage_of "$tool" "$acct")
+      if [[ -n "$use" && "$warn" =~ ^[0-9]+$ ]] && (( $(usage_top "$use") >= warn )); then
+        stamp="${XDG_RUNTIME_DIR:-/tmp}/afc-limit-$tool-$acct"
+        if [[ -z "$(find "$stamp" -mmin -30 2>/dev/null)" ]]; then
+          : > "$stamp"; best=""; low=101
+          while IFS=$TAB read -r n _; do
+            [[ "$n" == "$acct" ]] && continue
+            u=$(usage_of "$tool" "$n"); [[ -n "$u" ]] || continue
+            top=$(usage_top "$u"); if (( top < low )); then low=$top; best="$(label_of "$n") ($u)"; fi
+          done < <(tool_accounts "$tool")
+          msg="$(tool_label "$tool") / $(label_of "$acct") has used $use of its plan limits"
+          hint="Alt+G moves an agent to another account."; [[ -n "$best" ]] && hint="Most room: $best. Alt+G moves an agent there."
+          notify-send -a "Agentic CLI Fleet" -i dialog-warning -t 30000 "$msg" "$hint" 2>/dev/null
+          t display-message -d 6000 "$msg. $hint" 2>/dev/null
+        fi
+      fi
+    fi
+    exit 0
+    ;;
+  --overview)
+    fleet_up || { echo "Fleet is not running."; exit 0; }
+    printf '%-4s %-20s %-22s %s\n' TAB NAME STATE AGENT
+    while IFS=$TAB read -r idx name win id from st hdr; do
+      [[ -n "$id" ]] || continue
+      printf '%-4s %-20s %-22s %s\n' "$idx" "$name" "$st" "$hdr"
+    done < <(overview | sed -E 's/#\[[^]]*\]//g')
+    ;;
+  --overview-menu)
+    # Alt+L in the fleet. Usage: agents --overview-menu <client> (the binding passes it)
+    client="${2:?client}"; items=(); key=0; keys=123456789abcdefghijklmnopqrstuvwxyz
+    while IFS=$TAB read -r idx name win id from st hdr; do
+      [[ -n "$id" ]] || continue
+      case "$st" in
+        working*)    mark="#[fg=#7aa2f7]▶#[default]" ;;
+        waiting*)    mark="#[fg=#e0af68,bold]?#[default]" ;;
+        "done, not"*) mark="#[fg=#e0af68]✓#[default]" ;;
+        done)        mark="✓" ;;
+        *)           mark="·" ;;
+      esac
+      printf -v label '%s %-3s %-16s %-20s %s' "$mark" "$idx" "${name:0:16}" "$st" "$hdr"
+      if [[ "$from" == - ]]; then go="select-window -t $win ; select-pane -t $id"
+      else go="run-shell -b '$HOME/.local/bin/afc-min show \"$client\" $from $id'"; fi
+      items+=("$label" "${keys:key:1}" "$go"); key=$((key + 1))
+    done < <(overview)
+    (( ${#items[@]} )) || { t display-message "No agent is running in the fleet"; exit 0; }
+    t display-menu -M -c "$client" -T "#[align=centre] The fleet:  ▶ working   ? waiting for you   ✓ done " -x C -y C "${items[@]}"
+    ;;
+  --worktrees)
+    # The work folders made for splits (split menu, "in its own work folder"), for every project on the
+    # list: the branch, whether anything in it is uncommitted, how far it is ahead of what the project
+    # has checked out, and whether a split is in it now. --prune removes the finished ones: nothing
+    # uncommitted, every commit already in the project's checked-out branch, no split in it. It asks
+    # first, and it is git that removes them, without force: git refuses a folder with changes in it
+    # and a branch that is not merged.
+    prune=0; [[ "${2:-}" == --prune ]] && prune=1
+    inuse=""
+    if fleet_up; then inuse=$(for p in $(t list-panes -a -F '#{pane_pid}' 2>/dev/null || true); do readlink "/proc/$p/cwd" 2>/dev/null || true; done); fi
+    found=0; gone=()
+    while IFS=$'\t' read -r name dir <&3; do
+      git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || continue
+      wt=""
+      while read -r key val; do
+        case "$key" in
+          worktree) wt=$val ;;
+          branch)
+            [[ "$wt" == */.acf-worktrees/* ]] || continue
+            br=${val#refs/heads/}; found=$((found + 1))
+            state="nothing uncommitted"; clean=1
+            if [[ -n "$(git -C "$wt" status --porcelain 2>/dev/null || true)" ]]; then state="uncommitted changes"; clean=0; fi
+            ahead=$(git -C "$dir" rev-list --count "HEAD..$br" 2>/dev/null || echo "?")
+            used=0; while IFS= read -r c; do if [[ "$c" == "$wt" || "$c" == "$wt"/* ]]; then used=1; fi; done <<< "$inuse"
+            printf '  %-18s %-26s %-20s %-18s %-9s %s\n' "$name" "$br" "$state" "$([[ "$ahead" == 0 ]] && echo 'all in the project' || echo "$ahead commit(s) ahead")" "$( ((used)) && echo 'in use' || echo 'free')" "$wt"
+            if (( clean && ! used )) && [[ "$ahead" == 0 ]]; then gone+=("$dir$TAB$wt$TAB$br"); fi ;;
+        esac
+      done < <(git -C "$dir" worktree list --porcelain 2>/dev/null)
+    done 3< <(projects)
+    (( found )) || { echo "No work folders. A split gets one from the split menu (Alt+\\ or Alt+-): New agent in its own work folder."; exit 0; }
+    if (( ! prune )); then
+      echo "To bring a branch's work into the project: git merge <branch>, in the project folder."
+      echo "${#gone[@]} finished (nothing uncommitted, all in the project, free): agents --worktrees --prune removes those."
+      exit 0
+    fi
+    (( ${#gone[@]} )) || { echo "None is finished: nothing to remove."; exit 0; }
+    read -r -p "Remove the ${#gone[@]} finished work folder(s) and their branches? [y/N] " answer || answer=""
+    [[ "$answer" == [yY]* ]] || { echo "Left as they are."; exit 0; }
+    for g in "${gone[@]}"; do
+      IFS=$TAB read -r dir wt br <<< "$g"
+      if git -C "$dir" worktree remove "$wt" && git -C "$dir" branch -d "$br" >/dev/null; then echo "  removed $wt ($br)"; else echo "  kept    $wt: git would not remove it"; fi
+    done
+    ;;
+  --doctor)
+    # Looks whether everything the fleet leans on is in place. Changes nothing.
+    bad=0
+    ok()   { printf '  ok    %s\n' "$1"; }
+    no()   { printf '  !!    %s\n' "$1"; if [[ -n "${2:-}" ]]; then printf '        %s\n' "$2"; fi; bad=$((bad + 1)); }
+    note() { printf '  note  %s\n' "$1"; }
+    echo "Programs"
+    here=$(dirname "$(readlink -f "$HOME/.local/bin/agents")"); miss=""; nprog=0
+    for f in "$here"/*; do
+      [[ -f "$f" ]] || continue
+      b=${f##*/}; nprog=$((nprog + 1))
+      if [[ ! -x "$HOME/.local/bin/$b" ]]; then miss+=" $b"; fi
+    done
+    if [[ -z "$miss" ]]; then ok "$nprog programs of $here are in ~/.local/bin"; else no "not in ~/.local/bin, or not executable:$miss" "bash _tools/install.sh --apply sets the links"; fi
+    if [[ -r "$HOME/.tmux.conf" && "$(readlink -f "$HOME/.tmux.conf")" == "$(readlink -f "$here/../tmux/tmux.conf")" ]]; then ok "~/.tmux.conf is this folder's tmux/tmux.conf"
+    elif [[ -r "$HOME/.tmux.conf" ]]; then note "~/.tmux.conf is not this folder's tmux/tmux.conf ($(readlink -f "$HOME/.tmux.conf"))"
+    else no "~/.tmux.conf is missing"; fi
+    if command -v tmux >/dev/null; then
+      if [[ "$(readlink -f "$(command -v tmux)")" == */.local/opt/tmux-3.8/* ]]; then ok "$(tmux -V), the patched build"
+      else note "$(tmux -V) from $(command -v tmux): not the patched build, so no thin scrollbar, header buttons or hover"; fi
+    else no "tmux is not installed"; fi
+    for c in jq flock git python3 ps systemd-run; do command -v "$c" >/dev/null || no "$c is not installed: the fleet needs it"; done
+    for c in notify-send xclip kdialog; do command -v "$c" >/dev/null || note "$c is not installed ($(case $c in notify-send) echo 'no desktop notifications' ;; xclip) echo 'no Ctrl+V paste, no mouse copy' ;; *) echo 'no Alt+N folder picker' ;; esac))"; done
+    for tool in "${TOOLS[@]}"; do command -v "$(tool_bin "$tool")" >/dev/null || note "$(tool_label "$tool") is not installed ($(tool_bin "$tool"))"; done
+    echo "Hooks"
+    cs="$HOME/.claude/settings.json"
+    if [[ -r "$cs" ]]; then
+      lack=""
+      for ev in UserPromptSubmit PreToolUse Stop Notification SessionEnd; do
+        jq -e --arg e "$ev" '[.hooks[$e][]?.hooks[]?.command // empty] | any(test("agents --mark"))' "$cs" >/dev/null 2>&1 || lack+=" $ev"
+      done
+      if [[ -z "$lack" ]]; then ok "Claude: the five hooks call agents --mark"; else no "Claude: no agents --mark hook for:$lack" "merge config/claude/settings.fleet-keys.json into ~/.claude/settings.json"; fi
+      if jq -e '.statusLine.command | test("afc-statusline")' "$cs" >/dev/null 2>&1; then ok "Claude: the status line is afc-statusline"; else no "Claude: the status line is not afc-statusline, so pane headers lack model, tokens and cost"; fi
+      if [[ "$(jq -r '.tui // empty' "$cs" 2>/dev/null)" == default ]]; then ok "Claude: classic mode (tui default), so the scrollbar has the chat"; else note "Claude: \"tui\" is not \"default\": the tmux scrollbar will have nothing to scroll"; fi
+    else no "~/.claude/settings.json is missing"; fi
+    if grep -qs 'agents --mark' "$HOME/.gemini/settings.json"; then ok "Gemini: hooks call agents --mark"; else note "Gemini: no agents --mark hook in ~/.gemini/settings.json: its tab signals are estimated from its chat file, and it sends no notification"; fi
+    note "Codex needs no hook (the watcher reads each turn's start and end from its session file); Antigravity's tab signals are estimated"
+    echo "Background services"
+    for u in autonice.service keepawake-agents.service afc-logs.timer; do
+      if [[ "$(systemctl --user is-active "$u" 2>/dev/null)" == active ]]; then ok "$u is running"; else no "$u is not running" "systemctl --user enable --now $u"; fi
+    done
+    high=$(systemctl --user show agents.slice -p MemoryHigh --value 2>/dev/null || true)
+    if [[ "$high" =~ ^[0-9]+$ ]]; then ok "agents.slice slows the fleet at $(numfmt --to=iec "$high") of memory"; else no "agents.slice has no memory limit (MemoryHigh=$high)" "its unit is config/systemd/user/agents.slice"; fi
+    echo "Fleet"
+    if fleet_up; then
+      spid=$(t display -p '#{pid}' 2>/dev/null || true)
+      if grep -qs 'agents\.slice' "/proc/$spid/cgroup"; then ok "running, inside agents.slice"; else no "running, but NOT inside agents.slice: nothing caps it" "it has to be started by agents (from the desktop), not by tmux directly"; fi
+      if flock -n "$LAYOUT.lock" true 2>/dev/null; then no "the watcher is not running: the layout is not being saved" "it starts again at the next finished turn, or when you run agents"; else ok "the watcher is running (saved layout, tab signals for Codex and Antigravity)"; fi
+      if [[ -r "$LAYOUT" ]]; then ok "layout saved $(dur $(( EPOCHSECONDS - $(stat -c %Y "$LAYOUT") ))) ago: $(grep -c '^W' "$LAYOUT") tabs, $(grep -c '^P' "$LAYOUT") splits"; else note "no saved layout yet"; fi
+      if [[ ",$(t list-clients -F '#{client_flags}' 2>/dev/null | tr '\n' ',')," == *,focused,* ]]; then ok "the terminal reports focus, so notifications stay quiet while you look at a tab"
+      elif [[ -n "$(t list-clients 2>/dev/null)" ]]; then note "no window of the fleet is in focus right now (or the terminal does not report focus)"; fi
+    else
+      note "the fleet is not running"
+      if [[ -r "$LAYOUT" ]]; then ok "saved layout from $(date -r "$LAYOUT" '+%F %H:%M'): $(grep -c '^W' "$LAYOUT") tabs, $(grep -c '^P' "$LAYOUT") splits would reopen"; fi
+    fi
+    echo "Lists"
+    nproj=0; while IFS=$'\t' read -r name dir <&3; do nproj=$((nproj + 1)); done 3< <(projects 2>/dev/null || true)
+    lost=$( { projects >/dev/null; } 2>&1 || true)
+    if [[ -n "$lost" ]]; then no "project folders not found:" "$(echo "$lost" | tr '\n' ' ')"; else ok "$nproj projects, every folder is there"; fi
+    for tool in "${TOOLS[@]}"; do
+      while IFS=$'\t' read -r name dir; do
+        who=$(tool_email "$tool" "$dir")
+        if [[ "$who" == "not signed in" ]]; then note "$(tool_label "$tool") account $(label_of "$name") is not signed in"; fi
+      done < <(tool_accounts "$tool")
+    done
+    if [[ -r "$SETTINGS" ]]; then
+      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap)$/ { printf " %s", $1 }' "$SETTINGS")
+      if [[ -n "$odd" ]]; then no "unknown names in $SETTINGS:$odd"; else ok "settings: $SETTINGS"; fi
+    fi
+    echo
+    if (( bad )); then echo "$bad thing(s) need attention (marked !!)."; exit 1; fi
+    echo "Everything the fleet needs is in place."
+    ;;
+  --layout)
+    [[ -r "$LAYOUT" ]] || { echo "No saved layout yet. It is written while the fleet runs ($LAYOUT)."; exit 0; }
+    echo "Saved $(date -r "$LAYOUT" '+%F %H:%M:%S'): the next start reopens this (agents --fresh starts without it)"
+    layout_show
+    if ! fleet_up; then echo "The fleet is not running."
+    elif flock -n "$LAYOUT.lock" true 2>/dev/null; then echo "Not being kept current right now; the next finished turn, or running agents, starts that again."
+    else echo "Kept current while the fleet runs: looked at every $LAYOUT_EVERY seconds, rewritten when something changed."; fi
+    ;;
+  --layout-watch)
+    # The fleet's one background watcher: one per fleet (the lock), started with the fleet and, should
+    # it ever stop, by the next --mark done. It ends when the fleet does. Two jobs:
+    #   the saved layout  every $LAYOUT_EVERY seconds it asks tmux whether the tabs or splits changed,
+    #                     and --mark leaves $LAYOUT.dirty when an agent ends a turn; only then is the
+    #                     whole fleet read and the layout rewritten
+    #   tab signals       for Codex, Antigravity and hookless Gemini panes (activity): a look every
+    #                     4 seconds, only while there is such a pane
+    set +e
+    mkdir -p "${LAYOUT%/*}"
+    exec 9> "$LAYOUT.lock"; flock -n 9 || exit 0
+    act=4; (( LAYOUT_EVERY < act )) && act=$LAYOUT_EVERY
+    looks=$(( LAYOUT_EVERY / act )); sig=""; n=0; held=""; calm=0
+    printf x > "$LAYOUT.tick0"; printf x > "$LAYOUT.tick1"
+    while fleet_up; do
+      if (( n % looks == 0 )); then
+        now=$(layout_sig)
+        dirty=""; [[ -e "$LAYOUT.dirty" ]] && { dirty=1; rm -f "$LAYOUT.dirty"; }
+        if [[ "$now" != "$sig" || -n "$dirty" || ! -e "$LAYOUT" ]]; then
+          layout_save careful; rc=$?
+          if (( rc == 2 )); then   # fewer splits than on file: a split was closed, or the fleet is going down pane by pane
+            if [[ "$now" == "$held" ]]; then calm=$((calm + 1)); else held=$now; calm=1; fi
+            if (( calm >= 3 )); then layout_save; rc=$?; fi
+          fi
+          # not saved (an agent still starting, a change midway, a fleet that is shrinking): look again next time
+          if (( rc == 0 )); then sig=$now; held=""; calm=0; else sig=""; fi
+        fi
+      fi
+      n=$((n + 1))
+      if (( ${#TRK[@]} )); then
+        activity "$LAYOUT.tick$((n % 2))" "$LAYOUT.tick$(((n + 1) % 2))"
+        sleep "$act" 9>&-
+      else
+        n=0; sleep "$LAYOUT_EVERY" 9>&-
+      fi
+    done
+    exit 0
     ;;
   --dry-run)
     if fleet_up; then echo "Fleet running now: yes (agents would just reattach)"; else echo "Fleet running now: no"; fi
@@ -748,6 +1581,11 @@ case "${1:-}" in
     echo "Would start: tmux server inside agents.slice, one tab per project above."
     acct=$(current_account)
     echo "Account: $acct ($(account_email "$(account_dir "$acct")"))"
+    if [[ -r "$LAYOUT" ]] && ! fleet_up; then
+      echo "Saved layout from $(date -r "$LAYOUT" '+%F %H:%M:%S'): its tabs that are still on the list reopen with these splits instead"
+      echo "(agents --fresh starts without it):"
+      layout_show
+    fi
     ;;
   --window)
     # An Agents window is already open: raise it through a one-shot KWin script instead of opening another
@@ -770,7 +1608,7 @@ case "${1:-}" in
     else exec konsole -e "$self"; fi
     ;;
   -h|--help)
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
     echo "Unknown option: $1 (try: agents --help)" >&2
