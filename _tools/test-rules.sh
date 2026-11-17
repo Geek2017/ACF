@@ -27,6 +27,7 @@ mkdir -p "$HOME" "$AFC_RULES_STATE"
 pass=0; fail=0
 ok()  { pass=$((pass + 1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2" | head -c 600; }
+nodec() { [[ "$1" != *'"decision"'* ]]; }
 setmode() { printf 'rules %s\n' "$1" > "$AGENTS_SETTINGS"; }
 rules() { python3 -I "$RULES" "$@"; }
 hook() { local tool=$1 ev=$2 json=$3; printf '%s' "$json" | python3 -I "$RULES" hook "$tool" "$ev" 2>"$T/err"; }
@@ -96,20 +97,26 @@ j() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d'"$1"')' "$
 echo "Hooks, enforce"
 setmode enforce
 out=$(hook claude stop "{\"session_id\":\"c1\",\"transcript_path\":\"$CL1\",\"cwd\":\"$P\",\"stop_hook_active\":false}")
-if [[ "$(j '["decision"]' "$out")" == block && "$out" == *FIX-0001* && "$out" == *"[ACF rule check]"* && "$out" == *check-fixes.py\ --path\ src/app.js* ]]; then ok "Claude: a protected file changed without a fix check is sent back, with what to run"
+if [[ "$(j '["systemMessage"]' "$out")" == "ACF rules ✗ sent back to fix:"*FIX-0001* && "$(j '["decision"]' "$out")" == block && "$out" == *FIX-0001* && "$out" == *"[ACF rule check]"* && "$out" == *check-fixes.py\ --path\ src/app.js* ]]; then ok "Claude: a protected file changed without a fix check is sent back, with what to run"
 else bad "Claude: no block for the unchecked protected file" "$out $(cat "$T/err")"; fi
 if [[ "$out" == *"$P/CLAUDE.md"* ]]; then ok "the message names the project's own rule file by its full path"; else bad "no local rule file path in the message" "$out"; fi
 grep -q $'\thard\tfix-check\t' "$P/logs/acf/rules.log" 2>/dev/null && ok "the finding is a line in <project>/logs/acf/rules.log" || bad "no line in rules.log"
 out=$(hook claude stop "{\"session_id\":\"c1\",\"transcript_path\":\"$CL1\",\"cwd\":\"$P\",\"stop_hook_active\":true}")
-[[ -z "$out" ]] && ok "the turn's second stop (stop_hook_active) is let through: once per turn" || bad "sent back twice in one turn" "$out"
+nodec "$out" && [[ "$out" == *"ACF rules ✗ still open"* ]] && ok "the turn's second stop (stop_hook_active) is let through, once per turn; the recap says it is still open" || bad "sent back twice in one turn" "$out"
 [[ $(grep -c $'\tfix-check\t' "$P/logs/acf/rules.log") == 1 ]] && ok "a finding is logged once per turn, however often the turn stops" || bad "logged twice" "$(cat "$P/logs/acf/rules.log")"
 out=$(hook claude stop "{\"session_id\":\"c2\",\"transcript_path\":\"$CL2\",\"cwd\":\"$P\",\"stop_hook_active\":false}")
-[[ -z "$out" ]] && ok "Claude: check-fixes.py --path before the edit: let through" || bad "blocked although checked" "$out"
+nodec "$out" && ok "Claude: check-fixes.py --path before the edit: let through" || bad "blocked although checked" "$out"
+msg=$(j '["systemMessage"]' "$out")
+[[ "$msg" == "ACF rules △ · 1 file changed · index loaded by CLAUDE.md · fix check done for src/app.js · note: work not yet in _ai/UPDATES.md" ]] && ok "the recap under the reply: the verdict, what changed, index, fix check, notes" || bad "recap wording" "$msg"
+printf 'rules enforce\nrules-recap off\n' > "$AGENTS_SETTINGS"
+out=$(hook claude stop "{\"session_id\":\"c2b\",\"transcript_path\":\"$CL2\",\"cwd\":\"$P\",\"stop_hook_active\":false}")
+[[ -z "$out" ]] && ok "rules-recap off: no recap line" || bad "recap shown although off" "$out"
+setmode enforce
 out=$(hook claude stop "{\"session_id\":\"c3\",\"transcript_path\":\"$CL3\",\"cwd\":\"$P\",\"stop_hook_active\":false}")
-[[ -z "$out" ]] && ok "Claude: reading _ai/FIXES.md (sed, inside a cd \"...\" && command) counts as the check" || bad "blocked although FIXES.md was read" "$out"
+nodec "$out" && ok "Claude: reading _ai/FIXES.md (sed, inside a cd \"...\" && command) counts as the check" || bad "blocked although FIXES.md was read" "$out"
 out=$(hook claude stop "{\"session_id\":\"c4\",\"transcript_path\":\"$CL4\",\"cwd\":\"$P\",\"stop_hook_active\":false}")
 log=$(grep -E $'\t(outside|rule-files)\t' "$P/logs/acf/rules.log")
-if [[ -z "$out" && "$log" == *outside*memory* && "$log" == *rule-files*AGENTS.md* && "$log" != *scratch-ok* ]]; then ok "soft rules only note: Claude's memory folder, a generated rule file (temp files are fine)"
+if nodec "$out" && [[ "$out" == *"ACF rules △"* && "$log" == *outside*memory* && "$log" == *rule-files*AGENTS.md* && "$log" != *scratch-ok* ]]; then ok "soft rules only note: Claude's memory folder, a generated rule file (temp files are fine)"
 else bad "soft rules wrong" "out=$out log=$log"; fi
 python3 -c 'print("x" * 500)' >> "$P/_ai/INDEX.md"
 out=$(hook claude stop "{\"session_id\":\"c5\",\"transcript_path\":\"$CL5\",\"cwd\":\"$P\",\"stop_hook_active\":false}")
@@ -120,7 +127,7 @@ if [[ "$(j '["decision"]' "$out")" == block && "$out" == *"_ai/INDEX.md was neve
 else bad "Codex: index-first not caught" "$out $(cat "$T/err")"; fi
 [[ "$out" != *"FIX-0001"* ]] && ok "Codex: src/other.js is not protected, so no fix-check finding" || bad "fix-check on an unprotected file" "$out"
 out=$(hook codex stop "{\"session_id\":\"x2\",\"transcript_path\":\"$CX2\",\"cwd\":\"$P\",\"stop_hook_active\":false}")
-[[ -z "$out" ]] && ok "Codex: sed of _ai/INDEX.md inside an exec cell counts as reading it" || bad "Codex blocked although the index was read" "$out"
+nodec "$out" && ok "Codex: sed of _ai/INDEX.md inside an exec cell counts as reading it" || bad "Codex blocked although the index was read" "$out"
 out=$(hook gemini stop "{\"session_id\":\"g1\",\"transcript_path\":\"$GM\",\"cwd\":\"$P\",\"stop_hook_active\":false}")
 if [[ "$(j '["decision"]' "$out")" == deny && "$out" == *FIX-0001* ]]; then ok "Gemini: a relative path (src/app.js) is resolved from its folder; sent back with deny"
 else bad "Gemini: no deny" "$out $(cat "$T/err")"; fi
@@ -155,12 +162,12 @@ out=$(hook claude prompt "{\"session_id\":\"n2\",\"cwd\":\"$P/sub/x\",\"prompt\"
 [[ -z "$out" ]] && ok "a git repo of its own inside a TokenOps project is not under that project's rules" || bad "rules crossed a git root" "$out"
 printf 'garbage\n{"type":\n' > "$T/broken.jsonl"
 out=$(hook claude stop "{\"session_id\":\"b1\",\"transcript_path\":\"$T/broken.jsonl\",\"cwd\":\"$P\"}"); rc=$?
-[[ $rc == 0 && -z "$out" ]] && ok "a broken chat file: exit 0, nothing sent back" || bad "broken chat file" "rc=$rc $out"
+[[ $rc == 0 && -z "$out" ]] && ok "a broken chat file: exit 0, nothing sent back, no recap" || bad "broken chat file" "rc=$rc $out"
 out=$(printf 'not json' | python3 -I "$RULES" hook gemini stop 2>/dev/null); rc=$?
 [[ $rc == 0 && "$out" == "{}" ]] && ok "hook input that is not JSON: exit 0, an empty answer" || bad "bad hook input" "rc=$rc $out"
 setmode report
 out=$(hook claude stop "{\"session_id\":\"r1\",\"transcript_path\":\"$CL1\",\"cwd\":\"$P\",\"stop_hook_active\":false}")
-[[ -z "$out" ]] && ok "rules report: nothing is sent back" || bad "report mode blocked" "$out"
+nodec "$out" && ok "rules report: nothing is sent back" || bad "report mode blocked" "$out"
 setmode off
 out=$(hook claude prompt "{\"session_id\":\"o1\",\"cwd\":\"$P\",\"prompt\":\"hi\"}")
 [[ -z "$out" ]] && ok "rules off: no reminder either" || bad "off mode reminded" "$out"

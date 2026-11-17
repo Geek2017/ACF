@@ -9,3 +9,6 @@
 #log-md off           # chat log: off = one file per project (logs/acf/acf.db); on = also one readable .md file per thread
 #rules enforce        # TokenOps projects (afc-rules): enforce = a broken hard rule sends the agent back, once a turn;
                       # report = only shown in the pane header and logs/acf/rules.log; off = no reminder, no check
+#rules-recap on       # one line under each reply: the rule check's verdict and what the turn did (you see it, the model does not)
+#mem-wall 90          # no new agent or project tab once the fleet's real memory reaches this share of
+                      # its agents.slice limit (one more would only slow the running ones); 0 = no wall

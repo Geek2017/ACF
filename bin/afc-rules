@@ -28,8 +28,9 @@ What happens: "rules" in ~/.config/agents/settings, off | report | enforce (defa
   enforce  a hard finding made in this turn sends the agent back, once per turn, with what to fix
            (Claude and Codex: "block", Gemini: "deny", Antigravity: "continue")
   report   nothing is sent back
-  both     the pane header shows the result; each finding is a line in <project>/logs/acf/rules.log;
-           the next prompt's reminder names what is still open
+  both     a one-line recap under each reply, for you only (Claude, Codex, Gemini; "rules-recap off"
+           hides it); the pane header shows the result; each finding is a line in
+           <project>/logs/acf/rules.log; the next prompt's reminder names what is still open
 
 Not seen: files changed by shell commands (sed -i, cat >, a script) and by Claude's sub-agents.
 
@@ -431,6 +432,39 @@ def evaluate(P, tool, F, at=""):
     return found
 
 
+def recap(P, tool, F, found, sent):
+    """The one line shown under each reply: the verdict, then what this turn did against the rules."""
+    files = sorted({r for s, r in ((s, P.rel(p)) for s, p in F.edits if s > F.turn) if r})
+    hard = [f for f in found if f["hard"]]
+    soft = [f for f in found if not f["hard"]]
+    if sent:
+        head = "✗ sent back to fix: " + "; ".join(f["what"] for f in sent)
+    elif hard:
+        head = "✗ still open: " + "; ".join(f["what"] for f in hard)
+    else:
+        head = "△" if soft else "✓"
+    notes = [f"work not yet in {P.updates}" if f["rule"] == "record-work" else f["what"] for f in soft]
+    parts = []
+    if not files:
+        parts.append("no files changed this turn")
+    else:
+        parts.append(f"{len(files)} file{'s' if len(files) != 1 else ''} changed")
+        if P.index:
+            if P.imports_index(tool):
+                parts.append(f"index loaded by {P.entry(tool)}")
+            elif "index" in F.marks:
+                parts.append("index read")
+        guarded = [r for r in files if not r.startswith(WORK_ONLY) and P.covering(r)]
+        if guarded and not any(f["rule"] == "fix-check" for f in hard):
+            parts.append(f"fix check done for {short(guarded, 2)}")
+        if P.updates and any(P.rel(p) == P.updates for _, p in F.edits):
+            parts.append(f"{P.updates} written")
+    if notes:
+        parts.append("note: " + "; ".join(notes))
+    text = f"ACF rules {head} · " + " · ".join(parts)
+    return text if len(text) <= 400 else text[:397] + "..."
+
+
 def sends_back(found):
     return [f for f in found if f["hard"] and f["new"]]
 
@@ -648,14 +682,19 @@ def hook(tool, event):
                [f["what"] for f in found if not f["hard"]], "logged_turn": F.turn,
                "logged": sorted(done | {f["rule"] + f["what"] for f in fresh})})
     save_state(key, st)
+    # the recap: one line under the reply, for you only (the model never sees a systemMessage).
+    # Antigravity's Stop hook has no such line; its pane header shows the same.
+    # Nothing to say when the chat file gave no prompt at all (unreadable, or not written yet).
+    shown = {"systemMessage": recap(P, tool, F, found, sent)} \
+        if setting("rules-recap", "on") != "off" and tool != "agy" and F.prompts else {}
     if not sent:
-        return allow(tool)
+        return emit(shown) if shown else allow(tool)
     text = reason(P, tool, sent, [f for f in found if not f["hard"]])
     if tool == "gemini":
-        return emit({"decision": "deny", "reason": text})
+        return emit({"decision": "deny", "reason": text, **shown})
     if tool == "agy":
         return emit({"decision": "continue", "reason": text})
-    return emit({"decision": "block", "reason": text})
+    return emit({"decision": "block", "reason": text, **shown})
 
 
 # ---------------------------------------------------------------------------------------------

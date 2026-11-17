@@ -86,7 +86,8 @@ ACCOUNT_NOW="$HOME/.config/agents/account"   # the account new agents start on; 
 ACCOUNTS_GEMINI="${AGENTS_ACCOUNTS_GEMINI:-$HOME/.config/agents/accounts-gemini}"
 ACCOUNTS_CODEX="${AGENTS_ACCOUNTS_CODEX:-$HOME/.config/agents/accounts-codex}"
 ACCOUNTS_AGY="${AGENTS_ACCOUNTS_AGY:-$HOME/.config/agents/accounts-agy}"
-STAT="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/agents.slice/memory.stat"
+# AGENTS_STAT: another memory.stat, so the tests can hand the memory wall a full fleet to look at
+STAT="${AGENTS_STAT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/agents.slice/memory.stat}"
 
 t() { tmux -L "$SOCK" "$@"; }
 
@@ -142,6 +143,8 @@ BYPASS=--allow-dangerously-skip-permissions
 #   limit-warn <percent>     warn once the pane's account has used this much of a plan limit  (90)
 #   start-gap <seconds>      pause between one agent's start and the next after a restart     (2)
 #   log-md on|off            chat log: also one readable .md file per thread (read by afc-logs) (off)
+#   mem-wall <percent>       no new agent once the fleet's real memory is this share of its
+#                            agents.slice limit; 0 turns the wall off                            (90)
 SETTINGS="${AGENTS_SETTINGS:-$HOME/.config/agents/settings}"
 setting() {  # name default -> its value
   local n v _
@@ -151,6 +154,42 @@ setting() {  # name default -> its value
     done < "$SETTINGS"
   fi
   echo "$2"
+}
+
+# The memory wall. agents.slice slows the whole fleet down once it passes MemoryHigh, so one more
+# agent there does not get its own memory: it makes every agent already running crawl. Past that
+# MemoryMax kills one outright. So before a NEW agent starts, what the fleet is using is weighed
+# against that limit, and within mem-wall percent of it no further agent is started.
+#
+# The figure used is `anon` from the slice's memory.stat -- the memory that cannot be freed, which
+# is what the bottom bar shows. Not MemoryCurrent: that counts the file cache too, which the kernel
+# hands back the moment anything needs it, so refusing to open a project over it would be refusing
+# for nothing. The two can be far apart (7G real inside an 11G charge is ordinary).
+#
+# A terminal split is never refused -- one may be exactly what you need to free the memory -- and
+# nor is the wall anywhere without an agents.slice to read: a Mac, or WSL running without systemd.
+MEM_WALL_SAID=""
+WALLED=()        # tabs the wall kept shut, named at the end of a start
+mem_high() {  # the limit in bytes, or nothing at all
+  local h=""
+  read -r h < "${STAT%/memory.stat}/memory.high" 2>/dev/null || h=""
+  [[ "$h" =~ ^[0-9]+$ ]] || h=$(systemctl --user show agents.slice -p MemoryHigh --value 2>/dev/null || true)
+  [[ "$h" =~ ^[0-9]+$ ]] && printf '%s\n' "$h"
+}
+mem_anon() {  # the fleet's memory that cannot be freed, in bytes
+  awk '$1 == "anon" { print $2; exit }' "$STAT" 2>/dev/null
+}
+mem_room() {  # 0 = there is room for another agent, 1 = the wall is up (MEM_WALL_SAID says why)
+  local pct used high
+  MEM_WALL_SAID=""
+  pct=$(setting mem-wall 90)
+  [[ "$pct" =~ ^[0-9]+$ ]] && (( pct > 0 )) || return 0          # off, or a value that is not a number
+  used=$(mem_anon); high=$(mem_high)
+  [[ "$used" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] || return 0   # no agents.slice here: nothing to weigh
+  (( high > 0 )) || return 0
+  (( used * 100 < high * pct )) && return 0
+  MEM_WALL_SAID="the fleet is using $(numfmt --to=iec "$used") of its $(numfmt --to=iec "$high") limit, and the wall stands at $pct% of it"
+  return 1
 }
 
 # After a restart the agents start a moment apart (start-gap), not all in the same second: ten agents
@@ -452,8 +491,12 @@ new_tab() {  # name dir command [tmux size options, used when this tab starts th
   fi
 }
 
-open_tab() {  # name dir
+open_tab() {  # name dir -> 1 and opens nothing when the memory wall is up (mem_room)
   local win wait=$(( ${started:-0} * ${START_GAP:-0} ))
+  if ! mem_room; then
+    WALLED+=("$1")
+    return 1
+  fi
   started=$(( ${started:-0} + 1 ))
   win=$(new_tab "$1" "$2" "$(pane_cmd "$2" "$wait")")
   # @project marks a project tab: Alt+Q on its last pane takes the project off the list (--close)
@@ -903,9 +946,20 @@ case "${1:-}" in
       [[ "${1:-}" == --fresh ]] || layout_restore
       while IFS=$'\t' read -r name dir <&3; do
         [[ " ${restored[*]:-} " == *" $name "* ]] && continue
-        open_tab "$name" "$dir"; n=$((n + 1))
+        open_tab "$name" "$dir" && n=$((n + 1))
       done 3< <(projects)
-      if (( n == 0 )); then echo "No projects opened. Add one: cd <project> && agents --add" >&2; exit 1; fi
+      if (( ${#WALLED[@]} )); then
+        # The wall came up partway through: say which tabs were left shut rather than open them
+        # into a fleet that is already at its limit.
+        echo "Memory wall: ${#WALLED[@]} project(s) not opened — ${WALLED[*]}" >&2
+        echo "  $MEM_WALL_SAID." >&2
+        echo "  Close a split you are done with, then: agents --add <that project's folder>" >&2
+      fi
+      if (( n == 0 )); then
+        if (( ${#WALLED[@]} )); then echo "Nothing was opened: the fleet is already at its memory limit." >&2
+        else echo "No projects opened. Add one: cd <project> && agents --add" >&2; fi
+        exit 1
+      fi
       t select-window -t "$SESSION:=1"
     fi
     layout_watch_start
@@ -930,8 +984,16 @@ case "${1:-}" in
       echo "Added $name -> $dir"
     fi
     if fleet_up && ! t list-windows -t "$SESSION" -F '#{window_name}' | grep -qxF "$name"; then
-      open_tab "$name" "$dir"
-      echo "Opened tab $name in the running fleet"
+      if open_tab "$name" "$dir"; then
+        echo "Opened tab $name in the running fleet"
+      else
+        # On the list, so the next start opens it, but not started into a full fleet now.
+        echo "No tab opened: $MEM_WALL_SAID."
+        echo "$name stays on the list and opens at the next start. To open it now, close a split you"
+        echo "are done with (Alt+W) and run this again. agents --status shows what the fleet is using."
+        t display-message -d 6000 "No tab for $name: $MEM_WALL_SAID" 2>/dev/null || true
+        exit 1
+      fi
     fi
     ;;
   --pick)
@@ -974,6 +1036,17 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       max=$(systemctl --user show agents.slice -p MemoryMax --value)
       echo "fleet memory: $(numfmt --to=iec "$anon") real + $(numfmt --to=iec "$file") file cache" \
            "(slows at $(numfmt --to=iec "$high"), hard stop at $(numfmt --to=iec "$max"))"
+      pct=$(setting mem-wall 90)
+      if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct > 0 )) && [[ "$high" =~ ^[0-9]+$ ]]; then
+        if mem_room; then
+          echo "memory wall:  room for another agent (it goes up at $pct% of the limit," \
+               "$(numfmt --to=iec $(( high * pct / 100 ))) of real memory)"
+        else
+          echo "memory wall:  UP — no new agent or project tab until a split is closed ($MEM_WALL_SAID)"
+        fi
+      else
+        echo "memory wall:  off (mem-wall $pct)"
+      fi
     fi
     ;;
   --pane)
@@ -1010,6 +1083,28 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       gemini*) acct="${4:-$(tool_current gemini)}" ;;   # gemini|gemini-plan|gemini-bypass <pid> [account]
       codex*)  acct="${4:-$(tool_current codex)}" ;;
       agy*)    acct="${4:-$(tool_current agy)}" ;;
+    esac
+    # The memory wall (mem_room): no new agent once the fleet is near its memory limit, because one
+    # more there slows down every agent already running. The split itself is already open by now --
+    # tmux made it before this ran -- so it stays as a plain shell and says why.
+    needs_agent=1
+    case "$what" in
+      term|tab) needs_agent=0 ;;   # a shell costs nothing, and may be what you need to free memory
+      # a split coming back from the saved layout: only the ones that held an agent count
+      restore) case "${4:-term}" in claude|gemini|codex|agy) ;; *) needs_agent=0 ;; esac ;;
+    esac
+    case "$needs_agent" in
+      0) ;;
+      *) if ! mem_room; then
+           echo "Not starting an agent here: $MEM_WALL_SAID."
+           echo
+           echo "One more agent now would not get memory of its own; it would slow down every agent"
+           echo "already running. Close a split you have finished with (Alt+W), then Alt+Enter here."
+           echo "agents --status shows what the fleet is using. To move or lift the wall, set"
+           echo "mem-wall in ~/.config/agents/settings (0 turns it off)."
+           t display-message -d 6000 "No new agent: $MEM_WALL_SAID" 2>/dev/null || true
+           exec bash
+         fi ;;
     esac
     case "$what" in
       claude) claude_as "$acct" $BYPASS || true ;;                  # AGENTS_CLAUDE: test stub
@@ -1626,6 +1721,11 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     done
     high=$(systemctl --user show agents.slice -p MemoryHigh --value 2>/dev/null || true)
     if [[ "$high" =~ ^[0-9]+$ ]]; then ok "agents.slice slows the fleet at $(numfmt --to=iec "$high") of memory"; else no "agents.slice has no memory limit (MemoryHigh=$high)" "its unit is config/systemd/user/agents.slice"; fi
+    wpct=$(setting mem-wall 90)
+    if ! [[ "$wpct" =~ ^[0-9]+$ ]] || (( wpct == 0 )); then note "the memory wall is off (mem-wall $wpct): a new agent can be started however full the fleet is"
+    elif (( wpct > 100 )); then no "mem-wall is $wpct, which is over 100%: the wall will never come up" "set it to about 90 in $SETTINGS"
+    elif mem_room; then ok "the memory wall is on at $wpct% ($(numfmt --to=iec "$(mem_anon)") of $(numfmt --to=iec "$high") used): there is room for another agent"
+    else note "the memory wall is UP: $MEM_WALL_SAID. No new agent or project tab until a split is closed"; fi
     fi
     if [[ -n "$WSL" ]]; then
       echo "Windows"
@@ -1664,7 +1764,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       done < <(tool_accounts "$tool")
     done
     if [[ -r "$SETTINGS" ]]; then
-      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap|log-md|rules)$/ { printf " %s", $1 }' "$SETTINGS")
+      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap|log-md|mem-wall|rules|rules-recap)$/ { printf " %s", $1 }' "$SETTINGS")
       if [[ -n "$odd" ]]; then no "unknown names in $SETTINGS:$odd"; else ok "settings: $SETTINGS"; fi
     fi
     echo

@@ -361,6 +361,50 @@ if [[ -n "$client" ]]; then
   is "and starts nothing until that is answered" "$(tm display -p -t "$pane" '#{pane_pid}')" "$pid"
 else bad "a stand-in terminal could be attached for the menu checks" "no client"; fi
 
+echo "The memory wall"
+# agents.slice is not reachable from a sandbox, so hand the wall a memory.stat of our own
+# (AGENTS_STAT). "full" is 10.8G of real memory against a 12G limit, "room" is 2G of it.
+WFULL="$SBX/wall-full"; WROOM="$SBX/wall-room"; mkdir -p "$WFULL" "$WROOM"
+printf 'anon 11600000000\nfile 3700000000\n' > "$WFULL/memory.stat"; echo 12884901888 > "$WFULL/memory.high"
+printf 'anon 2000000000\nfile 3700000000\n'  > "$WROOM/memory.stat"; echo 12884901888 > "$WROOM/memory.high"
+wall() { sb env AGENTS_STAT="$1/memory.stat" "${@:2}"; }
+P4="$SBX/proj/p4"; mkdir -p "$P4"
+
+has "a full fleet reports the wall up, with the figures" \
+    "$(wall "$WFULL" "$A" --status 2>&1)" 'memory wall: +UP.*11G of its 12G limit'
+has "a fleet with room reports room for another agent" \
+    "$(wall "$WROOM" "$A" --status 2>&1)" 'memory wall: +room for another agent'
+printf 'start-gap 0\nmem-wall 0\n' > "$H/.config/agents/settings"
+has "mem-wall 0 turns the wall off, however full the fleet is" \
+    "$(wall "$WFULL" "$A" --status 2>&1)" 'memory wall: +off'
+printf 'start-gap 0\n' > "$H/.config/agents/settings"
+
+before=$(tm list-windows -t agents -F '#{window_name}' | tr '\n' ' ')
+out=$(wall "$WFULL" "$A" --add "$P4" </dev/null 2>&1); rc=$?
+has "a project added to a full fleet is refused, and says what is using the memory" "$out" 'No tab opened.*11G of its 12G limit'
+is  "and that refusal is an error, so a script calling it knows" "$rc" "1"
+is  "and no tab was opened" "$(tm list-windows -t agents -F '#{window_name}' | tr '\n' ' ')" "$before"
+has "but it stays on the list, to open at the next start" "$(cat "$H/.config/agents/projects")" "$(basename "$P4")"
+
+n0=$(grep -c . "$H/started.log" 2>/dev/null || echo 0)
+out=$(wall "$WFULL" "$A" --pane claude 0 </dev/null 2>&1)
+has "a new agent split on a full fleet leaves a shell and says why" "$out" 'Not starting an agent here.*of its 12G limit'
+has "and tells you how to make room" "$out" 'Close a split you have finished with'
+is  "and no agent was started" "$(grep -c . "$H/started.log" 2>/dev/null || echo 0)" "$n0"
+hasnt "a terminal split is never refused: it may be how you free the memory" \
+    "$(wall "$WFULL" "$A" --pane term 0 </dev/null 2>&1)" 'Not starting'
+hasnt "nor is a terminal split coming back from the saved layout" \
+    "$(wall "$WFULL" "$A" --pane restore 0 term - - </dev/null 2>&1)" 'Not starting'
+has "but an agent coming back from the saved layout is" \
+    "$(wall "$WFULL" "$A" --pane restore 0 claude main - </dev/null 2>&1)" 'Not starting an agent here'
+
+out=$(wall "$WFULL" "$A" --doctor 2>&1)
+has "the check-up reports the wall as up" "$out" 'the memory wall is UP'
+has "and reports it as on, with room, when there is room" "$(wall "$WROOM" "$A" --doctor 2>&1)" 'ok +the memory wall is on at 90%'
+sed -i "/$(basename "$P4")/d" "$H/.config/agents/projects"
+out=$(wall "$WROOM" "$A" --add "$P4" </dev/null 2>&1)
+has "with room, the same project opens its tab" "$out" 'Opened tab'
+
 echo "The check-up"
 doc=$(sb "$A" --doctor 2>&1)
 has "agents --doctor reports on programs, hooks, services, fleet and lists" "$(tr '\n' ' ' <<< "$doc")" 'Programs.*Hooks.*Background services.*Fleet.*Lists'
