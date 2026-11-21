@@ -14,6 +14,7 @@ COUNCIL="$HERE/bin/afc-council"; CONF_TMUX="$HERE/tmux/tmux.conf"
 [[ $# -eq 0 ]] || { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 pass=0; fail=0
 T=$(mktemp -d /tmp/acf-council-test.XXXXXX)
+T=$(cd "$T" && pwd -P)    # its real path: on a Mac /tmp is a link to /private/tmp, which is what tmux reports
 SOCK="acfcouncil-$$"; TB="$HOME/.local/bin/tmux"; [[ -x "$TB" ]] || TB=$(command -v tmux)
 cp=""
 trap '"$TB" -L "$SOCK" kill-server 2>/dev/null; "$TB" -L "$SOCK-t" kill-server 2>/dev/null; [[ -n "$cp" ]] && kill "$cp" 2>/dev/null; rm -rf "$T"' EXIT
@@ -59,11 +60,14 @@ start=$(date +%s.%N)
 sleep 0.6
 printf '%s\t%s\t%s\n' "$tool" "$start" "$(date +%s.%N)" >> "$L/log/timing"
 who=$(grep -oE '^You are @[a-z0-9_-]+' <<< "$prompt" | head -1); who=${who#You are @}
-kind=ANSWER; grep -q 'Give your point' <<< "$prompt" && kind=POINT; grep -q '^Roast the answers' <<< "$prompt" && kind=ROAST
-seen=$(sed -n '/^--- The thread so far ---$/,/^--- End of the thread ---$/p' <<< "$prompt" | grep -oE '(POINT|ANSWER|ROAST) from @[a-z0-9_-]+' | sort -u | tr '\n' ',')
+kind=ANSWER; grep -q 'Give your point' <<< "$prompt" && kind=POINT; grep -qE '^Roast (the answers|round [0-9]+:)' <<< "$prompt" && kind=ROAST
+grep -q '^Round table:' <<< "$prompt" && kind=TABLE
+seen=$(sed -n '/^--- The thread so far ---$/,/^--- End of the thread ---$/p' <<< "$prompt" | grep -oE '(POINT|ANSWER|ROAST|TABLE) from @[a-z0-9_-]+' | sort -u | tr '\n' ',')
 reply="$kind from @$who. read: [$seen]"
 [[ -f "$L/echo-name" ]] && reply="@$who: $reply"     # an LLM that copies the thread's "@name:" format
 [[ -f "$L/long" ]] && reply="$reply $(printf 'wordy%.0s ' $(seq 1 60))end"
+# an agent whose project's instructions add a greeting and a footer to every reply
+[[ -f "$L/footer" ]] && reply="My Lord. $reply"$'\n\n'"You: whatever the chair said"$'\n\n'"SITREP · ARMY/MDMP · P1 · Done: x · Open: y · Next: z"
 if [[ -n "$out" ]]; then echo "codex log noise on stdout"; printf '%s\n' "$reply" > "$out"; else printf '%s\n' "$reply"; fi
 EOF
 chmod +x "$T/agents"
@@ -72,7 +76,16 @@ mkdir -p "$T/ch" "$T/xh"; echo '{"model": "sonnet"}' > "$T/ch/settings.json"
 printf 'model = "gpt-test"\nmodel_reasoning_effort = "medium"\n[profiles.x]\nmodel = "not-this"\n' > "$T/xh/config.toml"
 sed -i.bak -e "s|/home/x/.claude\$|$T/ch|" -e "s|/home/x/.codex\$|$T/xh|" "$T/accounts.txt"
 export COUNCIL_TEST_DIR="$T" AFC_COUNCIL_AGENTS="$T/agents" AFC_COUNCIL_CONF="$T/council.json"
-run() { (cd "$T/proj" && printf '%s\n' "$@" | env -u TMUX python3 "$COUNCIL" 2>&1); }
+# the fleet's own `agents` (✕ goes through agents --close) must talk to the test's tmux, never the real fleet
+export AGENTS_SOCK="$SOCK"
+# a council that never ends fails its checks, not the whole test: each run is given 3 minutes
+run() { (cd "$T/proj" && printf '%s\n' "$@" | env -u TMUX timeout 180 python3 "$COUNCIL" 2>&1); }
+# wait for a council started in the background (a subshell); after SECS, stop it and say so
+ended() {
+  local i
+  for (( i = 0; i < $2 * 2; i++ )); do kill -0 "$1" 2>/dev/null || { wait "$1"; return 0; }; sleep 0.5; done
+  pkill -KILL -P "$1" 2>/dev/null; wait "$1" 2>/dev/null; return 1
+}
 since() { find "$T/log" -name 'prompt.*' -newer "$T/mark" | sort; }
 mark() { touch "$T/mark"; sleep 0.05; }
 
@@ -86,10 +99,12 @@ has "one not signed in sits out, and says how to try it anyway" "$out" 'Antigrav
 # ---- order mode ----------------------------------------------------------------------------------------
 mark
 out=$(run "Should we rewrite the billing service in Rust?")
-order=$(grep -oE '^@(claude|gemini|codex)$' <<< "$out" | tr '\n' ' ')
-is "order mode: each speaks in seat order" "$order" "@claude @codex @gemini "
-has "the second one read the first one's answer" "$out" 'ANSWER from @codex\. read: \[ANSWER from @claude,\]'
-has "the third read both" "$out" 'ANSWER from @gemini\. read: \[ANSWER from @claude,ANSWER from @codex,\]'
+is "order mode: everyone answers first" "$(grep -cE '^@(claude|gemini|codex)$' <<< "$out")" 3
+for h in claude codex gemini; do has "... @$h's answer made without reading the others'" "$out" "ANSWER from @$h\\. read: \\[\\]"; done
+is "... then the round table, one by one in seat order" "$(grep -oE '^@[a-z]+ ↻$' <<< "$out" | tr '\n' ' ')" "@claude ↻ @codex ↻ @gemini ↻ "
+has "... under a round table line" "$out" '─── round table ───'
+has "at the table the first reads all three answers" "$out" 'TABLE from @claude\. read: \[ANSWER from @claude,ANSWER from @codex,ANSWER from @gemini,\]'
+has "... the next also reads what the one before said at the table" "$out" 'TABLE from @codex\. read: \[ANSWER from @claude,ANSWER from @codex,ANSWER from @gemini,TABLE from @claude,\]'
 has "Codex's answer is taken from its last-message file, not its noisy stdout" "$out" 'ANSWER from @codex'
 hasnt "... the noise is not in the thread" "$out" 'codex log noise'
 p=$(cat $(since | head -1))
@@ -113,10 +128,17 @@ has "... and it is Gemini" "$out" '^@gemini$'
 out=$(run "@nobody hello")
 has "a tag nobody has says so, and nobody is asked" "$out" 'No member called @nobody'
 out=$(run "/rounds 2" "@claude @codex go")
-is "/rounds 2 with two tagged: four turns" "$(grep -cE '^@(claude|codex)$' <<< "$out")" 4
-has "... in the second round they answer each other" "$out" 'ANSWER from @claude\. read: \[ANSWER from @claude,ANSWER from @codex,\]'
+is "/rounds 2 with two tagged: two answers, then twice round the table" "$(grep -cE '^@(claude|codex)( ↻)?$' <<< "$out")" 6
+has "... the second time round they answer what was said at the table" "$out" 'TABLE from @claude\. read: \[ANSWER from @claude,ANSWER from @codex,TABLE from @claude,TABLE from @codex,\]'
+out=$(run "/rounds 0" "@claude @codex go")
+is "/rounds 0: the answers only" "$(grep -cE '^@(claude|codex)( ↻)?$' <<< "$out")" 2
 out=$(run "@claude first" "")
-is "Enter on an empty line: another round with the same members" "$(grep -cE '^@claude$' <<< "$out")" 2
+is "one member: no round table; Enter on an empty line has it say more" "$(grep -cE '^@claude( ↻)?$' <<< "$out")" 2
+touch "$T/footer"
+out=$(run "@claude hi")
+has "an answer keeps its words" "$out" 'ANSWER from @claude'
+hasnt "... but loses the greeting, the You: line and the SITREP its project adds" "$out" 'My Lord|You: whatever|SITREP'
+rm -f "$T/footer"
 
 # ---- made agents -----------------------------------------------------------------------------------------
 out=$(run "/agent new Skeptic claude:opus A CFO who hates spending money" "/agents")
@@ -135,6 +157,15 @@ out=$(run "/bench skeptic" "/agents")
 has "/bench takes it off the table (and that is kept)" "$out" '@skeptic \(Claude, opus\).*\(benched\)'
 out=$(run "/seat skeptic")
 has "/seat brings it back" "$out" 'is at the table'
+# who sits at the table is kept per folder: taking a member off in one project's council leaves the others alone
+mkdir -p "$T/proj2"
+# (the opening banner says who sits at the table when the council starts)
+run "/bench codex" > /dev/null; out=$(run "/agents")
+hasnt "/bench @codex in one project: it leaves that table" "$(grep -m1 'At the table:' <<< "$out")" '@codex'
+out=$( (cd "$T/proj2" && printf '%s\n' "/agents" | env -u TMUX timeout 180 python3 "$COUNCIL" 2>&1) )
+has "... but still sits at another project's table" "$(grep -m1 'At the table:' <<< "$out")" '@codex'
+run "/seat codex" > /dev/null; out=$(run "/agents")
+has "... and /seat brings it back in the first" "$(grep -m1 'At the table:' <<< "$out")" '@codex'
 
 # ---- answer length ---------------------------------------------------------------------------------------
 mark
@@ -174,17 +205,37 @@ if (( spread <= 4 )); then ok "... points are made at the same time (three at on
 pp=""; for f in $(since); do grep -q 'Give your point' "$f" && pp+=$(sed -n '/^--- The thread so far ---$/,/^--- End of the thread ---$/p' "$f"); done
 hasnt "... a point is made without reading the others' points (also the one that waited for a slot)" "$pp" 'POINT from'
 rp=""; for f in $(since); do grep -q '^Roast the answers' "$f" && { rp=$(cat "$f"); break; }; done
-for h in claude gemini codex skeptic; do has "... a roast reads @$h's point" "$rp" "@$h: POINT from @$h"; done
+has "... a roast reads the others' points that are in (no waiting for the rest)" "$rp" '@[a-z]+: POINT from @[a-z]+'
 has "... and is told to end with Final:" "$rp" "starting 'Final:'"
 has "... only the answers to the latest message, within the word limit" "$rp" 'leave earlier rounds alone.*|At most [0-9]+ words in all'
 mark
 out=$(run "@claude @gemini just you two")
 rp=""; for f in $(since); do grep -q 'You are @claude' "$f" && grep -q '^Roast the answers' "$f" && { rp=$(cat "$f"); break; }; done
-has "roast with two tagged: Claude roasts only Gemini" "$rp" 'Roast the answers @gemini just gave to the chair.s latest message'
+has "roast with two tagged: they give the points, the rest of the table roasts too" "$rp" 'Roast the answers @'
 pp=""; for f in $(since); do grep -q 'Give your point' "$f" && { pp=$(cat "$f"); break; }; done
 has "... and each is told who was asked" "$pp" 'The chair asked only @claude @gemini this time'
 out=$(run "@codex alone")
-has "roast with one tagged: a point, and nobody to roast" "$out" 'nobody to roast'
+has "roast with one tagged: it answers, and the others roast it" "$out" 'ROAST from @(claude|gemini|skeptic)'
+out=$(run "what about @claude then?")
+has "an @name in the middle of a message is a mention: everyone answers" "$(grep -oE 'POINT from @[a-z0-9_-]+' <<< "$out" | sort -u | wc -l | tr -d ' ')" '^[3-9]$'
+# endless roast: round after round until Ctrl+C, which stops the roast and not the council
+mkfifo "$T/in2"
+( cd "$T/proj" && env -u TMUX python3 "$COUNCIL" < "$T/in2" > "$T/endless.out" 2>&1 ) &
+epid=$!
+exec 6> "$T/in2"
+printf '%s\n' "/rounds 0" "@claude @codex go on" >&6; sleep 5
+kill -INT "$(pgrep -P "$epid" -f afc-council | head -1 || echo "$epid")" 2>/dev/null
+# /rounds 1 first: the whole table roasts a new message, and with /rounds 0 that would go on for ever
+sleep 1.5; printf '%s\n' "/rounds 1" "@gemini after the roast" >&6; sleep 2; exec 6>&-
+ended "$epid" 90 || bad "the council ends at the end of its input" "still running after 90 s (stopped by the test)"
+eo=$(cat "$T/endless.out")
+n=$(grep -cE '^ *ROAST from @claude\.' <<< "$eo")      # its own turns, not the read: lists of the others'
+if (( n >= 3 )); then ok "roast with /rounds 0: they keep countering each other ($n from @claude before Ctrl+C)"; else bad "roast with /rounds 0: they keep countering each other" "$n from @claude"; fi
+has "... a later round answers what was just said, by its own prompt" "$(cat "$T"/log/prompt.* | grep -m1 '^Roast round 2:')" '^Roast round 2: fire back at the newest messages from @'
+has "Ctrl+C stops the roast and keeps what was said" "$eo" 'Stopped\. What was said so far is kept'
+has "... and the council goes on" "$eo" 'POINT from @gemini'
+out=$(run "/rounds 2" "@claude @codex twice")
+is "/rounds 2 in roast mode: two counters each" "$(grep -cE '^ *ROAST from @claude\.' <<< "$out")" 2
 out=$(run "/mode order")
 has "/mode order switches back (and is kept)" "$(cat "$T/council.json")" '"mode": "order"'
 
@@ -210,7 +261,8 @@ cpid=$!
 exec 5> "$fifo"
 echo "@claude @gemini a slow one" >&5; sleep 1.5
 kill -INT "$(pgrep -P "$cpid" -f afc-council | head -1 || echo "$cpid")" 2>/dev/null
-sleep 1.5; echo "@gemini still with us?" >&5; sleep 2; exec 5>&-; wait "$cpid"
+sleep 1.5; echo "@gemini still with us?" >&5; sleep 2; exec 5>&-
+ended "$cpid" 90 || bad "the council ends at the end of its input" "still running after 90 s (stopped by the test)"
 out=$(cat "$T/ctrlc.out")
 has "Ctrl+C while they answer: that round stops" "$out" 'Stopped\. What was said so far is kept'
 has "... and the chat goes on" "$out" 'ANSWER from @gemini'
@@ -240,7 +292,8 @@ has "Alt+K is bound to the council" "$(tm list-keys -T root)" 'M-k .*afc-council
 if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCIL")" ]]; then
   tm send-keys -K -c "$CL" M-k; sleep 3
   is "Alt+K opens a tab called council" "$(tm list-windows -F '#{window_name}' | grep -c '^council$')" 1
-  has "... with the chat in it, in the folder of the pane it was pressed in" "$(tm capture-pane -p -t ':council' 2>/dev/null)" "Council · $(basename "$T/proj")"
+  is "... with the chat box in it, in the folder of the pane it was pressed in" "$(tm display -p -t ':council' '#{pane_current_path}' 2>/dev/null)" "$T/proj"
+  has "... the box's header shows the mode it is in" "$(tm show-options -pqv -t ':council' pane-border-format 2>/dev/null)" 'mode: (ORDER|ROAST)'
   cw=$(tm list-windows -F '#{window_id} #{window_name}' | awk '$2 == "council" {print $1}')
   chair=$(tm display -p -t "$cw" '#{pane_id}')
   is "the council's tab is dealt into a grid: one pane per member at the table, and the chat" "$(tm display -p -t "$cw" '#{window_panes}')" 5
@@ -279,31 +332,43 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
   tm select-pane -t "$chair"
   tm send-keys -t "$chair" "@codex hello from the keyboard" Enter; sleep 3
   scr=$(tm capture-pane -p -t "$chair" 2>/dev/null)
-  has "typed in the tab: a line per answer in the chat strip" "$scr" '^@codex  ANSWER from @codex'
+  hasnt "typed in the tab: the chat strip shows no answers (they are in the members' panes)" "$scr" 'ANSWER from'
+  hasnt "... nor what you typed: it went to the members' panes" "$scr" 'hello from the keyboard'
   hasnt "... and the 'thinking' line is gone once it is done" "$(tail -3 <<< "$scr")" 'thinking'
-  has "... and the prompt is back for the next message" "$(tail -2 <<< "$scr")" '^you>'
-  has "the whole answer is in @codex's own pane, under your message" "$(tm capture-pane -p -t "$(pane_of codex)")" 'you: @codex hello from the keyboard'
-  has "... the answer" "$(tm capture-pane -p -t "$(pane_of codex)")" '^ANSWER from @codex'
-  hasnt "... and not in @claude's pane" "$(tm capture-pane -p -t "$(pane_of claude)")" 'ANSWER from @codex'
+  has "... and the box is empty for the next message: rule, > line, rule" "$(sed -n 1,3p <<< "$scr" | tr '\n' '|')" '^─+\|> ?\|─+\|$'
+  has "in @codex's pane your message is on the left" "$(tm capture-pane -p -t "$(pane_of codex)")" '^@codex hello from the keyboard'
+  has "... and its own answer on the right" "$(tm capture-pane -p -t "$(pane_of codex)")" '^ +ANSWER from @codex'
+  has "in @claude's pane @codex's answer is on the left, like any other speaker's" "$(tm capture-pane -p -t "$(pane_of claude)")" '^ANSWER from @codex'
   touch "$T/slow.codex"
   tm send-keys -t "$chair" "@codex take your time" Enter; sleep 2
   has "while a member thinks, its pane shows a spinner and the seconds" "$(tm capture-pane -p -t "$(pane_of codex)" | grep -v '^$' | tail -1)" '^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] thinking  [0-9]+s$'
-  has "... and so does the chat strip" "$(tm capture-pane -p -t "$chair" | grep -v '^$' | tail -1)" '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] @codex is thinking  [0-9]+s'
+  hasnt "... but not the chat box: it is for typing" "$(tm capture-pane -p -t "$chair")" 'is thinking|are thinking'
+  tm send-keys -t "$chair" "/mode" Enter; sleep 1
+  has "... which takes a command while a member is still thinking" "$(tm capture-pane -p -t "$chair")" 'Mode: (roast|order)'
+  tm send-keys -t "$chair" "/mode" Enter; sleep 0.5
   f1=$(tm capture-pane -p -t "$(pane_of codex)" | grep -v '^$' | tail -1); sleep 0.35; f2=$(tm capture-pane -p -t "$(pane_of codex)" | grep -v '^$' | tail -1)
   [[ "$f1" != "$f2" ]] && ok "... and it moves" || bad "... and it moves" "same frame twice: $f1"
   sleep 6; rm -f "$T/slow.codex"
   touch "$T/echo-name" "$T/long"
   tm send-keys -t "$chair" "@gemini a long one" Enter; sleep 2.5
   gp=$(tm capture-pane -p -t "$(pane_of gemini)" | grep -v '^$')
-  has "an answer that copies the thread's @name: line loses it" "$gp" '^ANSWER from @gemini'
-  if grep -qE '(^|[^a-z])w$|^ordy|^dy |^y ' <<< "$gp"; then bad "... and a long answer wraps between words, not inside them" "$(tail -4 <<< "$gp")"; else ok "... and a long answer wraps between words, not inside them"; fi
+  has "an answer that copies the thread's @name: line loses it" "$gp" '^ *ANSWER from @gemini'
+  if grep -qE '(^|[^a-z])w$|^ *ordy|^ *dy |^ *y ' <<< "$gp"; then bad "... and a long answer wraps between words, not inside them" "$(tail -4 <<< "$gp")"; else ok "... and a long answer wraps between words, not inside them"; fi
   rm -f "$T/echo-name" "$T/long"
   hasnt "... gone once the answer is in" "$(tm capture-pane -p -t "$(pane_of codex)" | grep -v '^$' | tail -1)" 'thinking'
   tm send-keys -t "$chair" "/bench skeptic" Enter; panes_are 4
   is "/bench: the grid is dealt again without that member" "$(tm display -p -t "$cw" '#{window_panes}')" 4
   tm send-keys -t "$chair" "/seat skeptic" Enter; panes_are 5
   is "/seat: and with it" "$(tm display -p -t "$cw" '#{window_panes}')" 5
-  has "... its pane shows what it said before" "$(tm capture-pane -p -t "$(pane_of codex)")" 'you: @codex hello from the keyboard'
+  has "... its pane shows what was said before" "$(tm capture-pane -p -S - -t "$(pane_of codex)")" '^@codex hello from the keyboard'
+  # ✕ in a member's header (Alt+Q there): agents --close hands it to the council, which benches it
+  tm run-shell "$HOME/.local/bin/agents --close $(pane_of gemini)"; panes_are 4
+  is "✕ on @gemini's header: it leaves the table and the grid is dealt again" "$(tm display -p -t "$cw" '#{window_panes}')" 4
+  has "... the + in the bottom bar knows it is out" "$(tm show-options -wqv -t "$cw" @council_out)" 'gemini=@gemini'
+  has "... and the bottom bar shows + add on a council tab" "$(tm display -p -t "$cw" "$(tm show -gv status-right)")" 'council_add|\+ add'
+  tm run-shell -b "$HOME/.local/bin/afc-council --add-menu '$CL' '$cw'"; sleep 0.8
+  tm send-keys -K -c "$CL" 1; panes_are 5
+  is "+ add, 1: Bring back @gemini" "$(tm display -p -t "$cw" '#{window_panes}')" 5
   tm send-keys -t "$chair" "/grid off" Enter; panes_are 1
   is "/grid off: only the chat is left" "$(tm display -p -t "$cw" '#{window_panes}')" 1
   tm send-keys -t "$chair" "/grid on" Enter; panes_are 5
@@ -322,13 +387,14 @@ tt -f /dev/null new-session -d -s t -x 60 -y 10 -c "$T/proj" "env TERM=xterm-256
 sleep 2.5
 msg="this fucking tokenops is a mess and the person who made it is valued at a trillion"
 for ((i = 0; i < ${#msg}; i++)); do tt send-keys -t t -l "${msg:i:1}"; done; sleep 0.6
-scr=$(tt capture-pane -p -J -t t | grep -v '^$' | tail -1)
+shot() { tt capture-pane -p -J -t t | sed 's/[[:space:]]*$//' | grep -v '^$' | tail -1; }
+scr=$(shot)
 is "a long message typed past the edge stays whole, after the prompt" "$scr" "you> $msg"
 tt send-keys -t t -N 30 BSpace; sleep 0.6
-scr=$(tt capture-pane -p -J -t t | grep -v '^$' | tail -1)
+scr=$(shot)
 is "... and backspaced back across the wrap" "$scr" "you> ${msg:0:$(( ${#msg} - 30 ))}"
 tt send-keys -t t Home; tt send-keys -t t -l ">>"; tt send-keys -t t End; sleep 0.5
-scr=$(tt capture-pane -p -J -t t | grep -v '^$' | tail -1)
+scr=$(shot)
 is "... and edited at its start" "$scr" "you> >>${msg:0:$(( ${#msg} - 30 ))}"
 tt kill-server 2>/dev/null
 

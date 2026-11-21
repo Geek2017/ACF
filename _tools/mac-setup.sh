@@ -19,6 +19,9 @@
 #   4. ~/.claude/settings.json: the fleet's keys (classic mode, status line, hooks).
 #   5. The chat log every 15 minutes, as a launchd job (io.github.acf.afc-logs).
 #   6. ~/.local/bin on your PATH, by one line in ~/.zprofile, when it is not there yet.
+#   7. GNU readline for Python (pip's gnureadline, into your own ~/Library/Python), for each python3
+#      the fleet may run: Homebrew's and the Mac's own. They edit lines with libedit, which leaves
+#      the council (Alt+K) with Tab only: no Shift+Tab, Alt+P, Alt+T or / and @ lists.
 # Every step is skipped when it is already done, so running it again is safe.
 #
 # What a Mac does not get: the resource budget (agents.slice, autonice, jobq are Linux's cgroups
@@ -82,6 +85,19 @@ else
   echo "  puts this folder's copies of the lists over yours):"
   inst | sed '/^$/d; /^Nothing was changed/d' | tail -4
   echo "  To take those:  PATH=\"$GNU:\$PATH\" $BREW/bin/bash $HERE/_tools/install.sh --apply"
+  # Programs added to the fleet since then (afc-council, afc-copy, afc-even ...) would have no link
+  # and their keys would do nothing, so each missing one is linked now. Programs only: the lists,
+  # and anything already in place, are left as they are.
+  for f in "$HERE"/bin/* "$HERE"/lib/afc/*; do
+    [[ -f "$f" ]] || continue
+    b=${f##*/}
+    case "$b" in *.bak-*|autonice|jobq|keepawake-agents) continue ;; esac     # the guard is Linux only
+    case "$f" in "$HERE"/lib/*) dst="$HOME/.local/lib/afc/$b" ;; *) dst="$HOME/.local/bin/$b" ;; esac
+    if [[ -e "$dst" || -L "$dst" ]]; then continue; fi
+    run mkdir -p "${dst%/*}"
+    if [[ -n "$COPY" ]]; then run cp "$f" "$dst"; run chmod 755 "$dst"; else run ln -s "$f" "$dst"; fi
+    (( DRY )) || echo "  new since the last set-up, now in place: $dst"
+  done
 fi
 
 step "3. The patched tmux"
@@ -158,6 +174,27 @@ else
   printf '\n# Agentic CLI Fleet: its programs (agents, afc-logs ...) live in ~/.local/bin\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$ZP"
   echo "  added ~/.local/bin to PATH in $ZP (open a new Terminal window for it to count)"
 fi
+
+step "7. GNU readline for Python (the council's typing line)"
+# A Mac's Pythons edit lines with libedit. Under Python it runs no hooks, never calls the hook that
+# lists matches, and plays a key's macro only when the next key comes: the council would have Tab
+# and nothing else. gnureadline is GNU readline, as on Linux; the council takes it when it is there.
+for py in "$BREW/bin/python3" /usr/bin/python3; do
+  [[ -x "$py" ]] || continue
+  # without the developer tools /usr/bin/python3 is only a stub that offers to install them
+  if [[ "$py" == /usr/bin/python3 ]] && ! xcode-select -p >/dev/null 2>&1; then continue; fi
+  v=$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null) || continue
+  if "$py" -c 'import gnureadline' >/dev/null 2>&1; then echo "  python $v ($py): has it"; continue; fi
+  # Homebrew's Python is "externally managed": pip wants leave to install even into your own folder
+  em=""
+  "$py" -c 'import os, sys, sysconfig; sys.exit(not os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED")))' 2>/dev/null && em=--break-system-packages
+  if (( DRY )); then echo "  would run: $py -m pip install --user $em gnureadline"
+  elif "$py" -m pip install --quiet --user --disable-pip-version-check $em gnureadline; then echo "  python $v ($py): installed gnureadline"
+  else
+    echo "  !! python $v ($py): could not install gnureadline (no network?)"
+    left "For the council's keys:  $py -m pip install --user $em gnureadline"
+  fi
+done
 
 echo
 if (( DRY )); then echo "DRY RUN: nothing was changed. Run it again without --dry-run to do it."; exit 0; fi

@@ -88,6 +88,19 @@ else
   echo "  puts this folder's copies of the lists and units over yours):"
   bash "$HERE/_tools/install.sh" "${COPY[@]}" | sed '/^Left for you:/,$d' | sed '/^$/d; /^Nothing was changed/d' | tail -4
   echo "  To take those:  bash $HERE/_tools/install.sh --apply"
+  # Programs added to the fleet since then (afc-council, afc-copy, afc-even ...) would have no link
+  # and their keys would do nothing, so each missing one is linked now. Programs only: the lists,
+  # the units and anything already in place are left as they are.
+  for f in "$HERE"/bin/* "$HERE"/lib/afc/*; do
+    [[ -f "$f" ]] || continue
+    b=${f##*/}
+    case "$b" in *.bak-*|autonice|jobq|keepawake-agents) continue ;; esac     # the guard is copied, at the first run
+    case "$f" in "$HERE"/lib/*) dst="$HOME/.local/lib/afc/$b" ;; *) dst="$HOME/.local/bin/$b" ;; esac
+    if [[ -e "$dst" || -L "$dst" ]]; then continue; fi
+    run mkdir -p "${dst%/*}"
+    if (( ${#COPY[@]} )); then run cp "$f" "$dst"; run chmod 755 "$dst"; else run ln -s "$f" "$dst"; fi
+    (( DRY )) || echo "  new since the last set-up, now in place: $dst"
+  done
 fi
 
 step "4. The resource budget (agents.slice)"

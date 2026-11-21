@@ -342,6 +342,8 @@ class Facts:
             # a bare name counts too: read from inside _ai/ (cd _ai && cat INDEX.md)
             if tok == base or P.rel(resolve(cwd, tok)) == READS[base]:
                 self.mark("fixes" if base == "FIXES.md" else "index")   # brief.sh prints the index
+        if re.search(r"ops\.py\s+log\b", scan):
+            self.mark("logged")         # the project's own logger wrote the update entry
         if "check-fixes" in scan:
             self.mark("fixrun")
             for _, arg in FIX_ARG.findall(scan):
@@ -416,9 +418,11 @@ def evaluate(P, tool, F, at=""):
                 f"_ai/INDEX.md is {n} characters, over its budget of {P.budget}",
                 "Move detail out to the linked files (never cut history), then run python3 _tools/check-index.py.")
     work = sorted({r for _, r in now if not r.startswith(WORK_ONLY)})
-    if work and P.updates and not any(r == P.updates for _, r in inside):
+    if work and P.updates and not any(r == P.updates for _, r in inside) and "logged" not in F.marks:
         add("record-work", False, True, f"{len(work)} file(s) changed and the work is not in {P.updates} yet",
-            f"When the work is done, add a short entry at the top of {P.updates}.")
+            "When the work is done, record it: " + (
+                'python3 _tools/ops.py log "<title>" --body "<what and why>".' if P.has("_tools/ops.py") else
+                f"add a short entry at the top of {P.updates}."))
     gen = sorted({r for _, r in now if r in P.rule_files})
     if gen:
         add("rule-files", False, True, f"edited {short(gen)}, which TokenOps generates",
@@ -549,7 +553,9 @@ def nudge(P, tool, st):
     if P.index:
         parts.append(f"Keep _ai/INDEX.md within {P.budget} characters.")
     if P.updates:
-        parts.append(f"Record finished work at the top of {P.updates}.")
+        # a project with its own logger (TokenOps' ops.py) records through it, not by editing the file
+        parts.append("Record finished work with python3 _tools/ops.py log." if P.has("_tools/ops.py") else
+                     f"Record finished work at the top of {P.updates}.")
     if st.get("open"):
         parts.append("Still open from the last turn: " + "; ".join(st["open"][:3]) + ".")
     glob_md = global_md(tool)

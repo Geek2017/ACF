@@ -1680,6 +1680,16 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     # project leaves the list too, so a restart doesn't reopen it (back with: agents --add <folder>).
     # Usage: agents --close <pane-id>
     pane="${2:?pane id}"
+    # A council member's pane (afc-council's grid): ✕ takes that member off the table; the council
+    # deals its grid again (the + in the bottom bar brings it back)
+    if [[ -n "$(t show-options -pqv -t "$pane" @council_member 2>/dev/null)" ]]; then
+      exec "$HOME/.local/bin/afc-council" --remove "$pane"
+    fi
+    # The council's chat box: the council quits (/quit, so the meeting is saved), not a pane killed
+    if [[ -n "$(t show-options -pqv -t "$pane" @council_chat 2>/dev/null)" ]]; then
+      t send-keys -t "$pane" C-u \; send-keys -t "$pane" -l "/quit" \; send-keys -t "$pane" Enter
+      exit 0
+    fi
     read -r panes win project < <(t display -p -t "$pane" '#{window_panes} #{window_id} #{@project}') || true
     if [[ "${panes:-}" == 1 && -n "${project:-}" ]]; then drop_project "$project"; fi
     # Even out the row or column the pane left, not the whole tab, so top/bottom stacks stay. afc-even,
@@ -1861,6 +1871,11 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       else note "$(tmux -V) from $(command -v tmux): not the patched build, so no thin scrollbar, header buttons or hover"; fi
     else no "tmux is not installed"; fi
     for c in jq flock git python3 ps $([[ -n "$MAC" ]] || echo systemd-run); do command -v "$c" >/dev/null || no "$c is not installed: the fleet needs it"; done
+    # The council's typing line (Alt+K): a Mac's own Pythons edit lines with libedit, which has Tab and no more
+    if [[ -n "$MAC" ]] && command -v python3 >/dev/null; then
+      if python3 -c 'import gnureadline' >/dev/null 2>&1; then ok "python3 has GNU readline (gnureadline): the council's typing line has all its keys"
+      else note "$(command -v python3) has no gnureadline: in the council only Tab works (no Shift+Tab, Alt+P, Alt+T, or / and @ lists). bash _tools/mac-setup.sh installs it"; fi
+    fi
     if [[ -n "$WSL" ]]; then
       for c in notify-send xclip kdialog; do
         command -v "$c" >/dev/null && continue
