@@ -205,6 +205,20 @@ mkdir -p "$T/acct"; ln -s "$HOME/.claude/settings.json" "$T/acct/settings.json"
 rules install >/dev/null 2>&1
 [[ -L "$T/acct/settings.json" ]] && grep -q 'afc-rules' "$T/acct/settings.json" && ok "an account's settings.json that links to the main one stays a link and sees the hooks" || bad "link broken"
 
+echo "memory"
+enc=$(printf '%s' "$(readlink -f "$P")" | sed 's#[^A-Za-z0-9]#-#g'); OLD="$HOME/.claude/projects/$enc/memory"
+mkdir -p "$OLD"; printf -- '- [a](a.md)\n' > "$OLD/MEMORY.md"; printf 'fact a\n' > "$OLD/a.md"
+mkdir -p "$P/.claude"; printf '{"permissions":{"allow":["Bash(ls:*)"]}}\n' > "$P/.claude/settings.local.json"
+out=$(rules memory --dry-run "$P" 2>&1)
+[[ "$out" == *"would copy 2 memory file(s)"* && -d "$OLD" && ! -L "$OLD" && ! -e "$P/_ai/memory" ]] && ok "memory --dry-run: says what it would do, changes nothing" || bad "memory dry run" "$out"
+out=$(rules memory "$P" 2>&1)
+if [[ -f "$P/_ai/memory/a.md" && -f "$P/_ai/memory/MEMORY.md" && -L "$OLD" && "$(readlink -f "$OLD")" == "$(readlink -f "$P/_ai/memory")" ]] && ls -d "$OLD".before-project-* >/dev/null 2>&1; then
+  ok "memory: Claude's files copied into _ai/memory, the old folder kept as a backup and replaced by a link"; else bad "memory move" "$out"; fi
+jq -e --arg d "$(readlink -f "$P")/_ai/memory" '.autoMemoryDirectory == $d and .permissions.allow[0] == "Bash(ls:*)"' "$P/.claude/settings.local.json" >/dev/null \
+  && ok "memory: autoMemoryDirectory (absolute) set in .claude/settings.local.json; its other settings stay" || bad "settings.local.json" "$(cat "$P/.claude/settings.local.json")"
+out=$(rules memory "$P" 2>&1)
+[[ "$out" == *"already in the project"* ]] && ok "memory again: nothing to do" || bad "memory second run" "$out"
+
 echo
 echo "$pass passed, $fail failed"
 (( KEEP )) && echo "kept: $T"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # agents — the Claude agent fleet: one tmux tab per project, Claude already running,
-# everything inside agents.slice (slows at 10G, hard stop at 12G, max 3 cores).
+# everything inside agents.slice (slows at 10G, hard stop at 11G, max 2.5 cores).
 #
 #   agents                  open the fleet, or reattach if it is already running; a start reopens the saved splits
 #   agents --fresh          start with one pane per project instead of the saved splits
@@ -19,6 +19,7 @@
 #   agents --usage [acct]   plan usage per account: email, session %, weekly %, model cap (claude-usage)
 #   agents --as <acct> [..] run Claude on that account in any terminal (sign one in: agents --as company, /login)
 #   agents --as gemini:<acct> | codex:<acct> [..]  the same for Gemini (then /auth) and Codex (agents --as codex:<acct> login)
+#   agents --express [project]  the express lane: list it, or put a project's tab on it / off it (Alt+E in the tab)
 #
 # Project list: ~/.config/agents/projects — one per line: <name> <folder>
 # Accounts:     ~/.config/agents/accounts        — one per line: <name> <Claude config folder>   (CLAUDE_CONFIG_DIR)
@@ -91,6 +92,49 @@ STAT="${AGENTS_STAT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u)
 
 t() { tmux -L "$SOCK" "$@"; }
 
+# The express lane. A project's tab may run in agents-express.slice, a child of agents.slice with a
+# higher CPU weight (400 against the fleet's 100) and 3G of memory that is reclaimed last: when the
+# fleet is busy that tab gets first call on the fleet's cores and keeps its pages, and the fleet's
+# total (agents.slice's quota and walls) is exactly what it was, since a child cannot exceed its
+# parent. Its holder is agents-express-pool.service; a pane joins the lane when its process tree is
+# moved into the holder's cgroup (children follow), and leaves it by moving back into the fleet's own
+# scope. The lane is per project, kept in ~/.config/agents/express (one project name per line), and
+# applied when the tab opens, is restored or split; Alt+E or `agents --express <project>` applies it
+# at once. The pane header shows ⚡ (afc-bar); autonice leaves the lane's processes at normal
+# priority, and at the slot gate the lane has slots of its own (heavy-x, dev-x: one each), so its
+# tests never wait behind the fleet's but one tab cannot flood the box either. Added 2026-11-21.
+LANES="${AGENTS_LANES:-$HOME/.config/agents/express}"
+AGENTS_CG="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/agents.slice"
+EXPRESS_POOL="$AGENTS_CG/agents-express.slice/agents-express-pool.service/cgroup.procs"
+lane_of() {  # project -> express | fleet
+  if [[ -r "$LANES" ]] && grep -qxF -- "$1" "$LANES"; then echo express; else echo fleet; fi
+}
+lane_set() {  # project express|fleet
+  mkdir -p "$(dirname "$LANES")"; touch "$LANES"
+  grep -vxF -- "$1" "$LANES" > "$LANES.tmp" || true
+  [[ "$2" == express ]] && echo "$1" >> "$LANES.tmp"
+  mv "$LANES.tmp" "$LANES"
+}
+pid_tree() {  # pid -> it and every process under it
+  local out=("$1") i=0 c
+  while (( i < ${#out[@]} )); do for c in $(pgrep -P "${out[$i]}" 2>/dev/null); do out+=("$c"); done; i=$((i + 1)); done
+  echo "${out[@]}"
+}
+in_express() {  # [pid] -> true when it already runs in the lane
+  grep -qs agents-express.slice "/proc/${1:-$$}/cgroup"
+}
+lane_join() {  # pane pid, express|fleet -> moves the pane's process tree; 1 where there is no lane (a Mac, no systemd)
+  local dest p
+  if [[ "$2" == express ]]; then dest="$EXPRESS_POOL"
+  else dest="/sys/fs/cgroup$(awk -F: '$1 == "0" { print $3 }' "/proc/$(t display -p '#{pid}' 2>/dev/null)/cgroup" 2>/dev/null)/cgroup.procs"; fi
+  [[ -w "$dest" ]] || return 1
+  for p in $(pid_tree "$1"); do echo "$p" > "$dest" 2>/dev/null || true; done
+}
+lane_apply_window() {  # window id, express|fleet -> every pane of that tab
+  local p
+  for p in $(t list-panes -t "$1" -F '#{pane_pid}' 2>/dev/null); do lane_join "$p" "$2" || return 1; done
+}
+
 # What the fleet's menus and messages SHOW for an account. ~/.config/agents/account-labels maps an
 # account name to a neutral label (also used by afc-bar for the pane header), so a shared screen
 # never carries a personal account name or its email. An account with no label shows as before.
@@ -145,6 +189,9 @@ BYPASS=--allow-dangerously-skip-permissions
 #   log-md on|off            chat log: also one readable .md file per thread (read by afc-logs) (off)
 #   mem-wall <percent>       no new agent once the fleet's real memory is this share of its
 #                            agents.slice limit; 0 turns the wall off                            (90)
+#   ram-wall <percent>       ... nor once the whole machine's RAM is this full (R: in the bar)   (90)
+#   cpu-wall <percent>       no new agent by hand once the machine's CPU is this busy (C: in the
+#                            bar); agents coming back after a restart are let through            (90)
 SETTINGS="${AGENTS_SETTINGS:-$HOME/.config/agents/settings}"
 setting() {  # name default -> its value
   local n v _
@@ -167,12 +214,13 @@ setting() {  # name default -> its value
 # for nothing. The two can be far apart (7G real inside an 11G charge is ordinary).
 #
 # A terminal split is never refused -- one may be exactly what you need to free the memory -- and
-# nor is the wall anywhere without an agents.slice to read: a Mac, or WSL running without systemd.
+# nor is this wall anywhere without an agents.slice to read: a Mac, or WSL running without systemd.
+# The machine wall below still holds there.
 MEM_WALL_SAID=""
 WALLED=()        # tabs the wall kept shut, named at the end of a start
 mem_high() {  # the limit in bytes, or nothing at all
   local h=""
-  read -r h < "${STAT%/memory.stat}/memory.high" 2>/dev/null || h=""
+  { read -r h < "${STAT%/memory.stat}/memory.high"; } 2>/dev/null || h=""   # braces: else a missing file is said aloud
   [[ "$h" =~ ^[0-9]+$ ]] || h=$(systemctl --user show agents.slice -p MemoryHigh --value 2>/dev/null || true)
   [[ "$h" =~ ^[0-9]+$ ]] && printf '%s\n' "$h"
 }
@@ -183,12 +231,77 @@ mem_room() {  # 0 = there is room for another agent, 1 = the wall is up (MEM_WAL
   local pct used high
   MEM_WALL_SAID=""
   pct=$(setting mem-wall 90)
-  [[ "$pct" =~ ^[0-9]+$ ]] && (( pct > 0 )) || return 0          # off, or a value that is not a number
-  used=$(mem_anon); high=$(mem_high)
-  [[ "$used" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] || return 0   # no agents.slice here: nothing to weigh
-  (( high > 0 )) || return 0
-  (( used * 100 < high * pct )) && return 0
-  MEM_WALL_SAID="the fleet is using $(numfmt --to=iec "$used") of its $(numfmt --to=iec "$high") limit, and the wall stands at $pct% of it"
+  # The fleet's own wall weighs only where it is on (a number above 0) and there is an agents.slice to
+  # read. Either way the machine's RAM wall is asked next: a Mac, WSL without systemd and mem-wall 0
+  # keep that one (it used to be skipped with this one).
+  if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct > 0 )); then
+    used=$(mem_anon); high=$(mem_high)
+    if [[ "$used" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] && (( high > 0 && used * 100 >= high * pct )); then
+      MEM_WALL_SAID="the fleet is using $(numfmt --to=iec "$used") of its $(numfmt --to=iec "$high") limit, and the wall stands at $pct% of it"
+      return 1
+    fi
+  fi
+  ram_room
+}
+
+# The machine wall. The memory wall above weighs the fleet against its own limit only. The machine
+# can be nearly out of RAM or CPU while the fleet still has room on paper: browsers and desktop apps
+# share the same RAM and cores. On 2026-11-21 that is how RAM and swap filled. So a new agent is also
+# refused when the whole machine's RAM is ram-wall percent full, and one started by hand when its
+# CPU is cpu-wall percent busy. The two figures are the ones the bottom bar shows (R: and C:), read
+# from afc-bar's own last sample, so what refuses a split is what you can see.
+#
+# The CPU wall is for agents you add by hand (a split, agents --add). Agents coming back after a
+# restart are let through: a starting fleet uses every core for a minute, and a wall there would
+# leave half the fleet unopened. The RAM wall holds for both, like the memory wall.
+# AGENTS_LOAD: another sample file ("<when> <cpu %> <ram %> ..."), so the tests can hand the wall a
+# busy or a calm machine; it is then used whatever its age.
+LOADF="${AGENTS_LOAD:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-bar}"
+M_CPU="" M_RAM=""
+machine_load() {  # sets M_CPU and M_RAM (whole percent of the machine); 1 when they cannot be read
+  local stamp="" cpu="" ram="" now _ u n s i w q sq st b1 t1 b2 t2 k v tot=0 av=0
+  M_CPU="" M_RAM=""
+  now=$(date +%s)
+  if [[ -r "$LOADF" ]]; then read -r stamp cpu ram _ < "$LOADF" || true; fi
+  if [[ "$stamp" =~ ^[0-9]+$ && "$cpu" =~ ^[0-9]+$ && "$ram" =~ ^[0-9]+$ ]] &&
+     { [[ -n "${AGENTS_LOAD:-}" ]] || (( now >= stamp && now - stamp < 20 )); }; then
+    M_CPU=$cpu M_RAM=$ram; return 0
+  fi
+  if [[ -n "$MAC" ]]; then   # a Mac has no /proc: the same reading the bar makes there (ps, vm_stat)
+    M_CPU=$(ps -A -o %cpu= | awk -v n="$(sysctl -n hw.ncpu)" '{ s += $1 } END { v = int(s / n); print (v > 100 ? 100 : v) }')
+    M_RAM=$(vm_stat | awk -v tot="$(sysctl -n hw.memsize)" '/page size of/ { p = $8 }
+      /Pages active:|Pages wired down:|occupied by compressor:/ { gsub(/\./, "", $NF); u += $NF } END { print int(u * p * 100 / tot) }')
+    [[ "$M_CPU" =~ ^[0-9]+$ && "$M_RAM" =~ ^[0-9]+$ ]] && return 0
+    M_CPU="" M_RAM=""; return 1
+  fi
+  [[ -r /proc/stat && -r /proc/meminfo ]] || return 1     # nothing to read: no machine wall
+  # the bar has no fresh sample (no fleet window on screen): measure the CPU over one second
+  read -r _ u n s i w q sq st _ < /proc/stat; b1=$((u+n+s+q+sq+st)); t1=$((b1+i+w))
+  sleep 1
+  read -r _ u n s i w q sq st _ < /proc/stat; b2=$((u+n+s+q+sq+st)); t2=$((b2+i+w))
+  M_CPU=$(( t2 > t1 ? (b2-b1)*100/(t2-t1) : 0 ))
+  while read -r k v _; do
+    case "$k" in MemTotal:) tot=$v ;; MemAvailable:) av=$v; break ;; esac
+  done < /proc/meminfo
+  M_RAM=$(( tot ? (tot-av)*100/tot : 0 ))
+}
+ram_room() {  # 0 = the machine has RAM for another agent, 1 = the wall is up (MEM_WALL_SAID says why)
+  local pct
+  pct=$(setting ram-wall 90)
+  [[ "$pct" =~ ^[0-9]+$ ]] && (( pct > 0 )) || return 0
+  machine_load || return 0
+  (( M_RAM < pct )) && return 0
+  MEM_WALL_SAID="the machine's RAM is ${M_RAM}% full (R: in the bottom bar), and the wall stands at $pct%"
+  return 1
+}
+cpu_room() {  # 0 = the machine has CPU for another agent, 1 = the wall is up (MEM_WALL_SAID says why)
+  local pct
+  MEM_WALL_SAID=""
+  pct=$(setting cpu-wall 90)
+  [[ "$pct" =~ ^[0-9]+$ ]] && (( pct > 0 )) || return 0
+  machine_load || return 0
+  (( M_CPU < pct )) && return 0
+  MEM_WALL_SAID="the machine's CPU is ${M_CPU}% busy (C: in the bottom bar), and the wall stands at $pct%"
   return 1
 }
 
@@ -402,9 +515,17 @@ try:
     print(json.loads(base64.urlsafe_b64decode(t)).get("email", "signed in"))
 except Exception:
     print("not signed in")' "$2/auth.json" ;;
+    # Antigravity kept its token in antigravity-oauth-token; since 2026-11 it keeps it in the system
+    # keyring and leaves only the marker ~/.config/antigravity/credential-user-scope (no email to read).
+    # An account folder whose .config is a link to another's shares that one sign-in: said so.
     agy)    python3 -I -c 'import json,sys,base64,re,os
 f = sys.argv[1]
-if not os.path.exists(f): print("not signed in"); sys.exit()
+if not os.path.exists(f):
+    m = sys.argv[2]
+    if not os.path.exists(m): print("not signed in")
+    elif os.path.realpath(m).startswith(os.path.realpath(sys.argv[3]) + os.sep): print("signed in")
+    else: print("signed in (shared with main)")
+    sys.exit()
 raw = open(f, "rb").read()
 try:
     d = json.loads(raw)
@@ -420,7 +541,7 @@ for m in re.finditer(rb"eyJ[A-Za-z0-9_-]+\.(eyJ[A-Za-z0-9_-]+)\.", raw):   # any
         if e: print(e); sys.exit()
     except Exception:
         pass
-print("signed in")' "$2/.gemini/antigravity-cli/antigravity-oauth-token" ;;
+print("signed in")' "$2/.gemini/antigravity-cli/antigravity-oauth-token" "$2/.config/antigravity/credential-user-scope" "$2" ;;
   esac
 }
 tool_share() {  # tool folder: a new Gemini/Codex home gets the main one's settings (MCP servers, model, hooks) by link
@@ -484,8 +605,14 @@ new_tab() {  # name dir command [tmux size options, used when this tab starts th
   if fleet_up; then
     t new-window -P -F '#{window_id}' -t "$SESSION:" -n "$name" -c "$dir" "$cmd"
   # The tmux server starts inside agents.slice, so every agent and everything it runs is capped
-  elif [[ -n "$MAC" ]] || ! systemd-run --user --scope --slice=agents.slice --quiet \
-         tmux -L "$SOCK" new-session -d "$@" -P -F '#{window_id}' -s "$SESSION" -n "$name" -c "$dir" "$cmd"; then
+  # OOMPolicy=continue: at the slice's memory wall the kernel kills one process. systemd's default
+  # (stop) would then stop this whole group, which is the tmux server and every agent in it.
+  # An older systemd (Ubuntu 22.04's 249, still common under WSL) may refuse OOMPolicy on a scope,
+  # and with it the whole start: the fleet then starts capped without it rather than not capped.
+  elif [[ -n "$MAC" ]] || ! { systemd-run --user --scope --slice=agents.slice --quiet -p OOMPolicy=continue \
+         tmux -L "$SOCK" new-session -d "$@" -P -F '#{window_id}' -s "$SESSION" -n "$name" -c "$dir" "$cmd" 2>/dev/null ||
+       { ! fleet_up && systemd-run --user --scope --slice=agents.slice --quiet \
+         tmux -L "$SOCK" new-session -d "$@" -P -F '#{window_id}' -s "$SESSION" -n "$name" -c "$dir" "$cmd"; }; }; then
     [[ -n "$MAC" ]] || echo "warning: could not start inside agents.slice; fleet is running uncapped" >&2   # macOS has no agents.slice
     t new-session -d "$@" -P -F '#{window_id}' -s "$SESSION" -n "$name" -c "$dir" "$cmd"
   fi
@@ -501,6 +628,7 @@ open_tab() {  # name dir -> 1 and opens nothing when the memory wall is up (mem_
   win=$(new_tab "$1" "$2" "$(pane_cmd "$2" "$wait")")
   # @project marks a project tab: Alt+Q on its last pane takes the project off the list (--close)
   [[ -n "$win" ]] && t set-option -w -t "$win" @project "$1"
+  [[ -n "$win" && "$(lane_of "$1")" == express ]] && { lane_apply_window "$win" express || true; }
   return 0
 }
 
@@ -689,14 +817,15 @@ pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its
 }
 
 layout_scan() {  # prints the running fleet as W and P lines; fails when it cannot be read whole
-  local wins panes hidden win name project layout w pid flag id
-  wins=$(t list-windows -t "$SESSION" -F "#{window_id}$TAB#{?window_name,#{window_name},-}$TAB#{?#{@project},#{@project},-}$TAB#{window_layout}") || return 1
+  local wins panes hidden win name project layout council w pid flag id
+  wins=$(t list-windows -t "$SESSION" -F "#{window_id}$TAB#{?window_name,#{window_name},-}$TAB#{?#{@project},#{@project},-}$TAB#{window_layout}$TAB#{?#{@council},c,-}") || return 1
   panes=$(t list-panes -s -t "$SESSION" -F "#{window_id}$TAB#{pane_pid}$TAB#{?pane_active,a,-}$TAB#{pane_id}") || return 1
   # Minimised splits wait in the holding session afcmin (afc-min); @min_from is the tab each came from
   hidden=$(t list-panes -s -t "=afcmin" -F "#{?#{@min_from},#{@min_from},-}$TAB#{pane_pid}${TAB}m$TAB#{pane_id}" 2>/dev/null || true)
   scan_procs
-  while IFS=$TAB read -r win name project layout; do
+  while IFS=$TAB read -r win name project layout council; do
     [[ -n "$win" ]] || continue
+    [[ "$council" == c ]] && continue     # the council's grid tab (@council, afc-council): a meeting, not kept over a restart
     printf 'W\t%s\t%s\t%s\n' "$name" "$project" "$layout"
     while IFS=$TAB read -r w pid flag id; do
       [[ "$w" == "$win" && -n "$pid" ]] || continue
@@ -914,6 +1043,7 @@ restore_tab() {  # reopens one saved tab from the caller's name, project, layout
   done
   [[ -n "$win" ]] || return 0
   if [[ "$project" != - ]]; then t set-option -w -t "$win" @project "$project"; restored+=("$project"); fi
+  [[ "$project" != - && "$(lane_of "$project")" == express ]] && { lane_apply_window "$win" express || true; }
   t select-layout -t "$win" "$layout" >/dev/null 2>&1 || true
   if [[ -n "$focus" ]]; then t select-pane -t "$focus" 2>/dev/null || true; fi
   n=$((n + 1))
@@ -984,7 +1114,7 @@ case "${1:-}" in
       echo "Added $name -> $dir"
     fi
     if fleet_up && ! t list-windows -t "$SESSION" -F '#{window_name}' | grep -qxF "$name"; then
-      if open_tab "$name" "$dir"; then
+      if cpu_room && open_tab "$name" "$dir"; then
         echo "Opened tab $name in the running fleet"
       else
         # On the list, so the next start opens it, but not started into a full fleet now.
@@ -1048,6 +1178,15 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
         echo "memory wall:  off (mem-wall $pct)"
       fi
     fi
+    # the machine wall, also where there is no agents.slice (a Mac, WSL without systemd)
+    if machine_load; then
+      rpct=$(setting ram-wall 90); cpct=$(setting cpu-wall 90); up=""
+      if [[ "$rpct" =~ ^[0-9]+$ ]] && (( rpct > 0 && M_RAM >= rpct )); then up="RAM"; fi
+      if [[ "$cpct" =~ ^[0-9]+$ ]] && (( cpct > 0 && M_CPU >= cpct )); then up="${up:+$up and }CPU"; fi
+      if [[ -n "$up" ]]; then up="UP for $up — no new agent until it eases"; else up="room for another agent"; fi
+      echo "machine wall: $up (RAM ${M_RAM}% full, wall at ${rpct}%; CPU ${M_CPU}% busy, wall at ${cpct}%," \
+           "for agents added by hand)"
+    fi
     ;;
   --pane)
     # Runs INSIDE a new split/tab: takes the folder from the source pane's process (/proc/<pid>/cwd),
@@ -1057,6 +1196,11 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     pf "${3:-0}"; dir=$(readlink "$PROC/${3:-0}/cwd" 2>/dev/null || true)
     [[ -d "$dir" ]] || dir="$PWD"   # source pane gone: stay where tmux started us
     cd "$dir"
+    # Express lane: a split in a tab that is on the lane joins it before its agent starts (children follow)
+    if [[ -n "${TMUX_PANE:-}" ]] && ! in_express $$; then
+      lproj=$(tmux display -p -t "$TMUX_PANE" '#{@project}' 2>/dev/null || true)
+      [[ -n "$lproj" && "$(lane_of "$lproj")" == express ]] && { lane_join $$ express || true; }
+    fi
     [[ "${2:-}" == tab ]] && tmux rename-window -t "${TMUX_PANE:-}" "$(basename "$dir")" 2>/dev/null || true
     # wt-<what>: the same, in a folder of its own (worktree_new). Not a git project: say so, leave a shell.
     what="${2:-term}"
@@ -1095,13 +1239,14 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     esac
     case "$needs_agent" in
       0) ;;
-      *) if ! mem_room; then
+      *) if ! mem_room || { [[ "$what" != restore ]] && ! cpu_room; }; then
            echo "Not starting an agent here: $MEM_WALL_SAID."
            echo
-           echo "One more agent now would not get memory of its own; it would slow down every agent"
-           echo "already running. Close a split you have finished with (Alt+W), then Alt+Enter here."
-           echo "agents --status shows what the fleet is using. To move or lift the wall, set"
-           echo "mem-wall in ~/.config/agents/settings (0 turns it off)."
+           echo "One more agent now would not get memory or CPU of its own; it would slow down every"
+           echo "agent already running. Close a split you have finished with (Alt+W), or wait for the"
+           echo "running work to end, then Alt+Enter here. agents --status shows what the fleet and"
+           echo "the machine are using. To move or lift a wall, set mem-wall, ram-wall or cpu-wall in"
+           echo "~/.config/agents/settings (0 turns one off)."
            t display-message -d 6000 "No new agent: $MEM_WALL_SAID" 2>/dev/null || true
            exec bash
          fi ;;
@@ -1316,6 +1461,38 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       *) claude_as "$2" "${@:3}" ;;
     esac
     ;;
+  --express)
+    # agents --express             which projects are on the express lane
+    # agents --express <project>   that project's tab on the lane, or off it again (a toggle); at once when the fleet runs
+    if [[ -z "${2:-}" ]]; then
+      if [[ -s "$LANES" ]]; then echo "Express lane:"; sed 's/^/  /' "$LANES"; else echo "Express lane: no project on it (agents --express <project>, or Alt+E in its tab)"; fi
+      [[ -w "$EXPRESS_POOL" ]] || echo "note: agents-express.slice is not running here, so the lane changes nothing until it is (systemctl --user start agents-express-pool)"
+      exit 0
+    fi
+    project_dir "$2" >/dev/null || { echo "$2 is not on the fleet list (agents --list)" >&2; exit 2; }
+    if [[ "$(lane_of "$2")" == express ]]; then lane=fleet; else lane=express; fi
+    lane_set "$2" "$lane"
+    if fleet_up; then
+      for w in $(t list-windows -t "$SESSION" -F '#{window_id} #{@project}' | awk -v p="$2" '$2 == p { print $1 }'); do lane_apply_window "$w" "$lane" || true; done
+    fi
+    if [[ "$lane" == express ]]; then echo "$2: on the express lane ⚡"; else echo "$2: back in the fleet lane"; fi
+    ;;
+  --lane-toggle)
+    # Alt+E: this tab on or off the express lane. Usage: agents --lane-toggle <client> <window-id> <pane-pid>
+    lproj=$(t display -p -t "${3:?usage: agents --lane-toggle <client> <window-id> <pane-pid>}" '#{@project}' 2>/dev/null || true)
+    if [[ -z "$lproj" ]]; then t display-message -c "${2:-}" "Only a project tab can take the express lane (this tab has no project)"; exit 0; fi
+    if [[ "$(lane_of "$lproj")" == express ]]; then lane=fleet; else lane=express; fi
+    lane_set "$lproj" "$lane"
+    if ! lane_apply_window "$3" "$lane"; then t display-message -c "${2:-}" "No express lane here (agents-express.slice is not running); $lproj is noted for the next start"; exit 0; fi
+    if [[ "$lane" == express ]]; then t display-message -c "${2:-}" "⚡ $lproj is on the express lane: first call on the fleet's CPU, its memory kept. Alt+E again takes it off"
+    else t display-message -c "${2:-}" "$lproj is back in the fleet lane"; fi
+    ;;
+  --room)
+    # Room for one more agent? The same memory and machine walls a new split is checked against, for
+    # helpers that start agents of their own (afc-council). Exit 0: yes. Exit 1: no, and why.
+    if mem_room; then exit 0; fi
+    echo "$MEM_WALL_SAID"; exit 1
+    ;;
   --who)
     # tmux bottom bar: the agent in the focused pane, with its account for Claude (nothing for a plain terminal)
     read -r p kind < <(pane_agent "${2:-0}") || exit 0
@@ -1330,10 +1507,13 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     # Usage: agents --split-menu|--split-down <client> <pane-id> <pane-pid> [pick | <account>] (the binding passes three)
     menu="$1"; client="${2:?client}"; pane="${3#%}"; pid="${4:?pane pid}"; self="$HOME/.local/bin/agents"; start=""
     win=$(t display -p -t "%$pane" '#{window_id}')
-    # Right: full height at the right edge. Below: halves this pane. select-layout -E then evens out the
-    # new pane's row or column only, so top/bottom stacks survive (even-horizontal flattened them).
+    # Right: full height at the right edge. Below: halves this pane. afc-even then evens out the new
+    # pane's row or column only, so top/bottom stacks survive (even-horizontal flattened them). Not
+    # tmux's select-layout -E: in 3.8 it leaves a stacked column out of a row's count and pushes it
+    # past the tab's edge, so a split below made both halves vanish.
     if [[ "$menu" == --split-down ]]; then where="below"; how="-v"; else where="to the right"; how="-fh"; fi
-    split() { echo "split-window $how -t %$pane '$self --pane $1 $pid${2:+ $2}' ; select-layout -E -t $win"; }
+    even="run-shell -b '$HOME/.local/bin/afc-even --window $win'"
+    split() { echo "split-window $how -t %$pane '$self --pane $1 $pid${2:+ $2}' ; $even"; }
     again() { echo "run-shell -b \"$self $menu '$client' $pane $pid $1\""; }
     case "${5:-}" in
       "")
@@ -1361,7 +1541,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
           ""
           "New agent in its own work folder..." k "$(again wt)"
           ""
-          "Agent from another tab"           a "choose-tree -Zw \"join-pane $how -t %$pane -s '%%' ; select-layout -E -t $win\""
+          "Agent from another tab"           a "choose-tree -Zw \"join-pane $how -t %$pane -s '%%' ; $even\""
           "Plain terminal"                   t "$(split term)"
         ) ;;
       wt)
@@ -1502,9 +1682,12 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     pane="${2:?pane id}"
     read -r panes win project < <(t display -p -t "$pane" '#{window_panes} #{window_id} #{@project}') || true
     if [[ "${panes:-}" == 1 && -n "${project:-}" ]]; then drop_project "$project"; fi
+    # Even out the row or column the pane left, not the whole tab, so top/bottom stacks stay. afc-even,
+    # not tmux's select-layout -E, which in 3.8 pushed a stacked column off the tab's edge. Nothing to
+    # even when the row or column is left with one member: it fills the place by itself.
+    keep=""; (( ${panes:-1} > 1 )) && keep=$(AGENTS_SOCK="$SOCK" "$HOME/.local/bin/afc-even" --gone "$pane" 2>/dev/null || true)
     t kill-pane -t "$pane"
-    # Even out the row or column the pane left (-E), not the whole tab, so top/bottom stacks stay
-    (( ${panes:-1} > 1 )) && t select-layout -E -t "$win" 2>/dev/null
+    if [[ -n "$keep" ]]; then AGENTS_SOCK="$SOCK" "$HOME/.local/bin/afc-even" $keep 2>/dev/null || true; fi
     exit 0
     ;;
   --kill)
@@ -1663,6 +1846,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     for f in "$here"/*; do
       [[ -f "$f" ]] || continue
       b=${f##*/}
+      [[ "$b" == *.bak-* ]] && continue                                                          # a copy kept by hand, not a program (install.sh skips it too)
       if [[ -n "$MAC" && " autonice jobq keepawake-agents " == *" $b "* ]]; then continue; fi   # the resource guard is Linux only
       if [[ -n "$WSL" && "$b" == keepawake-agents ]]; then continue; fi                        # WSL has no screen to keep awake
       nprog=$((nprog + 1))
@@ -1711,12 +1895,12 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     if [[ -n "$MAC" ]]; then
       if launchctl print "gui/$(id -u)/io.github.acf.afc-logs" >/dev/null 2>&1; then ok "the chat log runs every 15 minutes (launchd: io.github.acf.afc-logs)"
       else no "the chat log is not scheduled" "bash _tools/mac-setup.sh sets it up (launchd)"; fi
-      note "macOS has no agents.slice: nothing caps the fleet's memory or CPU here, and autonice and keepawake are Linux only"
+      note "macOS has no agents.slice: nothing caps the fleet's memory or CPU here (the machine wall below still holds back new agents), and autonice and keepawake are Linux only"
     elif [[ -n "$WSL" && "$(ps -p 1 -o comm= 2>/dev/null)" != systemd ]]; then
       no "WSL is running without systemd: nothing caps the agents, and the chat log is not scheduled" \
          "put [boot] systemd=true in /etc/wsl.conf, then from Windows: wsl --shutdown"
     else
-    for u in autonice.service $([[ -n "$WSL" ]] || echo keepawake-agents.service) afc-logs.timer; do
+    for u in autonice.service agents-express-pool.service $([[ -n "$WSL" ]] || echo keepawake-agents.service) afc-logs.timer; do
       if [[ "$(systemctl --user is-active "$u" 2>/dev/null)" == active ]]; then ok "$u is running"; else no "$u is not running" "systemctl --user enable --now $u"; fi
     done
     high=$(systemctl --user show agents.slice -p MemoryHigh --value 2>/dev/null || true)
@@ -1727,6 +1911,10 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     elif mem_room; then ok "the memory wall is on at $wpct% ($(numfmt --to=iec "$(mem_anon)") of $(numfmt --to=iec "$high") used): there is room for another agent"
     else note "the memory wall is UP: $MEM_WALL_SAID. No new agent or project tab until a split is closed"; fi
     fi
+    # The machine wall, everywhere: the whole machine's RAM and CPU (on WSL, WSL's own share of the PC)
+    if machine_load; then
+      ok "the machine wall reads RAM ${M_RAM}% full (wall at $(setting ram-wall 90)%) and CPU ${M_CPU}% busy (wall at $(setting cpu-wall 90)%, for agents added by hand)"
+    else note "this machine's RAM and CPU cannot be read: no machine wall"; fi
     if [[ -n "$WSL" ]]; then
       echo "Windows"
       if [[ -n "$PS" ]]; then ok "Windows is reachable: $PS (clipboard, notifications, folder dialog)"
@@ -1821,7 +2009,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     if fleet_up; then echo "Fleet running now: yes (agents would just reattach)"; else echo "Fleet running now: no"; fi
     while IFS=$'\t' read -r name dir <&3; do
       acct=""; [[ "$(mode "$dir")" == continue* ]] && acct=$(chat_account "$dir" || true)
-      printf '  %-18s %-20s on %-8s %s\n' "$name" "$(mode "$dir")" "${acct:-$(current_account)}" "$dir"
+      printf '  %-18s %-20s on %-8s %s%s\n' "$name" "$(mode "$dir")" "${acct:-$(current_account)}" "$dir" "$([[ "$(lane_of "$name")" == express ]] && echo '  ⚡ express lane')"
     done 3< <(projects)
     echo "Would start: tmux server$(command -v systemd-run >/dev/null && [[ -z "$MAC" ]] && echo ' inside agents.slice'), one tab per project above."
     acct=$(current_account)
@@ -1873,7 +2061,9 @@ if ($p -and $s.AppActivate($p.Id)) { "ok" }' 10)" == ok ]]; then exit 0; fi
       fi
       exec cmd.exe /c start "Agents" wsl.exe -d "$d" --cd "~" -- "$self"
     fi
-    if command -v alacritty >/dev/null; then exec alacritty --title Agents --class Agents -e "$self"
+    # -q, with log_level = "Error" in alacritty.toml (it needs both): no warning bar over the fleet.
+    # It goes after --class Agents: --window looks for a window by the start of this command line.
+    if command -v alacritty >/dev/null; then exec alacritty --title Agents --class Agents -q -e "$self"
     else exec konsole -e "$self"; fi
     ;;
   -h|--help)

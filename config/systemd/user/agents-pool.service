@@ -7,6 +7,9 @@ ExecStart=/bin/sleep infinity
 # Stopping/restarting this holder must NOT kill the agents that were moved in.
 KillMode=process
 Restart=always
+# A kill at the group's memory wall takes one process. Without this, systemd stops everything
+# that was moved into this holder (its default, OOMPolicy=stop). Added 2026-11-21.
+OOMPolicy=continue
 
 [Install]
 WantedBy=default.target

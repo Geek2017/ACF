@@ -8,3 +8,6 @@ config/agents/projects
 config/agents/log-projects
 
 __pycache__/
+
+# Copies kept by hand before an edit (agents.bak-20261121 ...): not programs, not for the repo
+*.bak-*

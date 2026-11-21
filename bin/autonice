@@ -4,28 +4,67 @@
 # for your own processes; anything not matched is left alone.
 # It also runs the slot gate: "gate" rules cap how many heavy jobs run at
 # once, pausing the extras until a slot frees (see jobq).
+# And the idle stop: an "idle" rule stops a job of a gate class (a dev server)
+# that has done no work for the set time.
+# And the duplicate stop: a "single" rule stops a second job of a gate class
+# (a dev server) started in a folder that already has one.
+# And the turn stop: a "turn" rule stops a job of a gate class (a dev server)
+# that a Claude agent in a tmux pane started, once that agent's reply has ended.
 #
 #   autonice            run the watcher (normally started by systemd)
-#   autonice --status   show which processes are currently lowered
+#   autonice --status   show which processes are currently lowered, the slots,
+#                       how long each watched dev server has been idle, and
+#                       which agent each agent-started dev server belongs to
 
 RULES="${AUTONICE_RULES:-$HOME/.config/autonice/rules}"
 INTERVAL="${AUTONICE_INTERVAL:-5}"
+# Duplicate stop: seconds a second copy is left beside the first when the
+# "single" rule names no time of its own.
+DUP_GRACE="${AUTONICE_DUP_GRACE:-$((INTERVAL * 2))}"
 # Hard CPU cap: matched processes are also moved into this group
-# (agents.slice, CPUQuota=300% = 3 cores). Children inherit it.
+# (agents.slice, CPUQuota=250% = 2.5 cores). Children inherit it.
 POOL="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/agents.slice/agents-pool.service/cgroup.procs"
 # Slot gate state, shared with jobq.
 RUN="${JOBQ_RUN:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/jobq}"
 
 declare -A SLOTS KIDS HELD_FD HELD_START HELD_SLOT PAUSED
+# Idle stop: time limit per class, this pass's watched jobs, and per watched
+# job its start time, CPU used at the last pass, when it last worked, and
+# when it was told to stop.
+declare -A IDLE WATCH PARENT W_START W_CPU W_ACTIVE W_KILL
+# Duplicate stop: classes it is on for, this pass's jobs of those classes
+# (DORDER: oldest first), and per job its start time, its "class port folder"
+# key, when it was first seen beside an older twin, and when it was told to stop.
+declare -A SINGLE SINGLE_PORT DUPC DUP_START DUP_KEY DUP_SEEN DUP_KILL
+DORDER=()
+# Turn stop: time per class, this pass's jobs of those classes, and per job its
+# start time, its owner ("<pane> <tmux socket>"; empty = not an agent's), its
+# folder, when its agent was first seen finished, and when it was told to stop.
+declare -A TURN TJOB T_START T_OWNER T_CWD T_FREE T_KILL
+# The tmux the fleet runs on (a client of another version cannot talk to it).
+TMUXBIN="${AUTONICE_TMUX:-$HOME/.local/bin/tmux}"; [ -x "$TMUXBIN" ] || TMUXBIN=tmux
+
+seconds() {   # "3h", "90m", "45s" or a bare number of minutes -> seconds
+    local n=${1%[smh]} u=${1##*[0-9]}
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    case "$u" in
+        s) echo "$n" ;; h) echo $((n * 3600)) ;; m|'') echo $((n * 60)) ;; *) return 1 ;;
+    esac
+}
 
 load_rules() {
-    local c n p
-    PRIOS=(); PATS=(); GCLASS=(); GPATS=(); SLOTS=()
+    local c n p m
+    PRIOS=(); PATS=(); GCLASS=(); GPATS=(); SLOTS=(); IDLE=(); SINGLE=(); SINGLE_PORT=(); TURN=()
     [ -f "$RULES" ] || return
     while read -r prio pat; do
         [[ -z "$prio" || "$prio" == \#* ]] && continue
         case "$prio" in
             slots) read -r c n <<< "$pat"; SLOTS[$c]=$n ;;
+            idle)  read -r c n <<< "$pat"; n=$(seconds "$n") && IDLE[$c]=$n ;;
+            single) read -r c n m <<< "$pat"
+                    if [ -z "$n" ]; then [ -n "$c" ] && SINGLE[$c]=$DUP_GRACE
+                    else n=$(seconds "$n") && SINGLE[$c]=$n && [ "$m" = port ] && SINGLE_PORT[$c]=1; fi ;;
+            turn)  read -r c n <<< "$pat"; n=$(seconds "$n") && TURN[$c]=$n ;;
             gate)  read -r c p <<< "$pat"; GCLASS+=("$c"); GPATS+=("$p") ;;
             *)     PRIOS+=("$prio"); PATS+=("$pat") ;;
         esac
@@ -50,6 +89,44 @@ if [ "$1" = "--status" ]; then
     echo
     echo "Slot gate:"
     jobq --status | sed 's/^/  /'
+    echo
+    echo "Idle stop (a watched job is stopped after this long with no work):"
+    if [ -s "$RUN/idle" ]; then
+        while read -r pid idle limit args; do
+            echo "  $pid  idle $((idle / 60)) of $((limit / 60)) min  $args"
+        done < "$RUN/idle"
+    else
+        echo "  nothing watched"
+    fi
+    echo
+    load_rules
+    echo "Duplicate stop (a second one in a folder that already has one is stopped):"
+    if [ ${#SINGLE[@]} -gt 0 ]; then
+        for c in "${!SINGLE[@]}"; do
+            echo "  on for: $c, one per folder${SINGLE_PORT[$c]:+ and port} (after ${SINGLE[$c]} s beside the first)"
+        done
+    else
+        echo "  off (no 'single' rule)"
+    fi
+    echo
+    echo "Turn stop (a dev server an agent started is stopped when that agent's reply ends):"
+    if [ ${#TURN[@]} -gt 0 ]; then
+        for c in "${!TURN[@]}"; do echo "  on for: $c (${TURN[$c]} s after the reply ends)"; done
+        if [ -s "$RUN/turn" ]; then
+            while read -r pid pane state keep args; do
+                case "$keep$state" in
+                    1busy|1wait) why="its agent is working" ;;
+                    1*)          why="another agent in that project is working" ;;
+                    *)           why="its agent has finished ($state): stopping" ;;
+                esac
+                echo "  $pid  pane $pane: $why  $args"
+            done < "$RUN/turn"
+        else
+            echo "  no agent-started server running"
+        fi
+    else
+        echo "  off (no 'turn' rule)"
+    fi
     exit 0
 fi
 
@@ -76,7 +153,8 @@ take_slot() {   # take_slot <pid> <class>: lock a free slot on the job's behalf
     # Holding for it would record an empty start time, which a gone process
     # also reads as, and the slot would never be freed.
     start=$(start_time "$pid") || return 0
-    for ((k = 1; k <= ${SLOTS[$class]:-2}; k++)); do
+    local n=${SLOTS[$class]:-2}; [[ "$class" == *-x ]] && n=${SLOTS[$class]:-1}   # express classes: one slot unless the rules say more
+    for ((k = 1; k <= n; k++)); do
         exec {fd}>"$RUN/$class.$k"
         if flock -n "$fd"; then
             HELD_FD[$pid]=$fd; HELD_START[$pid]=$start; HELD_SLOT[$pid]=$class.$k
@@ -117,9 +195,9 @@ save_state() {   # what jobq --status reads
 
 gate_pass() {
     local pid ppid uid tty args i a nested start class
-    local -A MATCH=() PARENT=() SEEN=()
+    local -A MATCH=() SEEN=()
     local order=()
-    KIDS=()
+    KIDS=(); PARENT=(); WATCH=(); DUPC=(); DORDER=(); TJOB=()
     mkdir -p "$RUN"
 
     # Free the slots of jobs that have ended; forget paused jobs that are gone.
@@ -136,9 +214,16 @@ gate_pass() {
     while read -r pid ppid uid tty args; do
         PARENT[$pid]=$ppid; KIDS[$ppid]+="$pid "
         [ ${#GPATS[@]} -gt 0 ] || continue
-        [[ "$uid" == "$UID" && "$tty" == "?" && "$args" =~ $GCOMBINED ]] || continue
+        [[ "$uid" == "$UID" && "$args" =~ $GCOMBINED ]] || continue
         for i in "${!GPATS[@]}"; do
-            if [[ "$args" =~ ${GPATS[$i]} ]]; then MATCH[$pid]=${GCLASS[$i]}; order+=("$pid"); break; fi
+            if [[ "$args" =~ ${GPATS[$i]} ]]; then
+                # The idle stop watches terminal-started jobs too; the gate only background ones.
+                [ -n "${IDLE[${GCLASS[$i]}]}" ] && WATCH[$pid]=${GCLASS[$i]}
+                [ -n "${SINGLE[${GCLASS[$i]}]}" ] && { DUPC[$pid]=${GCLASS[$i]}; DORDER+=("$pid"); }
+                [ -n "${TURN[${GCLASS[$i]}]}" ] && TJOB[$pid]=${GCLASS[$i]}
+                [ "$tty" = "?" ] && { MATCH[$pid]=${GCLASS[$i]}; order+=("$pid"); }
+                break
+            fi
         done
     done < <(ps -e -o pid=,ppid=,uid=,tty=,args= --sort=start_time)
 
@@ -152,10 +237,14 @@ gate_pass() {
         [ -n "$nested" ] && continue
         # Started through jobq: it already holds its own slot.
         grep -qsz '^JOBQ_SLOT=' "/proc/$pid/environ" && continue
+        # The express lane (agents-express.slice) has slots of its own ("slots heavy-x N", default 1),
+        # so its jobs never wait behind the fleet's, but they are still counted: with no gate at all
+        # one tab ran seven browser tests and a 4 GB dev server at once (2026-11-21).
+        xl=""; grep -qs agents-express.slice "/proc/$pid/cgroup" && xl="-x"
         SEEN[$pid]=1
         [ -n "${HELD_FD[$pid]}" ] && continue
 
-        class=${MATCH[$pid]}
+        class=${MATCH[$pid]}$xl
         if [ -n "${PAUSED[$pid]}" ] && told_to_quit "$pid"; then
             # Its owner gave up waiting and asked it to quit: let it run so it can.
             resume "$pid" "asked to quit while paused"
@@ -175,7 +264,256 @@ gate_pass() {
     for pid in "${!PAUSED[@]}"; do
         [ -n "${SEEN[$pid]}" ] || resume "$pid" "no longer matches a gate rule"
     done
+    single_pass
+    turn_pass
+    idle_pass
     save_state
+}
+
+# --- Idle stop -------------------------------------------------------------
+# "idle <class> <time>" in the rules: a job of that gate class that has done no
+# work for that long is stopped (SIGTERM, then SIGKILL if it is still there 15
+# seconds later). Made for dev servers left running: at rest one uses no CPU at
+# all (measured: 0 ticks in 70 s), while a page load or a rebuild after a file
+# change does. Terminal-started ones are watched too. The clocks are kept in
+# memory, so restarting autonice starts them again from zero.
+
+# CPU ticks (1/100 s) in one pass that count as work: 1% of a core.
+BUSY="${AUTONICE_IDLE_BUSY:-$INTERVAL}"
+
+cpu_ticks() {   # cpu_ticks <pid...> -> user + system CPU ticks used so far, summed
+    local t=0 p s
+    for p in "$@"; do
+        { read -r s < "/proc/$p/stat"; } 2>/dev/null || continue
+        s=${s##*) }; s=($s); t=$((t + s[11] + s[12]))
+    done
+    echo "$t"
+}
+
+idle_pass() {
+    local pid a nested start cpu d limit idle class where now=$EPOCHSECONDS
+    local -a parts
+    for pid in "${!W_START[@]}"; do   # forget watched jobs that are gone
+        [ "$(start_time "$pid")" = "${W_START[$pid]}" ] && continue
+        unset 'W_START[$pid]' 'W_CPU[$pid]' 'W_ACTIVE[$pid]' 'W_KILL[$pid]'
+    done
+    : > "$RUN/idle.new"
+    for pid in "${!WATCH[@]}"; do
+        # A watched job inside another watched job is part of it.
+        a=${PARENT[$pid]}; nested=
+        while [ -n "$a" ] && [ "$a" -gt 1 ]; do
+            [ -n "${WATCH[$a]}" ] && { nested=1; break; }
+            a=${PARENT[$a]}
+        done
+        [ -n "$nested" ] && continue
+        start=$(start_time "$pid") || continue
+        class=${WATCH[$pid]}; limit=${IDLE[$class]}
+        cpu=$(cpu_ticks $(tree "$pid"))
+        if [ "${W_START[$pid]}" != "$start" ]; then   # first sight: the clock starts now
+            W_START[$pid]=$start; W_CPU[$pid]=$cpu; W_ACTIVE[$pid]=$now
+        fi
+        d=$((cpu - ${W_CPU[$pid]})); W_CPU[$pid]=$cpu
+        # Not idle: it worked this pass, a child of it ended (the sum fell), or the gate holds it paused.
+        if (( d >= BUSY || d < 0 )) || [ -n "${PAUSED[$pid]}" ]; then W_ACTIVE[$pid]=$now; fi
+        idle=$((now - ${W_ACTIVE[$pid]}))
+        mapfile -d '' -t parts < "/proc/$pid/cmdline" 2>/dev/null
+        if [ -n "${W_KILL[$pid]}" ]; then
+            (( now - ${W_KILL[$pid]} >= 15 )) && kill -KILL $(tree "$pid") 2>/dev/null
+        elif (( idle >= limit )); then
+            where=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+            # CONT as well: a job suspended with Ctrl+Z would never see the TERM.
+            kill -TERM $(tree "$pid") 2>/dev/null; kill -CONT $(tree "$pid") 2>/dev/null
+            W_KILL[$pid]=$now
+            echo "idle: stopped $pid, no work for $((idle / 60)) min (limit $((limit / 60))): ${parts[*]:0:6} (in $where)"
+            [ -z "$AUTONICE_NO_NOTIFY" ] && command -v notify-send >/dev/null && notify-send -a autonice "Idle $class server stopped" \
+                "${where##*/}: no work for $((idle / 60)) min. Start it again when you need it." 2>/dev/null
+        fi
+        echo "$pid $idle $limit ${parts[*]:0:6}" >> "$RUN/idle.new"
+    done
+    mv "$RUN/idle.new" "$RUN/idle"
+}
+
+# --- Duplicate stop --------------------------------------------------------
+# "single <class> [time] [port]" in the rules: of the jobs of that gate class
+# running in the same folder, only the first stays: one dev server per project
+# folder, whatever port the later one asks for. Each holds about 1 GB for as
+# long as it lives. With the word "port" after the time, a second server on a
+# port of its own (-p 3217) is not a duplicate and is left alone; only one
+# started for the same port (-p N, --port N, PORT=N, else the default) is.
+# The later one is stopped once it has been seen beside the first for the
+# rule's time (10s; without one, DUP_GRACE), so a restart (the old server
+# still shutting down as the new one starts) is not taken for a duplicate. It
+# is told why on its own output, so an agent that started it reads the reason
+# and uses the first. Write the rule WITH a time ("single dev 10s"): an
+# autonice from before this rule reads an unknown line as "<priority>
+# <pattern>", and a bare "single dev" would be the pattern "dev" to it.
+
+asked_port() {   # asked_port <pid> -> the port it was started for: -p N, --port N, --port=N, else PORT of its environment, else "default"
+    local -a a; local i e
+    mapfile -d '' -t a < "/proc/$1/cmdline" 2>/dev/null
+    for i in "${!a[@]}"; do
+        case "${a[$i]}" in
+            -p|--port) echo "${a[$((i + 1))]:-default}"; return ;;
+            --port=*)  echo "${a[$i]#--port=}"; return ;;
+            -p[0-9]*)  echo "${a[$i]#-p}"; return ;;
+        esac
+    done
+    while IFS= read -r -d '' e; do
+        [[ "$e" == PORT=* ]] && { echo "${e#PORT=}"; return; }
+    done 2>/dev/null < "/proc/$1/environ"
+    echo default
+}
+
+ports_of() {   # ports_of <pid...> -> the ports those processes listen on
+    local out p addr users r=" "
+    out=$(ss -ltnpH 2>/dev/null) || return 0
+    for p in "$@"; do
+        while read -r _ _ _ addr _ users; do
+            [[ "$users" == *"pid=$p,"* && "$r" != *" ${addr##*:} "* ]] && r+="${addr##*:} "
+        done <<< "$out"
+    done
+    r=${r# }; echo "${r% }"
+}
+
+single_pass() {
+    local pid a nested start key first class port where ports msg now=$EPOCHSECONDS
+    local -A FIRST=()
+    local -a parts
+    for pid in "${!DUP_START[@]}"; do   # forget jobs that are gone or no longer under the rule
+        [ -n "${DUPC[$pid]}" ] && continue
+        unset 'DUP_START[$pid]' 'DUP_KEY[$pid]' 'DUP_SEEN[$pid]' 'DUP_KILL[$pid]'
+    done
+    for pid in "${DORDER[@]}"; do   # oldest first
+        # A job of the class inside another one is part of it.
+        a=${PARENT[$pid]}; nested=
+        while [ -n "$a" ] && [ "$a" -gt 1 ]; do
+            [ -n "${DUPC[$a]}" ] && { nested=1; break; }
+            a=${PARENT[$a]}
+        done
+        [ -n "$nested" ] && continue
+        start=$(start_time "$pid") || continue
+        if [ "${DUP_START[$pid]}" != "$start" ]; then   # first sight: note its folder and port once
+            where=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+            port=any; [ -n "${SINGLE_PORT[${DUPC[$pid]}]}" ] && port=$(asked_port "$pid")
+            DUP_START[$pid]=$start; DUP_KEY[$pid]="${DUPC[$pid]} $port $where"
+            unset 'DUP_SEEN[$pid]' 'DUP_KILL[$pid]'
+        fi
+        if [ -n "${DUP_KILL[$pid]}" ]; then   # told to stop already: it is nobody's "first"
+            (( now - ${DUP_KILL[$pid]} >= 15 )) && kill -KILL $(tree "$pid") 2>/dev/null
+            continue
+        fi
+        [ -n "${W_KILL[$pid]}" ] && continue   # the idle stop is ending it
+        key=${DUP_KEY[$pid]}; first=${FIRST[$key]}
+        if [ -z "$first" ]; then FIRST[$key]=$pid; unset 'DUP_SEEN[$pid]'; continue; fi
+        [ -n "${DUP_SEEN[$pid]}" ] || DUP_SEEN[$pid]=$now
+        (( now - ${DUP_SEEN[$pid]} >= ${SINGLE[${DUPC[$pid]}]:-$DUP_GRACE} )) || continue
+
+        read -r class port where <<< "$key"
+        ports=$(ports_of $(tree "$first"))
+        mapfile -d '' -t parts < "/proc/$pid/cmdline" 2>/dev/null
+        msg="autonice: stopped this $class server: one already runs in this folder (pid $first${ports:+, port $ports}). Use that one; only one $class server per folder is allowed."
+        [ "$port" = any ] || msg="autonice: stopped this $class server: the same one already runs in this folder (pid $first${ports:+, port $ports}). Use that one, or start this one on another port with -p."
+        # Best effort, and never allowed to hang the watcher (a pipe nobody reads would).
+        timeout 1 bash -c 'echo "$1" >> "/proc/$2/fd/2"' _ "$msg" "$pid" 2>/dev/null
+        # CONT as well: a job the gate holds paused would never see the TERM.
+        kill -TERM $(tree "$pid") 2>/dev/null; kill -CONT $(tree "$pid") 2>/dev/null
+        DUP_KILL[$pid]=$now
+        echo "single: stopped $pid, a $class server already runs in $where (pid $first${ports:+, port $ports}): ${parts[*]:0:6}"
+        [ -z "$AUTONICE_NO_NOTIFY" ] && command -v notify-send >/dev/null && notify-send -a autonice "Duplicate $class server stopped" \
+            "${where##*/}: one already runs${ports:+ on port $ports}." 2>/dev/null
+    done
+}
+
+# --- Turn stop -------------------------------------------------------------
+# "turn <class> <time>" in the rules: a job of that gate class (a dev server)
+# that a Claude agent in a tmux pane started is stopped once that agent's reply
+# has ended for that long. An agent starts a server to test its work and then
+# leaves it running; this ends it with the turn. Whose it is comes from the
+# job's own environment: CLAUDECODE=1 (Claude's tool shells carry it) plus the
+# TMUX and TMUX_PANE of the pane. So a server you type in a pane yourself, or
+# one started outside tmux, is never touched by this rule.
+# Whether the agent is at work comes from the pane marks the fleet's hooks set
+# (agents --mark): @state busy or wait = at work; done, unset, or @bgshell set
+# (the reply ended with a background shell still running) = finished. A server
+# is kept while ANY agent at work sits in its folder or above it: a second
+# agent in the same project may be using it. If tmux cannot be asked (anything
+# but a plain "no server running"), nothing is stopped.
+
+owner_of() {   # owner_of <pid> -> "<pane> <tmux socket>" when a Claude agent in a tmux pane started it, else nothing
+    local e pane= sock= agent=
+    while IFS= read -r -d '' e; do
+        case "$e" in
+            TMUX_PANE=%*) pane=${e#TMUX_PANE=} ;;
+            TMUX=*)       sock=${e#TMUX=}; sock=${sock%%,*} ;;
+            CLAUDECODE=1) agent=1 ;;
+        esac
+    done 2>/dev/null < "/proc/$1/environ"
+    [ -n "$agent" ] && [ -n "$pane" ] && [ -n "$sock" ] && echo "$pane $sock"
+}
+
+turn_pass() {
+    local pid a nested start pane sock state path p out where keep msg now=$EPOCHSECONDS
+    local -A PST=() ASKED=() WORK=() BLIND=()
+    local -a parts
+    for pid in "${!T_START[@]}"; do   # forget jobs that are gone or no longer under the rule
+        [ -n "${TJOB[$pid]}" ] && continue
+        unset 'T_START[$pid]' 'T_OWNER[$pid]' 'T_CWD[$pid]' 'T_FREE[$pid]' 'T_KILL[$pid]'
+    done
+    [ ${#TURN[@]} -gt 0 ] || { rm -f "$RUN/turn"; return 0; }
+    : > "$RUN/turn.new"
+    for pid in "${!TJOB[@]}"; do
+        # A job of the class inside another one is part of it.
+        a=${PARENT[$pid]}; nested=
+        while [ -n "$a" ] && [ "$a" -gt 1 ]; do
+            [ -n "${TJOB[$a]}" ] && { nested=1; break; }
+            a=${PARENT[$a]}
+        done
+        [ -n "$nested" ] && continue
+        start=$(start_time "$pid") || continue
+        if [ "${T_START[$pid]}" != "$start" ]; then   # first sight: note whose it is and where, once
+            T_START[$pid]=$start; T_OWNER[$pid]=$(owner_of "$pid"); T_CWD[$pid]=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+            unset 'T_FREE[$pid]' 'T_KILL[$pid]'
+        fi
+        [ -n "${T_OWNER[$pid]}" ] || continue   # not an agent's: not this rule's to end
+        read -r pane sock <<< "${T_OWNER[$pid]}"
+        if [ -z "${ASKED[$sock]}" ]; then   # one question per tmux server per pass
+            ASKED[$sock]=1
+            if out=$("$TMUXBIN" -S "$sock" list-panes -a -F '#{pane_id} #{?#{@bgshell},left,#{?#{@state},#{@state},idle}} #{pane_current_path}' 2>&1); then
+                while read -r p state path; do
+                    [ -n "$p" ] || continue
+                    PST["$sock $p"]=$state
+                    [[ "$state" == busy || "$state" == wait ]] && WORK[$sock]+="$p $path"$'\n'
+                done <<< "$out"
+            elif [ -S "$sock" ] && [[ "$out" != *"no server running"* ]]; then
+                BLIND[$sock]=1   # the server may be there and only the asking failed: stop nothing
+            fi                   # (tmux leaves its socket file behind when its server ends, so ask what it said)
+        fi
+        state=${PST["$sock $pane"]:-gone}
+        where=${T_CWD[$pid]}; keep=
+        if [[ "$state" == busy || "$state" == wait ]] || [ -n "${BLIND[$sock]}" ]; then keep=1
+        else
+            while read -r p path; do
+                [ -n "$path" ] && [ "$p" != "$pane" ] && [[ "$where" == "$path" || "$where" == "$path"/* ]] && { keep=1; break; }
+            done <<< "${WORK[$sock]}"
+        fi
+        mapfile -d '' -t parts < "/proc/$pid/cmdline" 2>/dev/null
+        if [ -n "${T_KILL[$pid]}" ]; then
+            (( now - ${T_KILL[$pid]} >= 15 )) && kill -KILL $(tree "$pid") 2>/dev/null
+        elif [ -n "$keep" ]; then
+            unset 'T_FREE[$pid]'
+        else
+            [ -n "${T_FREE[$pid]}" ] || T_FREE[$pid]=$now
+            if (( now - ${T_FREE[$pid]} >= ${TURN[${TJOB[$pid]}]} )); then
+                msg="autonice: stopped this ${TJOB[$pid]} server: the agent that started it has finished its reply. This is expected. Do not start it again now; start it when you next need it."
+                timeout 1 bash -c 'echo "$1" >> "/proc/$2/fd/2"' _ "$msg" "$pid" 2>/dev/null
+                kill -TERM $(tree "$pid") 2>/dev/null; kill -CONT $(tree "$pid") 2>/dev/null
+                T_KILL[$pid]=$now
+                echo "turn: stopped $pid, its agent's reply ended (pane $pane, $state): ${parts[*]:0:6} (in $where)"
+            fi
+        fi
+        echo "$pid $pane $state ${keep:-0} ${parts[*]:0:6}" >> "$RUN/turn.new"
+    done
+    mv "$RUN/turn.new" "$RUN/turn"
 }
 
 # Fail open: if autonice stops, nothing stays frozen.
@@ -202,6 +540,9 @@ while true; do
             [[ "$ni" =~ ^-?[0-9]+$ ]] || continue
             for i in "${!PATS[@]}"; do
                 if [[ "$args" =~ ${PATS[$i]} ]]; then
+                    # The express lane (agents-express.slice, see `agents --express`) keeps normal
+                    # priority: it is already inside agents.slice, so the hard cap still holds.
+                    if grep -qs agents-express.slice "/proc/$pid/cgroup"; then break; fi
                     prio=${PRIOS[$i]}
                     if [ "$ni" -lt "$prio" ]; then
                         renice -n "$prio" -p "$pid" >/dev/null 2>&1

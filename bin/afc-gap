@@ -24,6 +24,15 @@ SOCK="${AGENTS_SOCK:-agents}"
 t() { tmux -L "$SOCK" "$@"; }
 state="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-panes/g${pane#%}"
 
+# One check per pane at a time. afc-bar starts this every other second and never waits for it, so
+# when the tmux server is slow to answer, the earlier checks are still waiting and new ones stack
+# up behind them. On 2026-11-21 that reached 12,700 processes, filled RAM and swap, and the kernel
+# killed the desktop app. A check that finds one still running for this pane leaves at once.
+if (( ! dry )) && command -v flock >/dev/null 2>&1; then
+  mkdir -p "${state%/*}" 2>/dev/null
+  if { exec 8> "$state.lock"; } 2>/dev/null; then flock -n 8 || exit 0; fi
+fi
+
 read -r h cy alt mode <<< "$(t display-message -p -t "$pane" '#{pane_height} #{cursor_y} #{alternate_on} #{pane_in_mode}' 2>/dev/null)"
 [[ "$h" =~ ^[0-9]+$ && "$cy" =~ ^[0-9]+$ ]] || exit 0
 if [[ "$alt" != 0 || "$mode" != 0 ]] || (( h - cy < 8 )); then

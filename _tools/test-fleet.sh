@@ -36,9 +36,13 @@ sb() {
   env -u TMUX -u TMUX_PANE -u CLAUDE_CONFIG_DIR -u CODEX_HOME -u GEMINI_CLI_HOME -u XDG_STATE_HOME -u XDG_CONFIG_HOME \
       -u AGENTS_LIST -u AGENTS_ACCOUNTS -u AGENTS_LAYOUT -u AGENTS_SETTINGS -u AGENTS_WORKTREES -u AGENTS_CLAUDE \
       HOME="$H" AGENTS_SOCK="$SOCK" AGENTS_LAYOUT_EVERY=2 XDG_RUNTIME_DIR="$SBX/run" \
+      AGENTS_LOAD="${LOAD:-$SBX/load-calm}" \
       PATH="$H/.local/bin:/usr/local/bin:/usr/bin:/bin" "$@"
 }
 tm() { sb tmux -L "$SOCK" "$@"; }
+# The machine wall reads the machine's CPU and RAM from a sample file (AGENTS_LOAD). The sandbox gets a
+# calm one, so a busy real machine cannot refuse the test's own agents; LOAD=<file> swaps it for one check.
+echo "0 10 30" > "$SBX/load-calm"; echo "0 97 30" > "$SBX/load-cpu"; echo "0 10 95" > "$SBX/load-ram"
 A="$H/.local/bin/agents"
 
 cleanup() {
@@ -55,7 +59,7 @@ mkdir -p "$H/.local/bin" "$H/.local/lib/afc" "$H/.config/agents" "$H/.claude/pro
 chmod 700 "$SBX/run"
 ln -s "$TMUXBIN" "$H/.local/bin/tmux"
 ln -s "$BIN/agents" "$A"
-for f in afc-agent-info afc-min afc-reflow afc-move; do
+for f in afc-agent-info afc-even afc-min afc-reflow afc-move; do
   if [[ -e "$BIN/$f" ]]; then ln -s "$BIN/$f" "$H/.local/bin/$f"; else ln -s "$REPO/bin/$f" "$H/.local/bin/$f"; fi
 done
 ln -s "$REPO/lib/afc/pb.py" "$H/.local/lib/afc/pb.py"
@@ -175,6 +179,9 @@ tm split-window -fh -t agents:2 "$A --pane gemini $p1"
 tm split-window -fh -t agents:2 "$A --pane claude $p1 main"
 tm split-window -fh -t agents:2 "$A --pane agy $p1"
 tm split-window -fh -t agents:2 "$A --pane plan $p1 main"
+# shared out evenly, as the split menu does (afc-even): five bare -fh splits leave the first columns
+# a few cells wide, and afc-even --guard minimises a split squeezed that small
+tm select-layout -t agents:2 even-horizontal
 sleep 1.5
 tm run-shell "$H/.local/bin/afc-min hide $(tm display -p -t agents:2.4 '#{pane_id}')"
 tm new-window -t agents: "$A --pane tab $p1"
@@ -349,7 +356,8 @@ is "\"a new chat\" starts it with nothing" "$(cut -d'|' -f1 "$H/started.log")" "
 echo "Menus and the tmux config"
 is "the tmux config loads without complaint" "$(tm source-file "$H/.tmux.conf" 2>&1)" ""
 has "Alt+L is bound to the overview" "$(tm list-keys -T root 2>/dev/null)" 'M-l .*--overview-menu'
-( sb script -qfc "tmux -L $SOCK attach -t agents" /dev/null >/dev/null 2>&1 & ); sleep 1.5
+# TERM of its own: run from an agent's shell (TERM=dumb) tmux refuses to attach and the menu checks are lost
+( sb script -qfc "env TERM=xterm-256color tmux -L $SOCK attach -t agents" /dev/null </dev/null >/dev/null 2>&1 & ); sleep 1.5
 client=$(tm list-clients -F '#{client_name}' | head -1)
 if [[ -n "$client" ]]; then
   pane=$(tm display -p -t agents:2.1 '#{pane_id}'); pid=$(tm display -p -t agents:2.1 '#{pane_pid}')
@@ -360,6 +368,14 @@ if [[ -n "$client" ]]; then
   is "Alt+G to another tool asks what to start from" "$(sb "$A" --switch codex:main "$pane" "$pid" ask "$client" 2>&1; echo "rc=$?")" "rc=0"
   is "and starts nothing until that is answered" "$(tm display -p -t "$pane" '#{pane_pid}')" "$pid"
 else bad "a stand-in terminal could be attached for the menu checks" "no client"; fi
+
+echo "Antigravity's sign-in"
+# Since 2026-11 Antigravity keeps its token in the system keyring and leaves only a marker in
+# ~/.config/antigravity; before that the account list called a signed-in Antigravity "not signed in"
+has "no token and no marker: not signed in" "$(sb "$A" --accounts 2>&1)" '^\* agy +main +not signed in'
+mkdir -p "$H/.config/antigravity"; : > "$H/.config/antigravity/credential-user-scope"
+has "the keyring marker: signed in" "$(sb "$A" --accounts 2>&1)" '^\* agy +main +signed in '
+rm -rf "$H/.config/antigravity"
 
 echo "The memory wall"
 # agents.slice is not reachable from a sandbox, so hand the wall a memory.stat of our own
@@ -404,6 +420,47 @@ has "and reports it as on, with room, when there is room" "$(wall "$WROOM" "$A" 
 sed -i "/$(basename "$P4")/d" "$H/.config/agents/projects"
 out=$(wall "$WROOM" "$A" --add "$P4" </dev/null 2>&1)
 has "with room, the same project opens its tab" "$out" 'Opened tab'
+
+echo "The machine wall"
+# Same refusals as the memory wall, for the whole machine: CPU 97% busy, or RAM 95% full, against walls at 90%.
+sleep 3   # the tab opened just above starts its agent a moment later: let that line land before counting
+n0=$(grep -c . "$H/started.log" 2>/dev/null || echo 0)
+out=$(LOAD="$SBX/load-cpu" wall "$WROOM" "$A" --pane claude 0 </dev/null 2>&1)
+has "a new agent split on a machine with its CPU spent leaves a shell and says why" "$out" "Not starting an agent here.*CPU is 97% busy"
+is  "and no agent was started" "$(grep -c . "$H/started.log" 2>/dev/null || echo 0)" "$n0"
+out=$(LOAD="$SBX/load-ram" wall "$WROOM" "$A" --pane claude 0 </dev/null 2>&1)
+has "nor on a machine with its RAM nearly full, though the fleet itself has room" "$out" "Not starting an agent here.*RAM is 95% full"
+hasnt "a terminal split is never refused by the machine wall either" \
+    "$(LOAD="$SBX/load-cpu" wall "$WROOM" "$A" --pane term 0 </dev/null 2>&1)" 'Not starting'
+# An agent that is let through really starts, and the stand-in never ends by itself: start it aside,
+# look for its line in started.log, then end it.
+through() {  # through <sample file> <agents arguments...>: "started" when an agent came up within 60 s
+  local n0 i got=refused   # (a split from "pane 0" looks at every process first, slow on a busy machine)
+  n0=$(grep -c . "$H/started.log" 2>/dev/null || echo 0)
+  ( LOAD="$1" wall "$WROOM" timeout 60 "$A" "${@:2}" </dev/null >/dev/null 2>&1 & )
+  for i in $(seq 120); do
+    sleep 0.5
+    if (( $(grep -c . "$H/started.log" 2>/dev/null || echo 0) > n0 )); then got=started; break; fi
+  done
+  pkill -f "^/bin/bash $H/.local/bin/claude --allow-dangerously-skip-permissions\$" 2>/dev/null
+  echo "$got"
+}
+is "an agent coming back after a restart is let through a busy CPU (a starting fleet uses every core)" \
+    "$(through "$SBX/load-cpu" --pane restore 0 claude main -)" started
+has "but not through a full RAM" \
+    "$(LOAD="$SBX/load-ram" wall "$WROOM" "$A" --pane restore 0 claude main - </dev/null 2>&1)" 'Not starting an agent here'
+has "agents --status shows the machine wall up, and for what" \
+    "$(LOAD="$SBX/load-cpu" wall "$WROOM" "$A" --status 2>&1)" 'machine wall: UP for CPU'
+has "and room when the machine is calm" "$(wall "$WROOM" "$A" --status 2>&1)" 'machine wall: room for another agent'
+P5="$SBX/proj/p5"; mkdir -p "$P5"
+out=$(LOAD="$SBX/load-cpu" wall "$WROOM" "$A" --add "$P5" </dev/null 2>&1); rc=$?
+has "a project added by hand to a machine with its CPU spent is refused" "$out" 'No tab opened.*CPU is 97% busy'
+is  "and that refusal is an error" "$rc" "1"
+sed -i "/$(basename "$P5")/d" "$H/.config/agents/projects"
+printf 'start-gap 0\ncpu-wall 0\nram-wall 0\n' > "$H/.config/agents/settings"
+is "cpu-wall 0 turns the CPU wall off" "$(through "$SBX/load-cpu" --pane claude 0)" started
+is "and ram-wall 0 the RAM wall" "$(through "$SBX/load-ram" --pane claude 0)" started
+printf 'start-gap 0\n' > "$H/.config/agents/settings"
 
 echo "The check-up"
 doc=$(sb "$A" --doctor 2>&1)

@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""afc-copy: what the fleet's mouse copy puts on the clipboard: the text, without the pane's dressing.
+
+tmux copies what is on the screen, so text taken from an agent's reply came out with the
+agent's layout in it: the quote bar ("▎"), the reply and tool marks ("●", "⎿"), the left margin,
+and a line break wherever the pane was too narrow. Pasted into a browser or a document that reads
+as broken lines with stray bars. This filter reads the selection on stdin, cleans it, and hands
+the result to the clipboard program.
+
+  afc-copy [--width N] [--raw] [--print] [-- clipboard command ...]
+
+  --width N   the pane's width in cells. Without it tmux is asked (the active pane of the session
+              the copy ran in). Without a width no line is rejoined; the dressing is still removed.
+  --raw       change nothing (what the copy was before this filter)
+  --print     write the result to stdout instead of the clipboard (tests, or a look)
+  -- command  the clipboard program to use instead of the one found here
+
+What is changed:
+  1. A leading quote bar, reply mark or tool mark counts as blank space.
+  2. The margin all the lines share is removed (a first line picked up from mid-line is allowed for).
+  3. Two lines become one when the break was only the pane's doing: the next line's first word
+     would not have fit on the line above. A line under 60% of the width is never joined, so short
+     lines of code and commands keep their breaks. A list item, a table row or a ruled line is
+     never joined to its neighbour. A line with no space in it (a long path or address cut by
+     the pane) is joined without a space.
+  4. Trailing blanks and empty lines at both ends go.
+
+It is the tmux copy-command (tmux/tmux.conf). Shift+drag is still Alacritty's own selection and
+copies the screen exactly as shown.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+
+MARKS = "▎●⎿"                      # quote bar, reply mark, tool-output mark
+LIST = re.compile(r"^(?:[-*+•‣◦▪▸>#]|\d{1,3}[.)])(?:\s|$)")
+
+
+def cells(s):
+    """Width on screen: wide characters take two cells, combining ones none."""
+    n = 0
+    for c in s:
+        if unicodedata.combining(c):
+            continue
+        n += 2 if unicodedata.east_asian_width(c) in "WF" else 1
+    return n
+
+
+def ruled(s):
+    """A table row or a drawn line: box-drawing or block characters in it."""
+    return any("─" <= c <= "▟" for c in s)
+
+
+def clean(text, width=0):
+    raw = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]
+    lines, lens = [], []
+    for line in raw:
+        lens.append(cells(line))
+        body = line.lstrip(" ")
+        if body[:1] and body[0] in MARKS and (len(body) == 1 or body[1] == " "):
+            line = " " * (len(line) - len(body) + 1) + body[1:]   # the mark counts as a blank
+        lines.append(line.rstrip())
+
+    def indent(s):
+        return len(s) - len(s.lstrip(" "))
+
+    # The margin the lines share. The first line may have been picked up from mid-line and so
+    # have no margin of its own: it is left out of the count when the others agree on more.
+    rest = [indent(l) for l in lines[1:] if l.strip()]
+    first = indent(lines[0]) if lines and lines[0].strip() else None
+    if rest:
+        margin = min(rest)
+        if first is not None and first < margin:
+            lens[0] += margin - first          # what was to the left of where the copy began
+        elif first is not None:
+            margin = min(margin, first)
+    else:
+        margin = first or 0
+    lines = [l[min(margin, indent(l)):] for l in lines]
+
+    out = []
+    prev = None            # index in `lines` of the last screen line that went into out[-1]
+    for i, line in enumerate(lines):
+        body = line.strip()
+        if out and prev is not None and body and out[-1].strip() and width > 0:
+            word = body.split(" ", 1)[0]
+            above = lines[prev].strip()
+            if (lens[prev] + 1 + cells(word) > width          # the word would not have fit
+                    and lens[prev] * 10 >= width * 6          # and the line above was not a short one
+                    and not LIST.match(body)
+                    and not ruled(body) and not ruled(above)):
+                out[-1] = out[-1].rstrip() + ("" if " " not in above else " ") + body
+                prev = i
+                continue
+        out.append(line)
+        prev = i if body else None
+    while out and not out[0].strip():
+        out.pop(0)
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out)
+
+
+def pane_width():
+    """The width of the pane the copy was made in: the active pane of this job's session."""
+    if not os.environ.get("TMUX"):
+        return 0
+    try:
+        mine = os.path.expanduser("~/.local/bin/tmux")     # the fleet's own tmux: another version cannot ask its server
+        r = subprocess.run([mine if os.access(mine, os.X_OK) else "tmux", "display-message", "-p", "#{pane_width}"],
+                           capture_output=True, text=True, timeout=2)
+        return int(r.stdout.strip())
+    except Exception:
+        return 0
+
+
+def wsl():
+    """Windows' Linux (WSL2): the copy belongs on the Windows clipboard."""
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        with open("/proc/sys/kernel/osrelease") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+def clipboard_command():
+    if shutil.which("pbcopy"):
+        return ["pbcopy"]
+    # In WSL, Windows' own clip.exe first: it is there with or without WSLg, and what it takes can be
+    # pasted into any Windows program. (See encode() for what it needs to be handed.)
+    if wsl() and shutil.which("clip.exe"):
+        return ["clip.exe"]
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        return ["wl-copy"]
+    if os.environ.get("DISPLAY") and shutil.which("xclip"):     # without an X display xclip only fails
+        return ["xclip", "-selection", "clipboard", "-i"]
+    if shutil.which("clip.exe"):
+        return ["clip.exe"]
+    return None
+
+
+def encode(sink, data):
+    """The bytes and the environment for that clipboard program.
+
+    clip.exe reads plain bytes in the Windows console's code page, not UTF-8, so "—" or "✓" would
+    land on the clipboard as mojibake. Text that is not plain ASCII goes to it as UTF-16LE behind a
+    byte-order mark, which it reads as Unicode. pbcopy reads by the locale, and a tmux server
+    started without one (LANG unset) would mangle the same characters: it is given UTF-8."""
+    env = None
+    name = os.path.basename(sink[0]) if sink else ""
+    if name == "clip.exe" and not data.isascii():
+        return b"\xff\xfe" + data.encode("utf-16-le"), env
+    if name == "pbcopy":
+        loc = os.environ.get("LC_ALL") or os.environ.get("LC_CTYPE") or os.environ.get("LANG") or ""
+        if "utf-8" not in loc.lower() and "utf8" not in loc.lower():
+            env = dict(os.environ, LC_CTYPE="UTF-8")
+            env.pop("LC_ALL", None)
+    return data.encode("utf-8"), env
+
+
+def main():
+    args = sys.argv[1:]
+    sink = None
+    if "--" in args:
+        k = args.index("--")
+        sink, args = args[k + 1:], args[:k]
+    raw = "--raw" in args
+    show = "--print" in args
+    width = None
+    for i, a in enumerate(args):
+        if a == "--width" and i + 1 < len(args):
+            try:
+                width = int(args[i + 1])
+            except ValueError:
+                width = 0
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+    data = sys.stdin.buffer.read().decode("utf-8", "replace")
+    if not raw:
+        try:
+            data = clean(data, pane_width() if width is None else width)
+        except Exception:          # never lose a copy to a fault in the cleaning
+            pass
+    if show:
+        sys.stdout.write(data)
+        return 0
+    sink = sink or clipboard_command()
+    if not sink:
+        sys.stderr.write("afc-copy: no clipboard program found (xclip, wl-copy, pbcopy, clip.exe)\n")
+        return 1
+    raw_bytes, env = encode(sink, data)
+    return subprocess.run(sink, input=raw_bytes, env=env,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

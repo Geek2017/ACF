@@ -53,3 +53,36 @@ gate heavy  ^[^ ]*(chrome|chromium)[^ ]* (.* )?--headless
 # dev servers (each one holds ~1 GB for as long as it runs)
 gate dev    ^[^ ]*node( -[^ ]+)* [^ ]*/next([./][^ ]*)? dev( |$)
 gate dev    ^[^ ]*node( -[^ ]+)* [^ ]*/vite(\.js)?( (dev|serve)( |$)| --|$)
+
+# --- Idle stop: a dev server nobody uses is stopped ---
+#   idle <class> <time>   a job of that gate class that did no work at all for
+#                         that long is stopped (3h, 90m, 45s; a bare number is
+#                         minutes). Work = any CPU use: a page load, a rebuild
+#                         after a file change. A server at rest uses none.
+#                         Servers started in a terminal are watched too.
+# Remove the line to turn it off.  See the clocks:  autonice --status
+idle dev 3h
+
+# --- Duplicate stop: one dev server per project folder ---
+#   single <class> <time> [port]   a second job of that gate class started in a
+#                           folder that already has one is stopped once it has
+#                           sat beside the first for that long (the wait lets a
+#                           restart through). The first one stays, whatever
+#                           port the second asks for. The stopped one is told
+#                           why on its own output.
+#                           With the word "port" after the time, a second
+#                           server on a port of its own (-p 3217) is allowed.
+# Keep the time on the line. Remove the line to turn it off.
+single dev 10s
+
+# --- Turn stop: an agent's dev server ends with the agent's reply ---
+#   turn <class> <time>   a job of that gate class that a Claude agent in a
+#                         fleet pane started is stopped once that agent's reply
+#                         has ended for that long. It is kept while any agent
+#                         at work sits in the same project folder, and while
+#                         the agent waits for your permission. A server you
+#                         start yourself (typed in a pane or a terminal) and
+#                         one from outside the fleet are never touched.
+#                         See whose is whose:  autonice --status
+# Remove the line to turn it off.
+turn dev 20s

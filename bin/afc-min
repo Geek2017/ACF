@@ -5,7 +5,9 @@
 # a hidden holding session called "afcmin", which has no tab in the bottom bar. The bottom bar shows
 # how many are minimised ( ▣ 2 ); clicking that, or Alt+U, brings one back.
 #
-#   afc-min hide <pane id>                    minimise that split (Alt+H, or – in its header)
+#   afc-min hide <pane id> [keep]             minimise that split (Alt+H, or – in its header); the row or
+#                                             column it leaves is evened, or with keep its neighbour
+#                                             takes the room and every other size stays (afc-even --guard)
 #   afc-min show <client> <window id> [pane]  restore: the only one, or a pop-up list when there are
 #                                             several (Alt+U, or click ▣ N); with a pane id, that one
 #   afc-min all <window id>                   restore every minimised split
@@ -19,6 +21,9 @@ MAC=''; [[ "$OSTYPE" != darwin* ]] || . "$HOME/.local/lib/afc/mac.sh"   # macOS:
 STASH=afcmin
 t() { tmux "$@"; }
 say() { t display-message -d 3500 "$1" 2>/dev/null; }
+# Even out a row or column of splits (afc-even). Not tmux's select-layout -E: in tmux 3.8 it leaves a
+# top/bottom stack out of a row's count and pushes it past the tab's edge, out of sight.
+even() { "$HOME/.local/bin/afc-even" "$@" 2>/dev/null || true; }
 
 hidden() { t list-panes -s -t "=$STASH" -F '#{?#{@min_from},#{pane_id},}' 2>/dev/null | grep . ; }
 count() { hidden | grep -c . ; }
@@ -53,7 +58,7 @@ restore() {  # <pane id> <window to fall back on>
   t join-pane -fh -s "$pane" -t "$target" || return 1
   t set-option -p -u -t "$pane" @min_from
   t set-option -p -u -t "$pane" @min_name
-  t select-layout -E -t "$pane"
+  even "$pane"
   t select-window -t "$target"
   t select-pane -t "$pane"
 }
@@ -68,11 +73,11 @@ case "${1:-}" in
     fi
     # the holding session needs one window of its own to exist; it does nothing
     t has-session -t "=$STASH" 2>/dev/null || t new-session -d -s "$STASH" -n holding 'exec sleep infinity'
-    other=$(t list-panes -t "$wid" -F '#{pane_id}' | grep -vx -- "$pane" | head -1)
+    keep=""; [[ "${3:-}" == keep ]] || keep=$(even --gone "$pane")   # the row or column it leaves, evened once it has gone
     t set-option -p -t "$pane" @min_from "$wid"
     t set-option -p -t "$pane" @min_name "$wname"
     if t break-pane -d -s "$pane" -t "$STASH:" -n "$wname"; then
-      [[ -n "$other" ]] && t select-layout -E -t "$other"
+      [[ -n "$keep" ]] && even $keep
       sync
       say "Minimised ($(count) hidden, still running). Alt+U or click ▣ in the bottom bar to bring it back."
     else

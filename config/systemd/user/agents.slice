@@ -2,9 +2,12 @@
 Description=Capped CPU group for AI agents and builds (autonice moves them here)
 
 [Slice]
-# 300% = at most 3 of your 6 cores, no matter how much work they start.
+# 100% = one core. The fleet gets at most this much of your 6 cores, no matter how much work it starts.
 # Change the number and run: systemctl --user daemon-reload
-CPUQuota=300%
+# 2026-11-21: lowered from 300% to 250%. With the fleet at 3 full cores (agents running tests),
+# the USB dock driver at ~1 and a video in Brave, the machine sat at 88% busy. 250% leaves the
+# desktop half a core more; agent tests run a little slower.
+CPUQuota=250%
 
 # Memory: slow a runaway agent down at 12 GB, kill it alone at 14 GB — before
 # it can eat the whole 24 GB and take the desktop down (OpenCode did this once).
@@ -12,10 +15,20 @@ CPUQuota=300%
 # 2026-10-28 (agents peaked at 10.9 GB and kept hitting the slow-down line;
 # the rest of the desktop used ~6 GB). 14 keeps ~10 GB for the desktop, Zed and
 # browsers. Do not go higher without measuring what's left.
-MemoryHigh=12G
-MemoryMax=14G
+# 2026-11-21: lowered from 12/14 to 10/11. At 14 the fleet stayed under its own line while the whole
+# machine ran out (fleet 13 GB + desktop apps and browsers ~10 GB = all 23 GB, swap full),
+# and the kernel killed the Claude desktop app instead of anything in the fleet. At 11 the
+# fleet hits its own wall first and the kill lands inside it.
+MemoryHigh=10G
+MemoryMax=11G
 
 # Swap: at most 1 GB. Without this the overflow past 8 GB went to swap instead,
 # filled it, and froze the whole desktop (2026-10-22). Now a runaway agent hits
 # 10 GB fast and is killed alone.
 MemorySwapMax=1G
+
+# Processes: at most 2500 (threads count too; a normal busy fleet is 350-450). On 2026-11-21
+# the fleet's background helpers stacked up to 12,700 because the memory line only slows things
+# down and nothing counted processes. Past this number a new one simply fails to start, so a
+# pile-up stops itself instead of filling RAM.
+TasksMax=2500

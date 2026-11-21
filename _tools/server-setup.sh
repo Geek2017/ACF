@@ -116,6 +116,9 @@ CPUQuota=$(( cap * 100 ))%
 MemoryHigh=${high}M
 MemoryMax=${max}M
 MemorySwapMax=1G
+# At most 2500 processes (threads count too; a busy fleet is 350-450). Past it a new one fails to
+# start, so a pile-up of helpers stops itself instead of filling the memory.
+TasksMax=2500
 EOF
   echo "  sized for $WHAT ($cores cores, $mem MB): $cap core(s), slowed at $high MB, stopped at $max MB"
   echo "  change it in $U"

@@ -36,6 +36,15 @@ CACHE="$RT/afc-bar"
 KEEP="$RT/afc-bar.d"      # the kept answers
 TTL=5 HDR_TTL=5 MACH_TTL=2 WHO_TTL=30 LIM_TTL=30 RUN_TTL=20
 
+# solo <lock file>: for the background helpers below. True when no earlier run of the same helper
+# is still going (the lock is held on fd 8 until the helper's subshell ends). Without it a slow
+# machine let helpers stack up behind each other by the thousand (2026-11-21, see afc-gap).
+solo() {
+  command -v flock >/dev/null 2>&1 || return 0
+  { exec 8> "$1"; } 2>/dev/null || return 0
+  flock -n 8
+}
+
 # The time, without starting `date` (bash 4.2 and later; older ones fall back to date).
 now=''; printf -v now '%(%s)T' -1 2>/dev/null
 [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
@@ -113,9 +122,9 @@ sample() {
   [[ "$rn" =~ ^[0-9]+$ ]] && running=$rn
   if ! [[ "$rs" =~ ^[0-9]+$ ]] || (( now - rs >= RUN_TTL || now < rs )); then
     echo "$now ${rn:-$running}" > "$CACHE.run"    # claim the turn first, so parallel calls do not all count
-    ( n=$(AGENTS_SOCK="$SOCK" "$BIN/agents" --running 2>/dev/null) && [[ "$n" =~ ^[0-9]+$ ]] && echo "$now $n" > "$CACHE.run" ) >/dev/null 2>&1 &
+    ( solo "$CACHE.run.lock" || exit 0; n=$(AGENTS_SOCK="$SOCK" "$BIN/agents" --running 2>/dev/null) && [[ "$n" =~ ^[0-9]+$ ]] && echo "$now $n" > "$CACHE.run" ) >/dev/null 2>&1 &
     # the same moment clears out kept answers of panes that are long gone
-    ( find "$KEEP" -type f -mmin +30 -delete ) >/dev/null 2>&1 &
+    ( solo "$CACHE.sweep.lock" || exit 0; find "$KEEP" -type f -mmin +30 -delete ) >/dev/null 2>&1 &
   fi
   # Keep the bottom bar's count of minimised splits true even when one ends by itself (afc-min).
   mins=$(tmux -L "$SOCK" list-panes -s -t '=afcmin' -F '#{?#{@min_from},x,}' 2>/dev/null | grep -c x)
@@ -217,14 +226,16 @@ if [[ -n "$who" ]]; then
   # The account is shown by its label from ~/.config/agents/account-labels (a neutral stand-in, so a
   # shared screen never carries a personal account name); an account not listed shows its own name.
   acct='' label=''
+  # ⚡: this pane runs in the express lane (agents-express.slice; Alt+E or agents --express)
+  lane=''; grep -qs agents-express.slice "/proc/${1:-0}/cgroup" && lane='⚡'
   if [[ "$who" == *' '* ]]; then
     acct=${who#* }; label=$acct
     while read -r lname lshow _; do
       [[ "$lname" == "$acct" && -n "$lshow" ]] && { label=$lshow; break; }
     done < "$HOME/.config/agents/account-labels" 2>/dev/null
-    add "#[fg=$GREEN]$letter / $label"
+    add "#[fg=$GREEN]$lane$letter / $label"
   else
-    add "#[fg=$GREEN]$letter"
+    add "#[fg=$GREEN]$lane$letter"
   fi
 fi
 # Model and effort of the Claude in this pane, as afc-statusline last saved them. A file older
@@ -267,7 +278,7 @@ if [[ "$who" == codex* || "$who" == gemini* || "$who" == agy* ]] && [[ "${1:-0}"
   isaved=$(stat -c %Y "$ifile" 2>/dev/null || echo 0)
   if (( now - isaved >= 10 )); then
     mkdir -p "${ifile%/*}" 2>/dev/null
-    ( "$BIN/afc-agent-info" "${who%% *}" "$1" > "$ifile.$$" 2>/dev/null; mv -f "$ifile.$$" "$ifile" ) >/dev/null 2>&1 &
+    ( solo "$ifile.lock" || exit 0; "$BIN/afc-agent-info" "${who%% *}" "$1" > "$ifile.$$" 2>/dev/null; mv -f "$ifile.$$" "$ifile" ) >/dev/null 2>&1 &
   fi
   if [[ -s "$ifile" ]]; then
     IFS= read -r saved_line < "$ifile"

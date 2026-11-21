@@ -54,10 +54,12 @@ Moved here: 2026-11-16, on the Kubuntu 24.04 workstation.
 | Alt+G | change the agent or account in this pane |
 | Alt+M | pick the model or effort (Claude, Gemini) without the agent's own tall picker |
 | Alt+L | list every agent in the fleet with what it is doing; pick one to go to it |
+| Alt+K | the council: a tab with a group chat of every signed-in LLM and the agents you make, on the topic you raise, dealt into an even grid (one pane per member, each with its own scroll and a spinner while it thinks; you type in the strip at the bottom). Each pane's header shows the model and effort that member runs on; Alt+M (or m) in its pane changes them. Answers are short and direct (at most 60 words; `/length N`). Tag `@name`; `/mode order` one by one, `/mode roast` all at once then roasting each other |
 | Alt+J | move this split: left, right, up, down, merge under a neighbour, own column |
 | Alt+H / Alt+U | minimise this split / bring a minimised one back |
+| Alt+E | this project's tab on or off the express lane: first call on the fleet's CPU and its memory kept when the fleet is busy, the fleet's total unchanged (⚡ in the header; `agents --express`) |
 | Alt+Z | maximise this split to the whole tab, and back |
-| Alt+Q | close this split (asks first, in a Yes / No pop-up in the centre) |
+| Alt+Q | close this split (asks first, in a pop-up in the centre: close it, minimise it instead, or keep it) |
 | Alt+S / Alt+X | show another tab beside this one / send this pane to its own tab |
 | Alt+N / Alt+C | add a project folder as a new tab / plain terminal tab |
 | Ctrl+V | paste text or an image |
@@ -74,6 +76,7 @@ Everything with a button also lights up under the pointer and can be clicked, me
 | `agents --fresh` | start with one pane per project instead of the saved splits |
 | `agents --layout` | show the saved tabs and splits: what the next start reopens |
 | `agents --overview` | every agent in one list: tab, working / waiting / done, tokens, cost, limits |
+| `agents --express [project]` | list the express lane, or put a project's tab on it / take it off (the same as Alt+E); kept in `~/.config/agents/express`, applied again when the tab is opened, restored or split |
 | `agents --worktrees` | the work folders made for splits; `--prune` removes the finished ones |
 | `agents --doctor` | check that links, hooks, services and the watcher are in place; changes nothing |
 | `agents --add [folder] [name]` | add a project (default: this folder); opens its tab if the fleet is up |
@@ -83,16 +86,26 @@ Everything with a button also lights up under the pointer and can be clicked, me
 | `agents --usage` | plan limits per Claude account |
 | `agents --as <account>` | run Claude on that account in any terminal (`gemini:<account>`, `codex:<account>`, `agy:<account>` for the others) |
 | `agents --kill` | stop every agent (asks first) |
+| `afc-council` | the council in this folder, in any terminal (`/help` inside lists its commands; `/agent new NAME LLM PERSONA` makes an agent) |
+| `agents --room` | is there memory for one more agent? (the walls a split is checked against); exit 1 and the reason when not |
 | `afc-logs search WORDS` | search this project's chat log (`--all` for every project) |
 | `afc-logs threads`, `afc-logs show THREAD` | list the threads, print one |
 | `afc-logs prune-md` | remove the readable `.md` files earlier versions wrote beside the database (`--all` for every project, `--dry-run` to look first) |
 | `afc-rules show` | what the rule check found in this TokenOps project (`--all` for every project in the fleet) |
 | `afc-rules replay` | judge the last two weeks of chats in TokenOps projects as the check would have (`--days N`, `-v` per turn); changes nothing |
 | `afc-rules install`, `afc-rules doctor` | add the rule check's hooks to all four tools' settings (`--dry-run`, `--remove`); see what is in place |
+| `afc-rules memory [folder...]` | keep Claude's own memory inside each TokenOps project, in `_ai/memory/`, instead of `~/.claude/projects/` (`--dry-run` to look first) |
 | `jobq <command>` | run a heavy command when a slot is free, instead of being paused |
 | `jobq --status`, `autonice --status` | who holds the slots, what is throttled |
-| `bash _tools/test-fleet.sh` | try the launcher on a throw-away fleet: about 80 checks in three minutes, nothing real is touched |
-| `bash _tools/test-rules.sh` | try the rule check on a made-up TokenOps project and chat files of each tool: 38 checks, a few seconds |
+| `bash _tools/test-fleet.sh` | try the launcher on a throw-away fleet: about 100 checks in three to four minutes, nothing real is touched |
+| `bash _tools/test-idle.sh` | try the idle stop of `autonice` on made-up dev servers: 16 checks in about two minutes, nothing real is stopped |
+| `bash _tools/test-single.sh` | try the duplicate stop of `autonice` on made-up dev servers: 35 checks in about two minutes, nothing real is stopped |
+| `bash _tools/test-copy.sh` | try the clean copy (`bin/afc-copy`) on sample selections and on a tmux of its own: 22 checks in a few seconds, your clipboard is not touched |
+| `bash _tools/test-council.sh` | try the council with stand-in LLMs (no model is asked), its grid on a tmux of its own: 110 checks in about a minute and a half |
+| `bash _tools/test-even.sh` | try splitting, closing, minimising, repairing and the guard (`bin/afc-even`) on a tmux of its own, pressing the real keys: 45 checks in about 25 seconds |
+| `afc-even --fix` | a tab whose splits have run past its right edge (out of sight): share it out again; a tab that fits is left alone |
+| `bash _tools/test-turn.sh` | try the turn stop of `autonice` on made-up dev servers and a made-up fleet (its own tmux): 26 checks in about two minutes, nothing real is stopped |
+| `bash _tools/test-rules.sh` | try the rule check on a made-up TokenOps project and chat files of each tool: 42 checks, a few seconds |
 
 ## How it works
 
@@ -205,9 +218,9 @@ Five pieces stand between the agents and the output, one per arrow that leaves t
 
 1. tmux runs inside `agents.slice`, so every agent and every command a tool call starts shares one budget: 3 CPU cores, slowed at 12 GB of memory, stopped at 14 GB.
 2. Processes that match `~/.config/autonice/rules` get a lower CPU and disk priority and are moved into the capped group. Priority is only ever lowered.
-3. A background job that matches a `gate` rule takes a slot. With no slot free it is paused, and resumed when one frees. `jobq <command>` waits for a slot instead.
+3. A background job that matches a `gate` rule takes a slot. With no slot free it is paused, and resumed when one frees. `jobq <command>` waits for a slot instead. A dev server that does no work at all for 3 hours (`idle dev 3h` in the rules) is stopped, whether an agent or a terminal started it: at rest it uses no CPU, a page load or a rebuild does. `autonice --status` shows each one's clock. One dev server per project folder (`single dev 10s` in the rules): a second one started in a folder that already has one is stopped about 10 seconds after it appears, whatever port it asks for, and the first one stays. It is told why on its own output. (`single dev 10s port` allows a second one on a port of its own.) And a dev server ends with the reply of the agent that started it (`turn dev 20s`): 20 seconds after a Claude agent in a fleet pane finishes its reply, the dev server it started is stopped. It is kept while that agent works or waits for your permission, and while another agent works in the same project folder. A server you start yourself, typed in a pane or a terminal, is never touched by this rule, nor is one started outside the fleet. `autonice --status` shows whose server is whose.
 4. If `autonice` stops, it first resumes everything it paused.
-5. **The wall.** Past 12 GB the group is throttled as a whole, so one more agent there does not get memory of its own — it slows down every agent already running. So once the fleet's real memory reaches 90% of that limit (`mem-wall` in `~/.config/agents/settings`; `0` turns it off), no new agent starts: not a new project tab (`agents --add`, Alt+N), not an agent split (Alt+Enter and the split menu), not one coming back from the saved layout. Each refusal says what is being used and how to make room, and `--add` keeps the project on the list so it opens at the next start. A **terminal** split is never refused — that may be exactly what you need in order to free the memory. The figure weighed is the fleet's *real* memory, the `anon` line of the group's `memory.stat`, which is what the bottom bar shows; not the whole charge, because that counts file cache the kernel hands back the moment anything needs it, and the two are often far apart (7 GB real inside an 11 GB charge is ordinary). `agents --status` and `agents --doctor` both say where the wall stands. Nowhere without an `agents.slice` to read — a Mac, or WSL without systemd — there is no wall, and `--doctor` says so.
+5. **The wall.** Past 12 GB the group is throttled as a whole, so one more agent there does not get memory of its own — it slows down every agent already running. So once the fleet's real memory reaches 90% of that limit (`mem-wall` in `~/.config/agents/settings`; `0` turns it off), no new agent starts: not a new project tab (`agents --add`, Alt+N), not an agent split (Alt+Enter and the split menu), not one coming back from the saved layout. Each refusal says what is being used and how to make room, and `--add` keeps the project on the list so it opens at the next start. A **terminal** split is never refused — that may be exactly what you need in order to free the memory. The figure weighed is the fleet's *real* memory, the `anon` line of the group's `memory.stat`, which is what the bottom bar shows; not the whole charge, because that counts file cache the kernel hands back the moment anything needs it, and the two are often far apart (7 GB real inside an 11 GB charge is ordinary). `agents --status` and `agents --doctor` both say where the wall stands. Where there is no `agents.slice` to read (a Mac, or WSL without systemd) this wall is not there, and `--doctor` says so. The machine wall (RAM and CPU) still holds there.
 
 **Tab signals** (`agents --mark`)
 
@@ -238,7 +251,8 @@ Five pieces stand between the agents and the output, one per arrow that leaves t
 4. A hard rule broken in this turn sends the agent back, once per turn, with what is wrong and the command to run (Claude and Codex: `block`; Gemini: `deny`; Antigravity: `continue`). The agent fixes it or says why the rule does not apply, and the turn ends. Notes never send it back. `rules report` in `~/.config/agents/settings` stops the sending back; `rules off` stops the reminder and the check too.
 5. Under each reply one line sums the turn up for you, for example `Stop says: ACF rules ✓ · 2 files changed · index loaded by CLAUDE.md · fix check done for src/app.js · _ai/UPDATES.md written`; with `△` it ends in the notes, with `✗` it starts with what was sent back or is still open. The model never sees that line, so it costs no tokens; `rules-recap off` in the settings hides it. Antigravity's turn-end hook has no such line. The pane header shows the same verdict after the figures: `✓ rules`, `△ N notes` or `✗ N rules`. Each finding is a line in `<project>/logs/acf/rules.log`; `afc-rules show` lists them.
 6. Not seen: files changed by shell commands (`sed -i`, `cat >`, a script) and by Claude's sub-agents. A hook that fails, or takes over 20 seconds, lets the turn go on. A first check reads the whole chat file (under a second for the largest chat here, 74 MB); after that only what is new.
-7. Setting up: `afc-rules install` adds the hooks to `~/.claude/settings.json`, `~/.codex/config.toml`, `~/.gemini/settings.json` and `~/.gemini/config/hooks.json`; every account shares those files through links. Agents pick the hooks up when they next start. Codex runs a new hook only after you trust it once: `/hooks` in a Codex pane.
+7. Claude's memory: Claude Code keeps notes of its own, by default in `~/.claude/projects/<project>/memory/`, which breaks "keep memory inside this project". `afc-rules memory` moves it into the project: it sets `autoMemoryDirectory` to `<project>/_ai/memory` in `<project>/.claude/settings.local.json` (Claude ignores that key in the committed `settings.json`, and takes only an absolute path), copies the notes Claude already has, and puts a link in place of the old folder, so sessions that were already running write into the project too. The old folder stays beside it as `memory.before-project-<date>`. A new TokenOps project needs `afc-rules memory` once; `afc-rules doctor` lists any that do not have it.
+8. Setting up: `afc-rules install` adds the hooks to `~/.claude/settings.json`, `~/.codex/config.toml`, `~/.gemini/settings.json` and `~/.gemini/config/hooks.json`; every account shares those files through links. Agents pick the hooks up when they next start. Codex runs a new hook only after you trust it once: `/hooks` in a Codex pane.
 
 ### 4 · The output
 
@@ -268,8 +282,11 @@ What a turn leaves behind, and where.
 | `bin/afc-logs` | | the chat log: every thread copied into `<project>/logs/acf/`, searchable, no tokens |
 | `bin/afc-rules` | | the rule check of TokenOps projects: the reminder on each prompt, the check at each turn end, its hooks |
 | `bin/afc-min`, `bin/afc-move` | | minimise / restore, and move / merge splits |
+| `bin/afc-council` | | the council (Alt+K): each member is one read-only, one-shot run of its LLM through `agents --as`, reading the whole thread; order and roast modes, tags, made agents (`~/.config/agents/council.json`), meetings saved in `<project>/logs/council/` (git-ignored). In tmux the tab is a grid: `afc-council --view` panes follow a live feed (`$XDG_RUNTIME_DIR/afc-council/<pid>.jsonl`) and show the chair's messages and that member's answers. Per member `/model` and `/effort` (Gemini: model only), kept in the settings file. Ctrl+C inside it stops a round |
+| `bin/afc-even` | | evens out the row or column of splits that changed after a split, close, minimise or restore, a top/bottom stack counted as one column. Used instead of tmux 3.8's own `select-layout -E`, which leaves a stack out of the count and pushes it past the tab's right edge (a split below, or closing a split, then looked like every split had closed). `--fix` repairs a tab already broken that way A split is also never left out of sight: when one ends up past the tab's edge, or squeezed below 8 columns x 3 lines (the window got too small, or a border was dragged over it), `afc-even --guard` (started by `afc-reflow` after each layout change) shares the tab out again or minimises that split, which keeps running (Alt+U brings it back) |
 | `bin/afc-reflow`, `bin/afc-gap` | | make Claude redraw after a resize, and close the gap its pop-ups leave |
 | `bin/afc-longcopy`, `bin/afc-model-menu` | | long copy, and the Alt+M menu |
+| `bin/afc-copy` | | what a mouse copy puts on the clipboard: the text without the agent's quote bar, marks and margin, with the lines the pane's width broke joined again (it is tmux's `copy-command`). Short lines of code, list items and tables keep their breaks. Shift+drag is still Alacritty's own selection: the screen exactly as shown |
 | `bin/autonice`, `bin/jobq`, `bin/keepawake-agents` | copy: `~/.local/bin/` | the resource guard: renices, caps and queues heavy jobs; keeps the machine awake while agents work |
 | `lib/afc/pb.py` | link: `~/.local/lib/afc/` | reads Antigravity's binary records |
 | `tmux/tmux.conf` | link: `~/.tmux.conf` | all keys, bars, hooks and the scrollbar |
@@ -280,9 +297,9 @@ What a turn leaves behind, and where.
 | `config/autonice/rules` | copy: `~/.config/autonice/` | which programs get throttled or queued |
 | `config/alacritty/` | copy: `~/.config/alacritty/` | the terminal the fleet window runs in |
 | `config/claude/`, `config/gemini/` | | only the fleet's keys from those tools' settings, to merge by hand |
-| `share/` | link: `~/.local/share/` | the desktop launcher, the window-raise script, the no-browser stand-ins |
+| `share/` | link: `~/.local/share/`; the desktop launcher `applications/agents.desktop` is a copy (KDE refuses to start a launcher that is a link to a file outside its own folders) | the desktop launcher, the window-raise script, the no-browser stand-ins |
 | `lib/afc/` | link: `~/.local/lib/afc/` | shared pieces: `mac.sh` and `macproc.py`, what the programs read instead of `/proc` on a Mac |
-| `_tools/` | | `collect.sh`, `install.sh`, `build-tmux.sh`, `test-fleet.sh`, `test-rules.sh`, `test-wsl.sh`, `server-setup.sh`, `mac-setup.sh`, `windows-setup.sh` |
+| `_tools/` | | `collect.sh`, `install.sh`, `build-tmux.sh`, `test-fleet.sh`, `test-rules.sh`, `test-idle.sh`, `test-single.sh`, `test-turn.sh`, `test-copy.sh`, `test-even.sh`, `test-council.sh`, `test-wsl.sh`, `server-setup.sh`, `mac-setup.sh`, `windows-setup.sh` |
 | `logs/acf/` | | this folder's own chat log, written by `afc-logs` when an agent works here (raw transcripts: they name the real account) |
 
 Not here, on purpose: sign-ins, other projects' chats and logs, and the built tmux program (it is rebuilt from `tmux/` and stays on the home disk, so tmux itself starts even without this drive).
@@ -327,6 +344,12 @@ All three leave sign-ins and the agents themselves alone, and skip every step al
 **Windows** needs the least code and the most explaining. tmux is not a Windows program and the fleet is a tmux program, so there is nothing to port: it runs in WSL2, which is real Linux on the same PC, with the budget, the units and `/proc` all as they are here. Only the four things that reach *outside* Linux change, and each goes to Windows itself: the clipboard (`Get-Clipboard`, or `xclip` when WSLg is there, which is quicker), notifications (a Windows toast), Alt+N (Windows' folder dialog) and the Agents window (Windows Terminal, where `windows-setup.sh` adds a "Fleet" profile). Those calls hand PowerShell the command base64-encoded as UTF-16LE, so a project path with a quote or a space in it never meets Windows' quoting rules. Two things to know: WSL only runs systemd when `/etc/wsl.conf` says `[boot] systemd=true`, and turning that on needs `wsl --shutdown` from a Windows window — the setup script writes the line and then stops to tell you. And keep projects in the Linux home folder: one under `/mnt/c` makes every file an agent reads cross between Windows and Linux, which is several times slower. `agents --doctor` has a Windows section that checks all of this.
 
 A Mac differs enough to need three pieces of its own. Its bash is 3.2 and the programs want 4, so `lib/afc/mac.sh` starts them again under Homebrew's bash and makes the GNU tools answer to their plain names *inside* the programs — the agents in the panes keep the Mac's own tools. There is no `/proc`, so `bin/afc-procfs` writes the handful of files the programs read there (`comm`, `cmdline`, `cwd`, open files, and only the few environment variables the fleet asks for — never the whole environment, which may hold keys) into a snapshot folder under `$TMPDIR`, from `libproc` and `sysctl` through `lib/afc/macproc.py`. And two agents are called something else there: Claude's program is `claude.exe`, Antigravity's is `antigravity`. In Terminal, turn on Settings → Profiles → Keyboard → "Use Option as Meta key", or none of the Alt keys reach tmux.
+
+**What came after the port** runs on both unchanged, with a few platform-specific details. That covers the council (Alt+K), the clean copy (`afc-copy`), the even-out of splits and its guard (`afc-even`), and the closing pop-up's "minimise it instead". They are Python and tmux, written for Python 3.9 (a Mac's own). The details:
+- The clean copy hands its text to `pbcopy` on a Mac, in UTF-8 even when tmux was started without a locale. In WSL it goes to Windows' `clip.exe` (before WSLg's `xclip`, so it works without WSLg too). Plain ASCII goes as it is; anything else goes as UTF-16 behind a byte-order mark, because `clip.exe` reads plain bytes in the console's code page and would turn `—` or `✓` into mojibake. `tmux.conf` therefore no longer sets a copy command of its own per platform: one did, and it skipped the cleaning.
+- The council finds the pane's folder with `lsof` on a Mac (no `/proc`).
+- The memory wall needs an `agents.slice` to weigh, so a Mac has none. The machine wall does hold there: RAM and CPU are read the way the bottom bar reads them (`vm_stat`, `ps`), and `--status` and `--doctor` show it. In WSL the machine wall weighs WSL's own share of the PC, which is what the agents can actually use.
+- If systemd refuses `OOMPolicy` on a scope, the fleet starts capped without that one setting, not uncapped. Older ones may refuse it, and Ubuntu 22.04's 249 is still common under WSL. `server-setup.sh` also gives a sized `agents.slice` the same `TasksMax=2500` as the desktop's.
 
 ## Things that will bite
 

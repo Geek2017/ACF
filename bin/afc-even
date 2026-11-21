@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""afc-even: even out one row or column of splits in a fleet tab, a stacked column counted as one.
+
+The fleet used tmux's own `select-layout -E` for this after a split, a close or a minimise. In
+tmux 3.8 that command shares a row out among its single panes only: a column holding a top/bottom
+stack is left out of the count, so the row's whole width went to the other panes and the stack was
+pushed past the tab's right edge, out of sight. Splitting a pane below (Alt+-), or closing or
+minimising one, in a tab with two or more columns made both halves of a stack vanish as if they had
+been closed. This does the same job, counts every member of the row or column, and sets the new
+sizes in one step (select-layout with the whole layout), so the sizes always add up to the tab.
+
+  afc-even <pane>               even out the row or column that pane is in
+  afc-even --window <window>    the same for that window's active pane (the one just split or joined)
+  afc-even <pane> <depth>       the row or column <depth> levels down from the tab (0 = the whole tab)
+                                on the way to that pane
+  afc-even --gone <pane>        before that pane leaves its tab (closed or minimised): prints what to
+                                pass to afc-even after it has gone ("<pane> <depth>"), or nothing
+                                when its row or column is left with one member, which fills it anyway
+  afc-even --fix [<window>...]  a tab whose splits run past its edge (what the old way left behind):
+                                share the whole tab out again. Every tab when none is named; a tab
+                                that fits, or one with a split zoomed, is left alone.
+  afc-even --guard <window>     never leave a split out of sight. One past the tab's edge (a layout
+                                gone wrong): share the tab out again. One squeezed below 8 columns x 3
+                                lines (a tab too small for them all, or a border dragged over it):
+                                minimise it (afc-min: it keeps running, Alt+U brings it back); the
+                                sizes of the others stay. When sharing out would leave a split that
+                                small, minimise the one furthest out and look again. Says what it did.
+                                Run by afc-reflow after every layout change and resize.
+
+Only that row or column changes size: each member gets the same width (or the same height on
+screen), the first ones a cell more when it does not divide evenly; whatever is inside a member is
+fitted to its new size in the proportions it had. A minimised or floating pane is not in the tab's
+layout and is not counted. Talks to the tmux server it runs in (TMUX), else to the fleet's
+(-L agents, or AGENTS_SOCK for a test server). Exits 0 when there is nothing to do or the layout
+cannot be read: a layout left as it was is never worse than an error in a key binding.
+"""
+import json
+import os
+import subprocess
+import sys
+
+
+def tmux_cmd():
+    mine = os.path.expanduser("~/.local/bin/tmux")   # the fleet's own build: another version cannot talk to its server
+    cmd = [mine if os.access(mine, os.X_OK) else "tmux"]
+    sock = os.environ.get("AGENTS_SOCK")
+    if sock:
+        cmd += ["-L", sock]
+    elif not os.environ.get("TMUX"):
+        cmd += ["-L", "agents"]
+    return cmd
+
+
+TMUX = tmux_cmd()
+
+
+def t(*args):
+    r = subprocess.run(TMUX + list(args), capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def info(target, fmt):
+    return t("display-message", "-p", "-t", target, fmt)
+
+
+# ---- the layout tree ---------------------------------------------------------------------------
+# tmux 3.8 prints a tab's layout as JSON: {"V":2,"L":cell}, a cell being {"t": "h" (a row: side by
+# side) | "v" (a column: one above the other) | "p" (a pane), "w","h","x","y", "c":[cells] for a row
+# or column, "i" the pane's index, "I" its id, "z" for a floating pane}. Sizes include the pane's
+# header line and scrollbar; one cell of border lies between members.
+
+def read(win):
+    raw = info(win, "#{window_layout}")
+    if not raw or not raw.startswith("{"):
+        return None                  # an older tmux (classic layout string): see main()
+    return json.loads(raw)
+
+
+def members(cell):
+    """The cells sharing out a row or column; a floating pane sits outside it."""
+    return [c for c in cell.get("c", []) if "z" not in c]
+
+
+def path_to(cell, pane):
+    """The cells from the tab down to the pane's own cell, or None."""
+    if cell.get("t") == "p":
+        return [cell] if cell.get("I") == pane else None
+    for c in members(cell):
+        p = path_to(c, pane)
+        if p:
+            return [cell] + p
+    return None
+
+
+def first_pane(cell):
+    if cell.get("t") == "p":
+        return cell.get("I")
+    for c in members(cell):
+        p = first_pane(c)
+        if p:
+            return p
+    return None
+
+
+def even_shares(total, n):
+    each, extra = divmod(total, n)
+    return [each + (1 if i < extra else 0) for i in range(n)]
+
+
+def kept_shares(old, total):
+    """total shared out in the proportions of old (largest remainders get the odd cells)."""
+    s = sum(old)
+    if s == total:
+        return list(old)
+    if s <= 0:
+        return even_shares(total, len(old))
+    raw = [o * total / s for o in old]
+    out = [int(r) for r in raw]
+    for i in sorted(range(len(old)), key=lambda i: raw[i] - out[i], reverse=True)[: total - sum(out)]:
+        out[i] += 1
+    return out
+
+
+class Tab:
+    def __init__(self, win):
+        self.win = win
+        self.doc = read(win)
+        size = info(win, "#{window_width} #{window_height} #{pane-border-status} #{window_zoomed_flag}")
+        w, h, self.status, self.zoomed = (size or "0 0 off 0").split()
+        self.w, self.h = int(w), int(h)
+
+    def place(self, cell, x, y, w, h, even):
+        """Put the cell at x,y with size w x h, and its members inside it; the cells in `even` (by
+        id()) share out evenly, the rest keep their proportions."""
+        cell["x"], cell["y"], cell["w"], cell["h"] = x, y, w, h
+        kids = members(cell)
+        if cell.get("t") not in ("h", "v") or not kids:
+            return
+        n = len(kids)
+        if cell["t"] == "h":
+            total = w - (n - 1)
+            sizes = even_shares(total, n) if id(cell) in even else kept_shares([k["w"] for k in kids], total)
+            for k, s in zip(kids, sizes):
+                self.place(k, x, y, s, h, even)
+                x += s + 1
+        else:
+            total = h - (n - 1)
+            if id(cell) in even:
+                # The same height on screen: with headers on top, the member at the tab's top edge
+                # also holds its own header line (the others use the border above them); at the
+                # bottom, the one at the bottom edge.
+                top = 1 if self.status == "top" and y == 0 else 0
+                bottom = 1 if self.status == "bottom" and y + h >= self.h else 0
+                sizes = even_shares(total - top - bottom, n)
+                sizes[0] += top
+                sizes[-1] += bottom
+            else:
+                sizes = kept_shares([k["h"] for k in kids], total)
+            for k, s in zip(kids, sizes):
+                self.place(k, x, y, w, s, even)
+                y += s + 1
+
+    def apply(self, even, whole=False, least=(1, 1)):
+        root = self.doc["L"]
+        before = json.dumps(self.doc, separators=(",", ":"))
+        if whole:          # the tab itself to its real size (a broken layout no longer adds up to it)
+            self.place(root, 0, 0, self.w, self.h, even)
+        else:
+            self.place(root, root["x"], root["y"], root["w"], root["h"], even)
+        if not ok(root, least):
+            return False
+        after = json.dumps(self.doc, separators=(",", ":"))
+        if after == before:
+            return False
+        return t("select-layout", "-t", self.win, after) is not None
+
+
+def ok(cell, least=(1, 1)):
+    if cell.get("t") == "p" and (cell.get("w", 0) < least[0] or cell.get("h", 0) < least[1]):
+        return False
+    if cell.get("w", 0) < 1 or cell.get("h", 0) < 1:
+        return False
+    return all(ok(c, least) for c in members(cell))
+
+
+def fits(cell, w, h):
+    if cell["x"] < 0 or cell["y"] < 0 or cell["x"] + cell["w"] > w or cell["y"] + cell["h"] > h:
+        return False
+    kids = members(cell)
+    if kids:
+        n = len(kids)
+        if cell["t"] == "h" and sum(k["w"] for k in kids) + n - 1 != cell["w"]:
+            return False
+        if cell["t"] == "v" and sum(k["h"] for k in kids) + n - 1 != cell["h"]:
+            return False
+    return all(fits(c, w, h) for c in kids)
+
+
+def containers(cell):
+    if members(cell):
+        yield cell
+        for c in members(cell):
+            yield from containers(c)
+
+
+def shown(tab):
+    root = tab.doc["L"]
+    return fits(root, tab.w, tab.h) and root["w"] == tab.w and root["h"] == tab.h
+
+
+def fix(win):
+    tab = Tab(win)
+    if not tab.doc or tab.zoomed == "1" or shown(tab):
+        return False
+    return tab.apply({id(c) for c in containers(tab.doc["L"])}, whole=True)
+
+
+# ---- the guard: a split is minimised rather than left out of sight ---------------------------------
+# A split is out of sight when tmux puts it past the tab's edge, or squeezes it below SMALL (what it
+# shows: columns x lines). bin/afc-reflow checks the same two things with these numbers before it
+# starts this; change both together.
+SMALL = (8, 3)
+LEAST = (SMALL[0] + 2, SMALL[1] + 1)   # the same in layout cells (scrollbar and header included)
+STASH = "afcmin"                        # afc-min's holding session for minimised splits
+
+
+def panes_of(win):
+    """The tab's splits as tmux shows them: id, left, width, top, height, active."""
+    out = []
+    for line in (t("list-panes", "-t", win, "-F",
+                   "#{pane_id} #{pane_left} #{pane_width} #{pane_top} #{pane_height} #{pane_active}") or "").splitlines():
+        f = line.split()
+        if len(f) == 6:
+            out.append({"id": f[0], "x": int(f[1]), "w": int(f[2]), "y": int(f[3]), "h": int(f[4]), "a": f[5] == "1"})
+    return out
+
+
+def trouble(tab, panes):
+    """(past the edge, too small): the splits that cannot be seen or used."""
+    past = [p for p in panes if p["x"] + p["w"] > tab.w or p["y"] + p["h"] > tab.h]
+    small = [p for p in panes if p not in past and (p["w"] < SMALL[0] or p["h"] < SMALL[1])]
+    return past, small
+
+
+def pick(cands):
+    """The split to minimise: not the one you are in unless it is the only choice; then the one
+    furthest right, then furthest down."""
+    return sorted(cands, key=lambda p: (p["a"], -(p["x"] + p["w"]), -(p["y"] + p["h"])))[0]["id"]
+
+
+def minimise(pane, sock, keep):
+    env = dict(os.environ)
+    env["TMUX"] = f"{sock},0,0"              # afc-min's plain `tmux` reaches this server, whoever called us
+    win = info(pane, "#{window_id}")
+    try:
+        subprocess.run([os.path.expanduser("~/.local/bin/afc-min"), "hide", pane] + (["keep"] if keep else []), env=env,
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return info(pane, "#{window_id}") != win
+
+
+def guard(win):
+    """Never leave a split out of sight. Past the edge (a layout gone wrong): share the tab out again,
+    which keeps every split where it was. Squeezed too small (a tab too small for them all, or a
+    border dragged over it): minimise it, the sizes you chose for the others stay. Either way, when
+    sharing out would still leave a split too small, minimise the one furthest out and look again."""
+    import fcntl
+    sock = info(win, "#{socket_path}") or ""
+    if not sock or info(win, "#{session_name}") == STASH:
+        return 0
+    lock = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+                        "afc-even-guard" + (sock + win).replace("/", "_").replace("@", "_") + ".lock")
+    try:
+        held = open(lock, "w")
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0                            # a guard is at work on this tab already
+    shared = hidden = 0
+    share = True
+    for _ in range(16):
+        tab = Tab(win)
+        if not tab.doc or tab.zoomed == "1":
+            break
+        panes = panes_of(win)
+        past, small = trouble(tab, panes)
+        broken = not shown(tab)             # the cells no longer add up to the tab
+        if not past and not small and not broken:
+            break
+        if len(panes) < 2:
+            break                           # a tab's only split stays: minimising it would close the tab
+        if (past or broken) and share:
+            share = False
+            if tab.apply({id(c) for c in containers(tab.doc["L"])}, whole=True, least=LEAST):
+                shared += 1
+                continue
+        # One split squeezed while the rest are fine (a border dragged over it): its neighbour takes
+        # the room and the sizes you chose stay. More than one (the tab got too small): the row or
+        # column it leaves is evened, so the rest share what there is.
+        cands = past + small or panes
+        if not minimise(pick(cands), sock, keep=len(past) + len(small) == 1):
+            break
+        hidden += 1
+        share = True
+    if hidden:
+        t("display-message", "-d", "7000",
+          f"No room in this tab: {hidden} split{'s' if hidden > 1 else ''} minimised instead of squeezed out "
+          f"of sight (still running). Alt+U or ▣ in the bottom bar brings one back.")
+    elif shared:
+        t("display-message", "-d", "5000", "A split had run past the edge of this tab: the tab is shared out again.")
+    if hidden or shared:
+        print(f"{win}: " + ", ".join(x for x in ("shared out again" if shared else "",
+                                                 f"{hidden} minimised" if hidden else "") if x))
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "--fix":
+        for w in argv[1:] or (t("list-windows", "-a", "-F", "#{window_id}") or "").split():
+            if fix(w):
+                print(f"{w} ({info(w, '#{window_name}')}): shared out again")
+        return 0
+    if argv[0] == "--guard":
+        return guard(argv[1]) if len(argv) > 1 else 2
+    if argv[0] == "--window":
+        pane = info(argv[1], "#{pane_id}") if len(argv) > 1 else None
+        if not pane:
+            return 0
+        argv = [pane]
+    gone = argv[0] == "--gone"
+    if gone:
+        argv = argv[1:2]
+    if not argv:
+        return 2
+    pane = argv[0]
+    win = info(pane, "#{window_id}")
+    if not win:
+        return 0
+    tab = Tab(win)
+    if tab.doc is None:
+        # An older tmux: its own select-layout -E has no such fault (it counts stacks)
+        if not gone:
+            t("select-layout", "-E", "-t", pane)
+        return 0
+    path = path_to(tab.doc["L"], pane)
+    if not path or len(path) < 2:
+        return 0
+    if gone:
+        others = [m for m in members(path[-2]) if m is not path[-1]]
+        if len(others) >= 2:
+            print(first_pane(others[0]), len(path) - 2)
+        return 0
+    depth = int(argv[1]) if len(argv) > 1 else len(path) - 2
+    if not 0 <= depth < len(path) - 1:
+        return 0
+    tab.apply({id(path[depth])})
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        sys.stderr.write(f"afc-even: could not read the layout ({e})\n")
+        sys.exit(0)

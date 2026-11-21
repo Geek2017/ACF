@@ -120,6 +120,42 @@ sleep 2; kill %1 2>/dev/null
 has "$W/wt.log" "wsl.exe -d Ubuntu" "it opens Windows Terminal on this distro"
 has "$W/wt.log" "-w new" "in a window of its own"
 
+echo "The copy (afc-copy to Windows' clipboard)"
+cp_run() { env -i HOME="$H" PATH="$W:$UB" WSL_DISTRO_NAME=Ubuntu DISPLAY=:0 LANG=C.UTF-8 \
+             python3 "$REPO/bin/afc-copy" --width 0 "$@"; }
+cc=$(env -i HOME="$H" PATH="$UB" WSL_DISTRO_NAME=Ubuntu TERM=xterm "$TMUX" -L wslconf -f "$REPO/tmux/tmux.conf" \
+       new-session -d -s c 'sleep 30' \; show -sv copy-command 2>/dev/null)
+"$TMUX" -L wslconf kill-server 2>/dev/null
+if [[ "$cc" == *afc-copy* ]]; then ok "under WSL the tmux config still copies through afc-copy (no clip.exe of its own)"
+else no "under WSL the tmux config still copies through afc-copy (no clip.exe of its own)" "copy-command is: $cc"; fi
+mk xclip <<EOF
+#!/usr/bin/env bash
+cat > "$W/xclip-got"
+EOF
+rm -f "$W/clip-got" "$W/xclip-got"
+printf '  ● plain words\n' | cp_run
+if [[ "$(cat "$W/clip-got" 2>/dev/null)" == "plain words" ]]; then ok "a copy goes to clip.exe, cleaned, even with WSLg's xclip there"
+else no "a copy goes to clip.exe, cleaned, even with WSLg's xclip there" "clip.exe got: $(cat "$W/clip-got" 2>/dev/null)"; fi
+[[ -e "$W/xclip-got" ]] && no "and not to xclip" || ok "and not to xclip"
+rm -f "$W/xclip"
+printf 'plain words' | cp_run
+if python3 -c 'import sys; sys.exit(0 if open(sys.argv[1], "rb").read() == b"plain words" else 1)' "$W/clip-got"
+then ok "plain ASCII reaches clip.exe as it is"; else no "plain ASCII reaches clip.exe as it is" "$(od -c "$W/clip-got" | head -2)"; fi
+printf 'em dash — tick ✓ café' | cp_run
+if python3 -c 'import sys; d = open(sys.argv[1], "rb").read(); sys.exit(0 if d[:2] == b"\xff\xfe" and d[2:].decode("utf-16-le") == "em dash — tick ✓ café" else 1)' "$W/clip-got"
+then ok "anything else goes as UTF-16 behind a byte-order mark, so Windows does not turn it into mojibake"
+else no "anything else goes as UTF-16 behind a byte-order mark, so Windows does not turn it into mojibake" "$(od -c "$W/clip-got" | head -2)"; fi
+
+echo "The machine wall (WSL with no agents.slice to read)"
+printf '%s 10 95\n' "$(date +%s)" > "$SBX/load-full"; printf '%s 10 40\n' "$(date +%s)" > "$SBX/load-calm"
+room() { env -i HOME="$H" PATH="$W:$UB" WSL_DISTRO_NAME=Ubuntu TERM=xterm LANG=C.UTF-8 AGENTS_SOCK=wsltest \
+           AGENTS_STAT="$SBX/no-slice/memory.stat" AGENTS_LOAD="$1" bash "$A" --room 2>&1; }
+out=$(room "$SBX/load-full"); rc=$?
+if (( rc == 1 )) && [[ "$out" == *"RAM is 95% full"* ]]; then ok "with RAM 95% full a new agent is refused, though there is no slice to weigh"
+else no "with RAM 95% full a new agent is refused, though there is no slice to weigh" "exit $rc: $out"; fi
+out=$(room "$SBX/load-calm"); rc=$?
+(( rc == 0 )) && ok "and let through at 40%" || no "and let through at 40%" "exit $rc: $out"
+
 echo "When Windows is out of reach"
 out=$(env -i HOME="$H" PATH="$UB" WSL_DISTRO_NAME=Ubuntu TERM=xterm LANG=C.UTF-8 bash "$A" --doctor 2>&1)
 has <(printf '%s' "$out") "Windows interop looks turned off" "with no powershell.exe it says interop is off"

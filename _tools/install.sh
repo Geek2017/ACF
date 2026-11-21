@@ -81,13 +81,17 @@ GUARD=" autonice jobq keepawake-agents "
 for f in "$HERE"/bin/*; do
   [[ -f "$f" ]] || continue            # not a program: a __pycache__ left by python3, say
   b=$(basename "$f")
+  [[ "$b" == *.bak-* ]] && continue    # a copy kept by hand before an edit, not a program
   if [[ "$GUARD" == *" $b "* ]]; then (( MAC )) || copy "bin/$b" "$HOME/.local/bin/$b" 755; else link "bin/$b" "$HOME/.local/bin/$b" 755; fi
 done
 for f in "$HERE"/lib/afc/*; do [[ -f "$f" ]] && link "lib/afc/$(basename "$f")" "$HOME/.local/lib/afc/$(basename "$f")"; done
 link tmux/tmux.conf "$HOME/.tmux.conf"
 if (( DESKTOP )); then
   link share/agents/kwin-focus.js "$HOME/.local/share/agents/kwin-focus.js"
-  link share/applications/agents.desktop "$HOME/.local/share/applications/agents.desktop"
+  # A real file, never a link: KDE will not start a launcher whose real path is outside its own
+  # folders ("Access denied, not owned by root and executable flag not set"), so a link into this
+  # folder leaves the Agents menu entry and its shortcut dead.
+  copy share/applications/agents.desktop "$HOME/.local/share/applications/agents.desktop" 755
 fi
 for f in "$HERE"/share/llm-usage/nobrowser/*; do link "share/llm-usage/nobrowser/$(basename "$f")" "$HOME/.local/share/llm-usage/nobrowser/$(basename "$f")" 755; done
 

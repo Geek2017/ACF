@@ -39,6 +39,7 @@ Other commands:
   afc-rules replay [--days N] [-v]                 every recent chat in a TokenOps project
   afc-rules show [--all] [-n N]                    the latest lines of rules.log
   afc-rules install [--dry-run] [--remove]         add (or take out) the hooks in each tool's settings
+  afc-rules memory [--dry-run] [FOLDER...]         Claude's auto-memory into each project's _ai/memory
   afc-rules doctor                                 what is in place
 """
 import datetime, fnmatch, glob, importlib.machinery, importlib.util, json, os, re, shutil, signal, subprocess, sys, time
@@ -815,6 +816,97 @@ def projects():
     return out
 
 
+def known_roots():
+    """TokenOps projects this machine knows of: the fleet's projects and those with a chat log."""
+    roots = set(projects())
+    try:
+        with open(os.environ.get("AFC_LOGS_LIST") or f"{CFG}/log-projects", encoding="utf-8") as f:
+            for line in f:
+                d = line.strip()
+                if d and os.path.isfile(os.path.join(d, "_ai", "TOKENOPS.json")):
+                    roots.add(os.path.realpath(d))
+    except OSError:
+        pass
+    return sorted(roots)
+
+
+def claude_memory_dir(root):
+    """Where Claude Code keeps a project's auto-memory unless told otherwise. Every account's
+    projects folder is a link to ~/.claude/projects, so there is one per project."""
+    return f"{HOME}/.claude/projects/{re.sub(r'[^A-Za-z0-9]', '-', root)}/memory"
+
+
+def memory_state(root):
+    """(set in settings.local.json?, old folder: 'link' | 'folder' | 'none')"""
+    want = os.path.join(root, "_ai", "memory")
+    try:
+        with open(os.path.join(root, ".claude", "settings.local.json"), encoding="utf-8") as f:
+            ok = json.load(f).get("autoMemoryDirectory") == want
+    except (OSError, ValueError, AttributeError):
+        ok = False
+    old = claude_memory_dir(root)
+    if os.path.islink(old):
+        kind = "link" if os.path.realpath(old) == os.path.realpath(want) else "other link"
+    else:
+        kind = "folder" if os.path.isdir(old) else "none"
+    return ok, kind
+
+
+def cmd_memory(args):
+    """Claude's auto-memory into the project: <project>/_ai/memory. It sets autoMemoryDirectory in
+    <project>/.claude/settings.local.json (Claude ignores it in the committed settings.json, and
+    takes only an absolute path), copies what Claude already remembers there, and puts a link in
+    place of the old folder, so Claude sessions already running write into the project too. The
+    old folder is kept beside the link as memory.before-project-<date>."""
+    dry = "--dry-run" in args
+    folders = [a for a in args if not a.startswith("-")]
+    roots = sorted({find_root(f) for f in folders} - {None}) if folders else known_roots()
+    if not roots:
+        print("no TokenOps project found (afc-rules memory [FOLDER...])")
+        return 1
+    stamp = datetime.date.today().isoformat()
+    for root in roots:
+        want = os.path.join(root, "_ai", "memory")
+        old = claude_memory_dir(root)
+        done = []
+        ok, kind = memory_state(root)
+        if not ok:
+            done.append("set autoMemoryDirectory in .claude/settings.local.json")
+            if not dry:
+                os.makedirs(want, exist_ok=True)
+                p = os.path.join(root, ".claude", "settings.local.json")
+                d = json_file(p) if os.path.exists(p) else {}
+                d["autoMemoryDirectory"] = want
+                write_json(p, d, False)
+        if kind == "folder":
+            names = os.listdir(old)
+            done.append(f"copy {len(names)} memory file(s) in, the old folder becomes a link")
+            if not dry:
+                os.makedirs(want, exist_ok=True)
+                for n in names:
+                    src, dst = os.path.join(old, n), os.path.join(want, n)
+                    if os.path.exists(dst):
+                        if os.path.isfile(src) and open(src, "rb").read() != open(dst, "rb").read():
+                            shutil.copy2(src, os.path.join(want, f"{n}.from-claude-{stamp}"))
+                        continue
+                    (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, dst)
+                os.rename(old, f"{old}.before-project-{stamp}")
+                os.symlink(want, old)
+        elif kind == "none" and os.path.isdir(os.path.dirname(old)):
+            done.append("link the old folder to it")
+            if not dry:
+                os.makedirs(want, exist_ok=True)
+                os.symlink(want, old)
+        elif kind == "other link":
+            done.append(f"left alone: the old folder is a link to {os.path.realpath(old)}")
+        name = os.path.basename(root)
+        print(f"{name}: " + ("; ".join(("would " if dry else "") + x for x in done) if done else "already in the project (_ai/memory)"))
+    if not dry:
+        print("New Claude sessions read and write _ai/memory; running ones write there through the link."
+              " A folder Claude has not trusted with this yet asks once.")
+    return 0
+
+
 def cmd_show(args):
     n = int(args[args.index("-n") + 1]) if "-n" in args else 20
     roots = projects() if "--all" in args else [find_root(os.getcwd())]
@@ -1030,6 +1122,13 @@ def cmd_doctor(_args):
               f"entry files {', '.join(n for n in ('CLAUDE.md', 'AGENTS.md', 'GEMINI.md') if P.has(n)) or 'none'}")
     if not roots:
         print("  note  none: the check has nothing to do")
+    print("Claude's memory (in the project: <project>/_ai/memory)")
+    for r in known_roots():
+        ok, kind = memory_state(r)
+        if ok and kind in ("link", "none"):
+            print(f"  ok    {os.path.basename(r)}")
+        else:
+            print(f"  note  {os.path.basename(r)}: still in ~/.claude/projects (afc-rules memory moves it)")
     return 1 if bad else 0
 
 
@@ -1058,7 +1157,8 @@ def main(argv):
             except Exception:
                 pass
         return 0
-    commands = {"check": cmd_check, "replay": cmd_replay, "show": cmd_show, "install": cmd_install, "doctor": cmd_doctor}
+    commands = {"check": cmd_check, "replay": cmd_replay, "show": cmd_show, "install": cmd_install, "doctor": cmd_doctor,
+                "memory": cmd_memory}
     if argv[0] not in commands:
         print(f"afc-rules: unknown command {argv[0]} (afc-rules --help)", file=sys.stderr)
         return 2

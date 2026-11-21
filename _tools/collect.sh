@@ -28,7 +28,7 @@ put() {  # <source file> <path inside the project>
 }
 
 B="$HOME/.local/bin"
-for f in agents afc-agent-info afc-bar afc-gap afc-logs afc-longcopy afc-min afc-model-menu afc-move \
+for f in agents afc-agent-info afc-bar afc-copy afc-council afc-even afc-gap afc-logs afc-longcopy afc-min afc-model-menu afc-move \
          afc-reflow afc-statusline llm-usage claude-usage autonice jobq keepawake-agents; do
   put "$B/$f" "bin/$f"
 done

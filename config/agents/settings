@@ -12,3 +12,6 @@
 #rules-recap on       # one line under each reply: the rule check's verdict and what the turn did (you see it, the model does not)
 #mem-wall 90          # no new agent or project tab once the fleet's real memory reaches this share of
                       # its agents.slice limit (one more would only slow the running ones); 0 = no wall
+#ram-wall 90          # ... nor once the whole machine's RAM is this full (R: in the bottom bar); 0 = no wall
+#cpu-wall 90          # no agent added by hand (split, agents --add) once the machine's CPU is this busy
+                      # (C: in the bottom bar); agents coming back after a restart are let through; 0 = no wall

@@ -13,6 +13,8 @@
 #                                   ~/.tmux.conf; inside tmux)
 #        afc-reflow --note-all     record every pane's present width without redrawing anything
 #
+# It also keeps every split in sight: see the end (afc-even --guard).
+#
 # It waits half a second and acts only on a width that held still for that long, so dragging a
 # border redraws once at the end, not at every step. The last width it dealt with is kept in the
 # pane option @rw. Only Claude panes are touched; a pane in copy mode is taken out of it first,
@@ -26,6 +28,17 @@ if [[ "${1:-}" == --note-all ]]; then
 fi
 
 win=${1:?usage: afc-reflow <window id> | --note-all}
+
+# At most two runs per tab: one at work and one waiting for it. Every layout change and resize
+# starts a run, and a slow tmux server used to let them stack up without limit (2026-11-21, see
+# afc-gap). The waiting one starts after the one at work ends, so it sees the final layout; any
+# further run that arrives while one is already waiting has nothing to add and leaves.
+if command -v flock >/dev/null 2>&1; then
+  L="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-panes"; mkdir -p "$L" 2>/dev/null; L="$L/rf${win#@}"
+  if { exec 7> "$L.next"; } 2>/dev/null; then flock -n 7 || exit 0; fi   # the waiting seat
+  if { exec 9> "$L.run"; } 2>/dev/null; then flock 9; fi                 # wait for the one at work
+  exec 7>&-                                                              # at work now: free the seat
+fi
 before=$(t list-panes -t "$win" -F '#{pane_id}=#{pane_width}' 2>/dev/null) || exit 0
 sleep 0.5
 t list-panes -t "$win" -F "$FMT" 2>/dev/null | while read -r id pid w alt mode rw; do
@@ -39,4 +52,15 @@ t list-panes -t "$win" -F "$FMT" 2>/dev/null | while read -r id pid w alt mode r
   [[ "$mode" == 1 ]] && t send-keys -t "$id" -X cancel
   t send-keys -t "$id" C-l
 done
+# A split must never be left out of sight. When one is past the tab's edge (a layout gone wrong) or
+# squeezed below 8 columns x 3 lines (a tab too small for all its splits, or a border dragged over
+# it), afc-even --guard shares the tab out again or minimises that split (Alt+U brings it back).
+# Checked here because this already runs after every layout change and resize; the check is one
+# tmux call and awk, so a border drag stays cheap. The numbers are SMALL in bin/afc-even.
+read -r ww wh zoomed sess < <(t display-message -p -t "$win" '#{window_width} #{window_height} #{window_zoomed_flag} #{session_name}' 2>/dev/null) || exit 0
+if [[ "$zoomed" == 0 && "$sess" != afcmin ]] &&
+   t list-panes -t "$win" -F '#{pane_left} #{pane_width} #{pane_top} #{pane_height}' 2>/dev/null |
+     awk -v W="$ww" -v H="$wh" '$1 + $2 > W || $3 + $4 > H || $2 < 8 || $4 < 3 { out = 1 } END { exit !out }'; then
+  "$HOME/.local/bin/afc-even" --guard "$win" >/dev/null 2>&1
+fi
 exit 0

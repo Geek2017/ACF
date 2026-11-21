@@ -14,6 +14,10 @@
 client=${1:?usage: afc-model-menu <client> <pane id> <pane pid>}
 pane=${2:?}
 pid=${3:?}
+# A council member's pane (afc-council's grid, Alt+K) has its own menu: that member's model and effort
+if [[ -n "$(tmux show-options -pqv -t "$pane" @council_member 2>/dev/null)" ]]; then
+  exec "$HOME/.local/bin/afc-council" --menu "$client" "$pane"
+fi
 who=$("$HOME/.local/bin/agents" --who "$pid" 2>/dev/null | head -1)
 
 # Type the command, pause, then press Enter. Without the pause Gemini takes the Enter as part of
