@@ -30,7 +30,7 @@ Moved here: 2026-11-16, on the Kubuntu 24.04 workstation.
 ```
 ── [C / acct] [C5.5-Opu X] [T:265k 26% $22.24] [S0% W4%] ───────────── [↔ – □ ✕]     pane header
    ... the agent ...                                                          ▎          scrollbar
- ACF | 1 ProjectA | 2 ProjectB            [C:27%|R:47%|F:5 1.5G/12G]  ▣ 1  ◀  ▶        bottom bar
+ ACF | 1 ProjectA | 2 ProjectB   ◀  ▶  [C:27%|R:47%|D:3%|F:5 C:6% 1.5G/10G]  ▣ 1     bottom bar
 ```
 
 **Pane header**, one per split:
@@ -43,7 +43,17 @@ Moved here: 2026-11-16, on the Kubuntu 24.04 workstation.
 | `[S0% W4%]` | plan limits used: 5-hour session, week (plus a per-model cap when that model is in use) |
 | `[↔ – □ ✕]` | move, minimise, maximise, close: for that split |
 
-**Bottom bar**: tabs, then machine CPU and RAM and the fleet's agent count and memory against its cap, `▣ N` when N splits are minimised, and previous / next tab.
+**Bottom bar**: tabs, previous / next tab, then the figures, and `▣ N` when N splits are minimised.
+
+| Figure | Meaning |
+|---|---|
+| `C:27%` `R:47%` | CPU and RAM of the whole machine, everything on it, not only the fleet |
+| `D:3%` | how busy the busiest disk is. A high figure means every project on that disk waits, with CPU and RAM to spare |
+| `F:5` | agents running in the fleet |
+| `C:6%` after it | the fleet's own share of the machine's CPU. `C:96%` with `F:2 C:5%` means the load is something else |
+| `1.5G/10G` | the agents' own memory against the point where the fleet is slowed down |
+
+C, R and D turn red at 85%. D and the fleet's C need Linux with an `agents.slice`; elsewhere they are left out.
 
 ## Keys
 

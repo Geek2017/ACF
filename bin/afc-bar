@@ -3,8 +3,11 @@
 #   [C / 1] [C5-Opu H] [T:196k 20% $25.56] [S0% W7%]
 #   [LLM letter / account label] [model, effort] [T: tokens in this conversation, % of the model's window, cost]
 #   [plan limits]
-# and, for the bottom bar (--machine):  [C:12%|R:40%|F:4 1.0G/12G]
-#   CPU and RAM of the machine, then the fleet: panes running, memory / limit
+# and, for the bottom bar (--machine):  [C:12%|R:40%|D:3%|F:4 C:5% 1.0G/12G]
+#   CPU and RAM of the machine, D: how busy its busiest disk is, then the fleet: panes running,
+#   C: the fleet's own share of the machine's CPU, memory / limit. The machine's C: beside the
+#   fleet's says at a glance whether a busy machine is the fleet's doing: C:96% with F:2 C:5% is
+#   something else (the screens' driver, a browser), and a high D: is a disk every project waits on.
 #   LLM letters: C Claude, X Codex, G Gemini, A Antigravity, H Copilot (GitHub), F OpenCode (Cloudflare).
 #   Model, effort and tokens: Claude panes get them from afc-statusline; Codex, Gemini and Antigravity
 #   panes from afc-agent-info (no dollar cost there). afc-statusline also saves
@@ -14,7 +17,7 @@
 #   (the first is called by pane-border-format in ~/.tmux.conf, the header
 #   on each pane; the pane id, like %3, is what finds the pane's model and effort)
 #
-# CPU and RAM are for the whole machine, and turn red at 85%. A field with nothing to show is left
+# CPU, RAM and disk are for the whole machine, and turn red at 85%. A field with nothing to show is left
 # out along with its brackets. Machine readings are sampled at most every 5 seconds.
 #
 # COST. tmux re-runs this about once a second for EVERY pane header, so a full run (about a fifth of
@@ -81,6 +84,48 @@ hot() {   # hot <label> <percent>
   else printf '%s:%s%%' "$1" "$2"; fi
 }
 
+# Sets fcpu, the fleet's own share of the machine's CPU (agents.slice; every core busy = 100%), and
+# disk, how busy the busiest disk was (the share of the time it had work in hand), both since the
+# last sample. The clock is the CPU counters themselves: total - prev_total is ticks of 1/100 s
+# summed over the cores, so a sample that comes late still divides by the right stretch of time.
+# The counters read are kept in $CACHE.load under the two figures. Reads /proc and /sys only, so no
+# program starts. Nothing is set where there is nothing to read: no agents.slice, or WSL, where
+# these would be the Ubuntu VM's figures beside the Windows host's CPU and RAM.
+FLEET_CG="${AGENTS_STAT:+${AGENTS_STAT%/*}}"
+FLEET_CG="${FLEET_CG:-/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/agents.slice}"
+load_linux() {
+  local dt=$(( total - prev_total )) k v name ms n=0 fu='' pfu='' prevd=' ' p d keep=''
+  fcpu='' disk=''
+  [[ -d /mnt/c/Users ]] && return 0
+  if [[ -r "$CACHE.load" ]]; then
+    { read -r _ _ pfu; while read -r name ms; do prevd+="$name=$ms "; done; } < "$CACHE.load"
+  fi
+  while read -r k _; do    # the cores: the cpuN lines
+    case "$k" in cpu) ;; cpu[0-9]*) n=$((n+1)) ;; *) break ;; esac
+  done < /proc/stat
+  (( n > 0 )) || n=1
+  if [[ -r "$FLEET_CG/cpu.stat" ]]; then
+    while read -r k v; do [[ "$k" == usage_usec ]] && { fu=$v; break; }; done < "$FLEET_CG/cpu.stat"
+  fi
+  [[ "$fu" =~ ^[0-9]+$ ]] || fu=''
+  if [[ -n "$fu" && "$pfu" =~ ^[0-9]+$ ]] && (( prev_total > 0 && dt > 0 && fu >= pfu )); then
+    fcpu=$(( (fu - pfu) / (dt * 100) )); (( fcpu > 100 )) && fcpu=100
+  fi
+  if [[ -r /proc/diskstats ]]; then
+    while read -r _ _ name _ _ _ _ _ _ _ _ _ ms _; do    # field 13: milliseconds with work in hand
+      case "$name" in loop*|ram*|zram*|sr*|fd*) continue ;; esac
+      [[ -d "/sys/block/$name" && "$ms" =~ ^[0-9]+$ ]] || continue    # whole disks, not their partitions
+      keep+="$name $ms"$'\n'
+      [[ "$prevd" == *" $name="* ]] || continue
+      p=${prevd#* $name=}; p=${p%% *}
+      [[ "$p" =~ ^[0-9]+$ ]] && (( prev_total > 0 && dt > 0 && ms >= p )) || continue
+      d=$(( (ms - p) * 10 * n / dt )); (( d > 100 )) && d=100
+      (( d > ${disk:--1} )) && disk=$d
+    done < /proc/diskstats
+  fi
+  printf '%s %s %s\n%s' "${fcpu:--}" "${disk:--}" "${fu:--}" "$keep" > "$CACHE.load" 2>/dev/null
+}
+
 # Sets cpu and ram, using prev_busy and prev_total to measure CPU since the last sample on Linux.
 sample_linux() {
   local _ u n s i w q sq st k v tot=0 av=0
@@ -91,6 +136,7 @@ sample_linux() {
     case "$k" in MemTotal:) tot=$v ;; MemAvailable:) av=$v; break ;; esac
   done < /proc/meminfo
   ram=$(( tot ? (tot-av)*100/tot : 0 ))
+  load_linux
 }
 
 sample() {
@@ -131,14 +177,17 @@ sample() {
   [[ "$(tmux -L "$SOCK" show -gqv @min_count 2>/dev/null)" == "$mins" ]] || tmux -L "$SOCK" set -g @min_count "$mins" 2>/dev/null
 }
 
-stamp=0 cpu=0 ram=0 running=0 prev_busy=0 prev_total=0 busy=0 total=0 note='' pane_limits='' model='' model_full='' msuffix=''
+stamp=0 cpu=0 ram=0 running=0 prev_busy=0 prev_total=0 busy=0 total=0 fcpu='' disk='' note='' pane_limits='' model='' model_full='' msuffix=''
 # The machine's readings are only shown in the bottom bar, so only that call samples them.
 if [[ "${1:-}" == --machine ]]; then
   [[ -r "$CACHE" ]] && read -r stamp cpu ram running prev_busy prev_total note < "$CACHE"
+  [[ -r "$CACHE.load" ]] && read -r fcpu disk _ < "$CACHE.load"    # the last sample's, shown until the next
   if (( now - stamp >= TTL )); then
     sample
     echo "$now $cpu $ram $running $busy $total $note" > "$CACHE"
   fi
+  [[ "$fcpu" =~ ^[0-9]+$ ]] || fcpu=''
+  [[ "$disk" =~ ^[0-9]+$ ]] || disk=''
 fi
 
 line=''
@@ -164,7 +213,11 @@ if [[ "${1:-}" == --machine ]]; then
   # One pair of brackets round all three figures, set apart by a dim |, packed tight with no spaces round the | or the /, as the operator asked.
   dot="#[fg=$DIM]|"
   mem=${mem// \/ //}    # "1.6G / 12G" -> "1.6G/12G"
-  emit "#[fg=$DIM][#[fg=$WHITE]$(hot C "$cpu")$dot#[fg=$WHITE]$(hot R "$ram")${note:+ ($note)}$dot#[fg=$BLUE]F:$running${mem:+ $mem}#[fg=$DIM]]"
+  # D: is the busiest disk, and the C: inside F: is the fleet's own share of the machine's CPU, so
+  # the bar itself says whether a high C: is the fleet's doing. Each is left out where there is
+  # nothing to read it from (a Mac, WSL, no agents.slice) and until a second sample has been taken.
+  dsk=''; [[ -n "$disk" ]] && dsk="$dot#[fg=$WHITE]$(hot D "$disk")"
+  emit "#[fg=$DIM][#[fg=$WHITE]$(hot C "$cpu")$dot#[fg=$WHITE]$(hot R "$ram")${note:+ ($note)}$dsk$dot#[fg=$BLUE]F:$running${fcpu:+ C:$fcpu%}${mem:+ $mem}#[fg=$DIM]]"
   exit 0
 fi
 
