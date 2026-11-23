@@ -6,6 +6,8 @@
 #notify-after 30       # how many seconds a turn must have taken for that
 #limit-warn 90         # warn once the pane's account has used this share (percent) of a plan limit
 #start-gap 2           # seconds between one agent's start and the next after a restart
+#start-agent claude   # what a new project tab starts: claude, or ask = a list to pick from (Claude,
+                      # Gemini, Codex, Antigravity, a terminal); a tab the saved layout brings back keeps its agent
 #log-md off           # chat log: off = one file per project (logs/acf/acf.db); on = also one readable .md file per thread
 #rules enforce        # TokenOps projects (afc-rules): enforce = a broken hard rule sends the agent back, once a turn;
                       # report = only shown in the pane header and logs/acf/rules.log; off = no reminder, no check

@@ -13,7 +13,7 @@
 #   agents --status         list tabs and fleet memory
 #   agents --kill           stop every agent in the fleet (asks first)
 #   agents --dry-run        show what would open, start nothing
-#   agents --window         bring the Agents window to the front, or open it (Meta+A, KDE menu, login)
+#   agents --window         bring the Agents window to the front, or open it (Meta+A; Option+A on a Mac)
 #   agents --new-window     always open another Agents window (e.g. for a second monitor)
 #   agents --accounts       list the Claude accounts (Alt+G in the fleet: other account, or Gemini / Codex)
 #   agents --usage [acct]   plan usage per account: email, session %, weekly %, model cap (claude-usage)
@@ -316,6 +316,11 @@ start_wait() {  # seconds
 
 pane_cmd() {  # folder [seconds to wait first]
   local claude acct="" wait=""
+  # "start-agent ask" in the settings: a new project tab asks which agent to start (--choose) instead
+  # of starting Claude. A tab coming back from the saved layout still gets the agent it had.
+  if [[ -z "${AGENTS_NO_ASK:-}" && "$(setting start-agent claude)" == ask && "$(mode "$1")" != skip* ]]; then
+    echo "$HOME/.local/bin/agents --choose; exec bash"; return 0
+  fi
   if (( ${2:-0} > 0 )); then wait="$HOME/.local/bin/agents --wait $2; "; fi
   # Guardrail: a chat that is continued goes back on the account it belongs to, not on whatever
   # account happens to be the current default (chat_account, below). Without this a fleet restart
@@ -1189,6 +1194,37 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
            "for agents added by hand)"
     fi
     ;;
+  --choose)
+    # Runs INSIDE a new project tab when the settings say "start-agent ask": which agent to start.
+    # c is the Claude the tab would have started (its folder's last chat continued, on that chat's
+    # account); the others start fresh, as from the split menu (Alt+\).
+    self="$HOME/.local/bin/agents"
+    has() { command -v "$1" >/dev/null 2>&1; }
+    claude_cmd=$(AGENTS_NO_ASK=1 pane_cmd "$PWD")
+    cont=""; [[ "$claude_cmd" == *--continue* ]] && cont=", going on with this folder's last chat"
+    keys="c"
+    printf '\n  Start which agent in %s?\n\n' "${PWD##*/}"
+    printf '    c  Claude%s\n' "$cont"
+    has gemini && { printf '    g  Gemini\n'; keys+="g"; }
+    has codex && { printf '    x  Codex\n'; keys+="x"; }
+    { has agy || has antigravity; } && { printf '    n  Antigravity\n'; keys+="n"; }
+    printf '    t  a plain terminal\n\n'; keys+="t"
+    ask=$(sed 's/./&, /g; s/, $//; s/\(.*\), /\1 or /' <<< "$keys")   # "c, g, x, n or t"
+    while :; do
+      printf '  Press %s: ' "$ask"
+      IFS= read -rsn1 k || exit 0
+      k=${k,,}
+      if [[ -n "$k" && "$keys" == *"$k"* ]]; then echo "$k"; echo; break; fi
+      echo
+    done
+    case "$k" in
+      c) exec bash -c "$claude_cmd" ;;
+      g) exec "$self" --pane gemini $$ ;;
+      x) exec "$self" --pane codex $$ ;;
+      n) exec "$self" --pane agy $$ ;;
+      t) exec "$self" --pane term $$ ;;
+    esac
+    ;;
   --pane)
     # Runs INSIDE a new split/tab: takes the folder from the source pane's process (/proc/<pid>/cwd),
     # never from a tmux format — tmux re-parses "$$" in paths (Codebase/$$AFocus -> Codebase/$),
@@ -1900,6 +1936,9 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       if [[ -z "$lack" ]]; then ok "Claude: the five hooks call agents --mark"; else no "Claude: no agents --mark hook for:$lack" "merge config/claude/settings.fleet-keys.json into ~/.claude/settings.json"; fi
       if jq -e '.statusLine.command | test("afc-statusline")' "$cs" >/dev/null 2>&1; then ok "Claude: the status line is afc-statusline"; else no "Claude: the status line is not afc-statusline, so pane headers lack model, tokens and cost"; fi
       if [[ "$(jq -r '.tui // empty' "$cs" 2>/dev/null)" == default ]]; then ok "Claude: classic mode (tui default), so the scrollbar has the chat"; else note "Claude: \"tui\" is not \"default\": the tmux scrollbar will have nothing to scroll"; fi
+      # focus view: commands fold into one line (Ctrl+O opens them), the step checklist stays under the
+      # working line. Its own key, Ctrl+Shift+B, does not get through tmux, so it is set at the start.
+      if [[ "$(jq -r '.viewMode // empty' "$cs" 2>/dev/null)" == focus ]]; then ok "Claude: focus view (viewMode focus): steps as a checklist, commands folded"; else note "Claude: \"viewMode\" is not \"focus\": every command and its output fill the pane (merge config/claude/settings.fleet-keys.json)"; fi
     else no "~/.claude/settings.json is missing"; fi
     if grep -qs 'agents --mark' "$HOME/.gemini/settings.json"; then ok "Gemini: hooks call agents --mark"; else note "Gemini: no agents --mark hook in ~/.gemini/settings.json: its tab signals are estimated from its chat file, and it sends no notification"; fi
     note "Codex needs no hook (the watcher reads each turn's start and end from its session file); Antigravity's tab signals are estimated"
@@ -2038,7 +2077,9 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     ;;
   --window)
     if [[ -n "$MAC" ]]; then   # macOS: the fleet is in a Terminal window; bring Terminal forward, or open one
-      if [[ -n "$(t list-clients -t "$SESSION" 2>/dev/null || true)" ]]; then osascript -e 'tell application "Terminal" to activate' >/dev/null 2>&1 || true; exit 0; fi
+      # open, not osascript, here and in --new-window: AppleScript to Terminal from the Option+A helper
+      # (agents-hotkey, a launchd job) would need the Automation permission; LaunchServices needs none
+      if [[ -n "$(t list-clients -t "$SESSION" 2>/dev/null || true)" ]]; then open -a Terminal >/dev/null 2>&1 || true; exit 0; fi
       exec "$0" --new-window
     fi
     if [[ -n "$WSL" ]]; then   # Windows: bring the Windows Terminal window holding the fleet forward
@@ -2065,7 +2106,7 @@ if ($p -and $s.AppActivate($p.Id)) { "ok" }' 10)" == ok ]]; then exit 0; fi
     # (in the project folder) holds "$$" and spaces, which tmux and shells mangle. Use the link.
     self="$HOME/.local/bin/agents"
     if [[ -n "$MAC" ]]; then
-      exec osascript -e "tell application \"Terminal\" to do script \"exec '$self'\"" -e 'tell application "Terminal" to activate' >/dev/null
+      exec open -a Terminal "$self"   # a new Terminal window that runs it
     fi
     if [[ -n "$WSL" ]]; then
       # Windows Terminal, in a window of its own. It is started from a Windows folder on purpose:

@@ -21,7 +21,7 @@
 #   5. _tools/build-tmux.sh: the patched tmux, and ~/.local/bin/tmux pointing at it.
 #   6. ~/.claude/settings.json: the fleet's keys (classic mode, status line, hooks).
 #   7. Linger on, so the fleet keeps running after you log out, and the background services
-#      started: agents-pool, autonice, afc-logs.
+#      started: agents-pool, agents-express-pool (the express lane), autonice, afc-logs.
 # Every step is skipped when it is already done, so running it again is safe.
 #
 # What it leaves alone: sign-ins (it prints how at the end); Codex, Gemini and Antigravity
@@ -141,6 +141,19 @@ EOF
   echo "  sized for $WHAT ($cores cores, $mem MB): $cap core(s), slowed at $high MB, stopped at $max MB"
   echo "  change it in $U"
 fi
+# The express lane (Alt+E, agents --express): a child of agents.slice that gets first call on the
+# fleet's CPU and keeps part of its memory. Its protected share is sized from this machine's budget
+# (a quarter of the slow-down point; the desktop's copy keeps 3G of 11G). One that is there stays.
+X="$HOME/.config/systemd/user/agents-express.slice"
+if [[ -e "$X" ]]; then echo "  the express lane's slice is there: left alone"
+elif (( DRY )); then echo "  would add the express lane, keeping $(( high / 4 )) MB of its memory"
+else
+  sed "s/^MemoryLow=.*/MemoryLow=$(( high / 4 ))M/; s/^# MemoryLow: up to 3G /# MemoryLow: up to $(( high / 4 ))M (sized by server-setup.sh) /" \
+    "$HERE/config/systemd/user/agents-express.slice" > "$X"
+  echo "  added the express lane, keeping $(( high / 4 )) MB of its memory"
+fi
+XP="$HOME/.config/systemd/user/agents-express-pool.service"
+[[ -e "$XP" ]] || run cp "$HERE/config/systemd/user/agents-express-pool.service" "$XP"
 
 step "5. The patched tmux"
 T="$HOME/.local/opt/tmux-3.8/bin/tmux"
@@ -160,7 +173,19 @@ S="$HOME/.claude/settings.json"; K="$HERE/config/claude/settings.fleet-keys.json
 if [[ ! -e "$S" ]]; then
   run mkdir -p "$HOME/.claude"; run cp "$K" "$S"
   (( DRY )) || echo "  wrote $S"
-elif grep -qs 'agents --mark' "$S"; then echo "  the fleet's hooks are already in $S"
+elif grep -qs 'agents --mark' "$S"; then
+  echo "  the fleet's hooks are already in $S"
+  # Keys the fleet added since (tui, statusLine, viewMode): each one the file lacks is added from
+  # the fleet's keys; one it has, whatever its value, is left as it is.
+  add=""
+  for n in tui statusLine viewMode; do jq -e --arg n "$n" 'has($n)' "$S" >/dev/null 2>&1 || add+=" $n"; done
+  if [[ -z "$add" ]]; then :
+  elif (( DRY )); then echo "  would add to it:$add"
+  else
+    cp -p "$S" "$S.bak-$(date +%Y%m%d-%H%M%S)"
+    jq --slurpfile k "$K" --arg a "$add" '. + ($k[0] | with_entries(select(.key as $x | ($a | split(" ") | index($x)))))' "$S" > "$S.acf-new" && mv -f "$S.acf-new" "$S"
+    echo "  added to it:$add (the old file is kept beside it as .bak-<date>)"
+  fi
 elif (( DRY )); then echo "  would add the fleet's keys to $S if it has no hooks or status line of its own"
 elif jq -e 'has("hooks") or has("statusLine") | not' "$S" >/dev/null 2>&1; then
   cp -p "$S" "$S.bak-$(date +%Y%m%d-%H%M%S)"
@@ -168,7 +193,7 @@ elif jq -e 'has("hooks") or has("statusLine") | not' "$S" >/dev/null 2>&1; then
   echo "  added the fleet's keys to $S (the old file is kept beside it as .bak-<date>)"
 else
   echo "  !! $S has hooks or a status line of its own: not touched."
-  LEFT+=("Merge $K into $S (keys: tui, statusLine, hooks)")
+  LEFT+=("Merge $K into $S (keys: tui, viewMode, statusLine, hooks)")
 fi
 
 step "7. Linger and the background services"
@@ -181,15 +206,15 @@ else
   else run sudo loginctl enable-linger "$ME"; fi
   if (( DRY )); then
     echo "  would run: systemctl --user daemon-reload"
-    echo "  would run: systemctl --user enable --now agents-pool.service autonice.service afc-logs.timer"
+    echo "  would run: systemctl --user enable --now agents-pool.service agents-express-pool.service autonice.service afc-logs.timer"
   elif systemctl --user daemon-reload 2>/dev/null; then
-    systemctl --user enable --now agents-pool.service autonice.service afc-logs.timer
-    for u in agents-pool.service autonice.service afc-logs.timer; do
+    systemctl --user enable --now agents-pool.service agents-express-pool.service autonice.service afc-logs.timer
+    for u in agents-pool.service agents-express-pool.service autonice.service afc-logs.timer; do
       printf '  %-22s %s\n' "$u" "$(systemctl --user is-active "$u" 2>/dev/null || true)"
     done
   else
     echo "  !! this shell cannot reach your systemd user session (logged in through su or sudo -u?)"
-    LEFT+=("Log in over SSH as $ME and run:  systemctl --user daemon-reload && systemctl --user enable --now agents-pool.service autonice.service afc-logs.timer")
+    LEFT+=("Log in over SSH as $ME and run:  systemctl --user daemon-reload && systemctl --user enable --now agents-pool.service agents-express-pool.service autonice.service afc-logs.timer")
   fi
 fi
 

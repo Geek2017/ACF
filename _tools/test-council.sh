@@ -322,6 +322,8 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
   has "... and says how to change them" "$(hdr codex)" 'Alt\+M or m: change'
   tm select-pane -t "$(pane_of codex)"; tm send-keys -K -c "$CL" M-m; sleep 0.8; tm send-keys -K -c "$CL" h; hdr_has codex 'effort high'
   has "Alt+M in a member's pane, h: its effort is now high" "$(hdr codex)" 'gpt-test · effort high'
+  # the strip is written after the header: on a slow Mac (a 2017 Intel laptop) a moment later
+  for w in $(seq 1 32); do grep -qE '@codex \(high\): effort high' <<< "$(tm capture-pane -p -t "$chair")" && break; sleep 0.25; done
   has "... said in the chat strip" "$(tm capture-pane -p -t "$chair")" '@codex \(high\): effort high'
   tm select-pane -t "$(pane_of claude)"; tm send-keys -K -c "$CL" m; sleep 0.8; tm send-keys -K -c "$CL" 2; hdr_has claude 'fable'
   has "m in a member's pane opens the same menu: 2 picks its second model" "$(hdr claude)" 'fable · effort default'

@@ -1,0 +1,14 @@
+[Unit]
+Description=Holder for the express lane (agents --lane moves a tab's processes into it)
+
+[Service]
+Slice=agents-express.slice
+ExecStart=/bin/sleep infinity
+# Stopping/restarting this holder must NOT kill the agents that were moved in.
+KillMode=process
+Restart=always
+# A kill at the group's memory wall takes one process, never everything in this holder (FIX-0002).
+OOMPolicy=continue
+
+[Install]
+WantedBy=default.target

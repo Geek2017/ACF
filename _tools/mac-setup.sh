@@ -22,6 +22,9 @@
 #   7. GNU readline for Python (pip's gnureadline, into your own ~/Library/Python), for each python3
 #      the fleet may run: Homebrew's and the Mac's own. They edit lines with libedit, which leaves
 #      the council (Alt+K) with Tab only: no Shift+Tab, Alt+P, Alt+T or / and @ lists.
+#   8. Option+A from anywhere opens the fleet or brings its window forward, as Meta+A on Linux: a
+#      small helper (share/mac/agents-hotkey.swift, built with the Mac's swiftc) run at login by
+#      launchd (io.github.acf.agents-hotkey). Another key: ACF_HOTKEY=ctrl+opt+a bash mac-setup.sh
 # Every step is skipped when it is already done, so running it again is safe.
 #
 # What a Mac does not get: the resource budget (agents.slice, autonice, jobq are Linux's cgroups
@@ -118,7 +121,19 @@ S="$HOME/.claude/settings.json"; K="$HERE/config/claude/settings.fleet-keys.json
 if [[ ! -e "$S" ]]; then
   run mkdir -p "$HOME/.claude"; run cp "$K" "$S"
   (( DRY )) || echo "  wrote $S"
-elif grep -qs 'agents --mark' "$S"; then echo "  the fleet's hooks are already in $S"
+elif grep -qs 'agents --mark' "$S"; then
+  echo "  the fleet's hooks are already in $S"
+  # Keys the fleet added since (tui, statusLine, viewMode): each one the file lacks is added from
+  # the fleet's keys; one it has, whatever its value, is left as it is.
+  add=""
+  for n in tui statusLine viewMode; do "${JQ:-jq}" -e --arg n "$n" 'has($n)' "$S" >/dev/null 2>&1 || add+=" $n"; done
+  if [[ -z "$add" ]]; then :
+  elif (( DRY )); then echo "  would add to it:$add"
+  else
+    cp -p "$S" "$S.bak-$(date +%Y%m%d-%H%M%S)"
+    "${JQ:-jq}" --slurpfile k "$K" --arg a "$add" '. + ($k[0] | with_entries(select(.key as $x | ($a | split(" ") | index($x)))))' "$S" > "$S.acf-new" && mv -f "$S.acf-new" "$S"
+    echo "  added to it:$add (the old file is kept beside it as .bak-<date>)"
+  fi
 elif (( DRY )); then echo "  would add the fleet's keys to $S if it has no hooks or status line of its own"
 elif [[ -n "$JQ" ]] && "$JQ" -e 'has("hooks") or has("statusLine") | not' "$S" >/dev/null 2>&1; then
   cp -p "$S" "$S.bak-$(date +%Y%m%d-%H%M%S)"
@@ -126,7 +141,7 @@ elif [[ -n "$JQ" ]] && "$JQ" -e 'has("hooks") or has("statusLine") | not' "$S" >
   echo "  added the fleet's keys to $S (the old file is kept beside it as .bak-<date>)"
 else
   echo "  !! $S has hooks or a status line of its own: not touched."
-  left "Merge $K into $S (keys: tui, statusLine, hooks)"
+  left "Merge $K into $S (keys: tui, viewMode, statusLine, hooks)"
 fi
 
 step "5. The chat log, every 15 minutes (launchd)"
@@ -195,6 +210,56 @@ for py in "$BREW/bin/python3" /usr/bin/python3; do
     left "For the council's keys:  $py -m pip install --user $em gnureadline"
   fi
 done
+
+step "8. A key that opens the fleet from anywhere"
+KEY=${ACF_HOTKEY:-opt+a}
+HK="$HOME/.local/bin/agents-hotkey"; HSRC="$HERE/share/mac/agents-hotkey.swift"
+HJOB=io.github.acf.agents-hotkey; HPL="$HOME/Library/LaunchAgents/$HJOB.plist"
+hplist() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- ACF: $KEY opens the fleet from anywhere (agents --window). Written by _tools/mac-setup.sh. -->
+<dict>
+  <key>Label</key><string>$HJOB</string>
+  <key>ProgramArguments</key><array><string>$HK</string><string>$KEY</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/acf-agents-hotkey.log</string>
+</dict>
+</plist>
+EOF
+}
+if ! command -v swiftc >/dev/null 2>&1; then
+  echo "  !! no swiftc (the Mac's developer tools)"
+  left "For the $KEY key: xcode-select --install, then run this again"
+else
+  built=0
+  if [[ -x "$HK" && ! "$HSRC" -nt "$HK" ]]; then echo "  the helper is built: $HK"
+  elif (( DRY )); then echo "  would build $HK from share/mac/agents-hotkey.swift"
+  elif swiftc -O -suppress-warnings -o "$HK.new" "$HSRC" && [[ -x "$HK.new" ]]; then
+    mv -f "$HK.new" "$HK"; built=1; echo "  built $HK"
+  else
+    echo "  !! could not build $HK"
+    left "Build the $KEY helper:  swiftc -O -o $HK $HSRC"
+  fi
+  if [[ -x "$HK" ]] && (( ! built )) && [[ -e "$HPL" && "$(hplist)" == "$(cat "$HPL")" ]] && launchctl print "gui/$(id -u)/$HJOB" >/dev/null 2>&1; then
+    echo "  $KEY opens the fleet (launchd: $HJOB)"
+  elif (( DRY )); then echo "  would write $HPL and load it: $KEY opens the fleet"
+  elif [[ -x "$HK" ]]; then
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+    hplist > "$HPL"
+    launchctl bootout "gui/$(id -u)/$HJOB" >/dev/null 2>&1 || true
+    if launchctl bootstrap "gui/$(id -u)" "$HPL" 2>/dev/null; then echo "  $KEY opens the fleet (launchd: $HJOB; its log: ~/Library/Logs/acf-agents-hotkey.log)"
+    else
+      echo "  !! wrote $HPL but could not load it from this shell (no desktop session?)"
+      left "Load the $KEY helper once you are logged in at the Mac:  launchctl bootstrap gui/\$(id -u) $HPL"
+    fi
+  fi
+fi
 
 echo
 if (( DRY )); then echo "DRY RUN: nothing was changed. Run it again without --dry-run to do it."; exit 0; fi

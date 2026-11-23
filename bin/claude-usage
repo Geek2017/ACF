@@ -10,7 +10,7 @@ Accounts: ~/.config/agents/accounts (<name> <Claude config dir>). Cache: $XDG_RU
 TTL $CLAUDE_USAGE_TTL seconds (default 300). --short never blocks: a stale cache is printed and refreshed in the background.
 Exit 1 when no account could be read.
 """
-import json, os, sys, time, subprocess, urllib.request, urllib.error
+import hashlib, json, os, sys, time, subprocess, urllib.request, urllib.error
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -38,19 +38,41 @@ def email(cfg):
     except Exception:
         return None
 
-# On a Mac Claude keeps its sign-in in the Keychain, not in .credentials.json, and this does not read
-# the Keychain. So there the plan usage cannot be asked for: the table says so, and --short prints
-# nothing (the pane header then shows the limits Claude itself reports, saved by afc-statusline).
+# On a Mac Claude keeps its sign-in in the login Keychain, not in .credentials.json: "Claude
+# Code-credentials" for ~/.claude, "Claude Code-credentials-<first 8 hex of sha256(config dir)>" for
+# another CLAUDE_CONFIG_DIR. It is read with `security` (the user chose this, 2026-11-21); macOS asks
+# once whether `security` may read the item ("Always Allow"). KEYCHAIN is the answer when it can't.
 KEYCHAIN = "sign-in is in the Mac's Keychain: plan usage not read here"
+
+def keychain(cfg):
+    """The claudeAiOauth block from the Mac Keychain for config dir `cfg`, or None."""
+    if sys.platform != "darwin":
+        return None
+    default = os.path.realpath(f"{HOME}/.claude")
+    names = []
+    for d in (cfg, os.path.realpath(cfg)):
+        svc = "Claude Code-credentials" if os.path.realpath(d) == default else \
+              "Claude Code-credentials-" + hashlib.sha256(d.encode()).hexdigest()[:8]
+        if svc not in names:
+            names.append(svc)
+    for svc in names:
+        try:
+            r = subprocess.run(["security", "find-generic-password", "-s", svc, "-w"],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                return json.loads(r.stdout)["claudeAiOauth"]
+        except Exception:
+            pass
+    return None
 
 
 def token(cfg):
     try:
         o = json.load(open(f"{cfg}/.credentials.json"))["claudeAiOauth"]
     except Exception:
-        if sys.platform == "darwin" and not os.path.exists(f"{cfg}/.credentials.json"):
-            return None, KEYCHAIN
-        return None, "not signed in"
+        o = keychain(cfg)
+        if o is None:
+            return None, "not signed in"
     if o.get("expiresAt", 0) / 1000 < time.time():
         return None, "token expired (open claude on this account)"
     return o["accessToken"], None

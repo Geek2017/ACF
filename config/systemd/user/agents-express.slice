@@ -1,0 +1,10 @@
+[Unit]
+Description=Express lane inside the agents group: wins CPU and keeps its memory when the fleet is busy
+
+[Slice]
+# A child of agents.slice (the name does it), so the fleet's total stays what agents.slice says:
+# this lane cannot take more than the fleet has, it only gets first call on it when there is a fight.
+# CPUWeight: 400 against the fleet's 100, so under contention about 4/5 of the fleet's cores.
+# MemoryLow: up to 3G of this lane is reclaimed last; the other agents' pages go first. Added 2026-11-21.
+CPUWeight=400
+MemoryLow=3G

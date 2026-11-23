@@ -1,5 +1,6 @@
 {
   "tui": "default",
+  "viewMode": "focus",
   "statusLine": {
     "type": "command",
     "command": "~/.local/bin/afc-statusline",
