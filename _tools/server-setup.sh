@@ -175,10 +175,10 @@ if [[ ! -e "$S" ]]; then
   (( DRY )) || echo "  wrote $S"
 elif grep -qs 'agents --mark' "$S"; then
   echo "  the fleet's hooks are already in $S"
-  # Keys the fleet added since (tui, statusLine, viewMode): each one the file lacks is added from
+  # Keys the fleet added since (tui, statusLine): each one the file lacks is added from
   # the fleet's keys; one it has, whatever its value, is left as it is.
   add=""
-  for n in tui statusLine viewMode; do jq -e --arg n "$n" 'has($n)' "$S" >/dev/null 2>&1 || add+=" $n"; done
+  for n in tui statusLine; do jq -e --arg n "$n" 'has($n)' "$S" >/dev/null 2>&1 || add+=" $n"; done
   if [[ -z "$add" ]]; then :
   elif (( DRY )); then echo "  would add to it:$add"
   else
@@ -193,7 +193,7 @@ elif jq -e 'has("hooks") or has("statusLine") | not' "$S" >/dev/null 2>&1; then
   echo "  added the fleet's keys to $S (the old file is kept beside it as .bak-<date>)"
 else
   echo "  !! $S has hooks or a status line of its own: not touched."
-  LEFT+=("Merge $K into $S (keys: tui, viewMode, statusLine, hooks)")
+  LEFT+=("Merge $K into $S (keys: tui, statusLine, hooks)")
 fi
 
 step "7. Linger and the background services"

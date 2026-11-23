@@ -1936,9 +1936,6 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       if [[ -z "$lack" ]]; then ok "Claude: the five hooks call agents --mark"; else no "Claude: no agents --mark hook for:$lack" "merge config/claude/settings.fleet-keys.json into ~/.claude/settings.json"; fi
       if jq -e '.statusLine.command | test("afc-statusline")' "$cs" >/dev/null 2>&1; then ok "Claude: the status line is afc-statusline"; else no "Claude: the status line is not afc-statusline, so pane headers lack model, tokens and cost"; fi
       if [[ "$(jq -r '.tui // empty' "$cs" 2>/dev/null)" == default ]]; then ok "Claude: classic mode (tui default), so the scrollbar has the chat"; else note "Claude: \"tui\" is not \"default\": the tmux scrollbar will have nothing to scroll"; fi
-      # focus view: commands fold into one line (Ctrl+O opens them), the step checklist stays under the
-      # working line. Its own key, Ctrl+Shift+B, does not get through tmux, so it is set at the start.
-      if [[ "$(jq -r '.viewMode // empty' "$cs" 2>/dev/null)" == focus ]]; then ok "Claude: focus view (viewMode focus): steps as a checklist, commands folded"; else note "Claude: \"viewMode\" is not \"focus\": every command and its output fill the pane (merge config/claude/settings.fleet-keys.json)"; fi
     else no "~/.claude/settings.json is missing"; fi
     if grep -qs 'agents --mark' "$HOME/.gemini/settings.json"; then ok "Gemini: hooks call agents --mark"; else note "Gemini: no agents --mark hook in ~/.gemini/settings.json: its tab signals are estimated from its chat file, and it sends no notification"; fi
     note "Codex needs no hook (the watcher reads each turn's start and end from its session file); Antigravity's tab signals are estimated"

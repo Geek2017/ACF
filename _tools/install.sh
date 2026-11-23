@@ -157,7 +157,7 @@ echo "$( ((APPLY)) || echo 'DRY RUN: ' )$changed file(s) $( ((APPLY)) && echo 's
 cat <<'EOF'
 
 Left for you:
-  1. Merge config/claude/settings.fleet-keys.json into ~/.claude/settings.json (keys: tui, viewMode, statusLine, hooks).
+  1. Merge config/claude/settings.fleet-keys.json into ~/.claude/settings.json (keys: tui, statusLine, hooks).
   2. Merge config/gemini/settings.fleet-keys.json into ~/.gemini/settings.json (keys: experimental, modelConfigs).
   3. systemctl --user daemon-reload && systemctl --user enable --now autonice.service afc-logs.timer
   4. Build the patched tmux if ~/.local/opt/tmux-3.8 is missing:  bash _tools/build-tmux.sh
