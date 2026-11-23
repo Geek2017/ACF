@@ -76,6 +76,41 @@ link() {  # <path inside the project> <target file> [mode]
   echo "  linked  $dst"
 }
 
+# KDE: the Agents window's own icon is Alacritty's (it puts its icon on every window it opens), and
+# KWin shows that in the title bar. A window rule ties the window (class Agents) to agents.desktop,
+# and KWin then takes the icon from the launcher: the logo. Added to the rule for that window when
+# there is one (the "reopen where it was" rule), else as a rule of its own. Nothing without KWin.
+kwin_logo() {
+  local kw rc="${XDG_CONFIG_HOME:-$HOME/.config}/kwinrulesrc" g found="" list
+  command -v kwin_x11 >/dev/null || command -v kwin_wayland >/dev/null || return 0
+  kw=$(command -v kwriteconfig6 || command -v kwriteconfig5) || return 0
+  section() { awk -v g="[$1]" '$0 == g { s = 1; next } /^\[/ { s = 0 } s' "$rc" 2>/dev/null; }
+  list=$(section General | sed -n 's/^rules=//p')
+  for g in ${list//,/ }; do
+    if section "$g" | grep -qx 'wmclass=agents'; then found=$g; break; fi
+  done
+  if [[ -n "$found" ]] && section "$found" | grep -qx 'desktopfile=agents' && section "$found" | grep -qx 'desktopfilerule=2'; then
+    same=$((same + 1)); return 0
+  fi
+  changed=$((changed + 1))
+  if (( ! APPLY )); then echo "  would add a KWin rule: the Agents window shows the logo ($rc)"; return 0; fi
+  keep "$rc"
+  if [[ -z "$found" ]]; then
+    found=agents-logo
+    "$kw" --file "$rc" --group "$found" --key Description "Agents window: the fleet's logo as its icon"
+    "$kw" --file "$rc" --group "$found" --key wmclass agents
+    "$kw" --file "$rc" --group "$found" --key wmclassmatch 1
+    "$kw" --file "$rc" --group "$found" --key types 1
+    list=${list:+$list,}$found
+    "$kw" --file "$rc" --group General --key rules "$list"
+    "$kw" --file "$rc" --group General --key count "$(tr ',' '\n' <<< "$list" | grep -c .)"
+  fi
+  "$kw" --file "$rc" --group "$found" --key desktopfile agents
+  "$kw" --file "$rc" --group "$found" --key desktopfilerule 2
+  { qdbus6 org.kde.KWin /KWin reconfigure || qdbus org.kde.KWin /KWin reconfigure; } >/dev/null 2>&1 || true
+  echo "  KWin rule: the Agents window shows the logo (from the next window it opens)"
+}
+
 # A Mac gets the fleet's programs and lists only: the resource guard, the systemd units, the KDE
 # launcher files and the Alacritty config are for Linux (_tools/mac-setup.sh is what a Mac runs).
 # Windows runs it in WSL, which IS Linux and keeps the guard and the units; what it skips is the
@@ -102,6 +137,7 @@ if (( DESKTOP )); then
   # splash's frames. Real files, so they still show when this folder's disk is not mounted.
   for f in "$HERE"/share/icons/hicolor/*/apps/acf.png; do [[ -f "$f" ]] && copy "${f#"$HERE"/}" "$HOME/.local/${f#"$HERE"/}"; done
   for f in "$HERE"/share/acf/*; do [[ -f "$f" ]] && copy "share/acf/${f##*/}" "$HOME/.local/share/acf/${f##*/}"; done
+  kwin_logo
 fi
 for f in "$HERE"/share/llm-usage/nobrowser/*; do link "share/llm-usage/nobrowser/$(basename "$f")" "$HOME/.local/share/llm-usage/nobrowser/$(basename "$f")" 755; done
 

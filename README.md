@@ -351,6 +351,8 @@ The package puts the fleet in `/opt/agentic-cli-fleet` (tmux built, in `tmux-3.8
 
 What goes in, and what does not: this folder without `.git`, `logs/`, `dist/` and the hand-kept `.bak` copies. The lists under `config/agents/` go in as templates (each tool's default account, named `main`; no projects, no labels, no chat-log folders), and the two places that name this machine's paths are made general. The build stops if any of this machine's paths is still in the package. The maintainer field is the repository's git author unless `ACF_DEB_MAINTAINER` says otherwise.
 
+On KDE the window's own icon would be Alacritty's (it puts one on every window it opens, and KWin shows it in the title bar), so `install.sh` adds a KWin rule that ties the Agents window to `agents.desktop`; KWin then shows the launcher's icon, the logo, in the title bar and the taskbar. It goes into the existing rule for that window when there is one.
+
 The logo files are made from `logo.png` with `python3 _tools/build-logo.py` (it needs Pillow). They are committed, so a machine that only runs the fleet needs no Pillow; run it again after the logo changes. `build-deb.sh` refuses to pack logo files older than `logo.png`.
 
 ## On other machines
