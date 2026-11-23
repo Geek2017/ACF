@@ -93,7 +93,8 @@ step "Windows Terminal"
 # Its settings.json lives under the Store app's folder; the path differs between the Store build,
 # the preview build and the unpackaged one, so look for whichever is there.
 WTDIR=""
-for d in "$(wslpath -u "$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')" 2>/dev/null || true)"; do
+WLAD=$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r' || true)
+for d in "$(wslpath -u "$WLAD" 2>/dev/null || true)"; do
   [[ -n "$d" && -d "$d" ]] || continue
   for c in "Packages/Microsoft.WindowsTerminal_8wekyb3d8bbwe/LocalState" \
            "Packages/Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe/LocalState" \
@@ -101,24 +102,48 @@ for d in "$(wslpath -u "$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '
     [[ -e "$d/$c/settings.json" ]] && { WTDIR="$d/$c"; break 2; }
   done
 done
+# The profile's icon is the fleet's logo: share/acf/acf.ico (made from logo.png by build-logo.py),
+# copied to %LOCALAPPDATA%\AgenticCLIFleet, since Windows Terminal reads an icon from a Windows path.
+# Without it, the old ⌨️.
+ICON="⌨️"
+ICODIR=$(wslpath -u "$WLAD" 2>/dev/null || true)
+if [[ -n "$WTDIR" && -n "$ICODIR" && -d "$ICODIR" && -f "$HERE/share/acf/acf.ico" ]]; then
+  if (( DRY )); then ICON="$WLAD\\AgenticCLIFleet\\acf.ico"; echo "  would copy the logo to $ICON"
+  elif mkdir -p "$ICODIR/AgenticCLIFleet" && cp -f "$HERE/share/acf/acf.ico" "$ICODIR/AgenticCLIFleet/acf.ico"; then
+    ICON="$WLAD\\AgenticCLIFleet\\acf.ico"
+  fi
+fi
 if [[ -z "$WTDIR" ]]; then
   echo "  Windows Terminal's settings were not found: no profile added."
   echo "  (Get Windows Terminal from the Microsoft Store; it is the one that draws the fleet properly.)"
   LEFT+=("Install Windows Terminal from the Microsoft Store, then run this script again to add the Fleet profile.")
 elif grep -q '"name": *"Fleet"' "$WTDIR/settings.json" 2>/dev/null; then
-  echo "  the Fleet profile is already there"
+  # A Fleet profile made before the logo still has the ⌨️ (or no icon): it gets the logo. An icon
+  # you chose yourself is left alone.
+  old=$(jq -r '[.profiles.list[]? | select(.name == "Fleet") | (.icon // "")][0] // ""' "$WTDIR/settings.json" 2>/dev/null || echo "?")
+  if [[ "$ICON" == "⌨️" || ( "$old" != "⌨️" && -n "$old" ) ]] || ! command -v jq >/dev/null; then
+    echo "  the Fleet profile is already there"
+  elif (( DRY )); then echo "  the Fleet profile is already there; would give it the logo as its icon"
+  else
+    cp -p "$WTDIR/settings.json" "$WTDIR/settings.json.bak-$(date +%Y%m%d-%H%M%S)"
+    jq --arg i "$ICON" '(.profiles.list[]? | select(.name == "Fleet") | .icon) = $i' "$WTDIR/settings.json" \
+        > "$WTDIR/settings.json.acf-new" \
+      && mv -f "$WTDIR/settings.json.acf-new" "$WTDIR/settings.json" \
+      && echo "  the Fleet profile is already there; its icon is now the logo" \
+      || { rm -f "$WTDIR/settings.json.acf-new"; echo "  the Fleet profile is already there (its icon could not be changed)"; }
+  fi
 elif (( DRY )); then echo "  would add a Fleet profile to $WTDIR/settings.json"
 elif ! command -v jq >/dev/null; then
   echo "  !! jq is not installed yet: no profile added."
   LEFT+=("Run this script again (jq comes with step 2) to add the Fleet profile to Windows Terminal.")
 else
   cp -p "$WTDIR/settings.json" "$WTDIR/settings.json.bak-$(date +%Y%m%d-%H%M%S)"
-  jq --arg d "$DISTRO" --arg g "$(cat /proc/sys/kernel/random/uuid)" '
+  jq --arg d "$DISTRO" --arg g "$(cat /proc/sys/kernel/random/uuid)" --arg i "$ICON" '
     .profiles.list = ((.profiles.list // []) + [{
       name: "Fleet",
       guid: ("{" + $g + "}"),
       commandline: ("wsl.exe -d " + $d + " --cd ~ -- $HOME/.local/bin/agents"),
-      icon: "⌨️",
+      icon: $i,
       startingDirectory: null,
       closeOnExit: "always"
     }])' "$WTDIR/settings.json" > "$WTDIR/settings.json.acf-new" \

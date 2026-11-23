@@ -23,7 +23,7 @@ Moved here: 2026-11-16, on the Kubuntu 24.04 workstation.
 | **A resource budget** | Every agent and everything it starts runs in one capped group: 3 CPU cores, slowed at 12 GB of memory, stopped at 14 GB. Near that limit the fleet refuses to start another agent, rather than slow down the ones already running. Builds, tests and agents get lower priority. At most 2 heavy jobs and 3 dev servers run at once; the rest wait their turn. The machine stays awake while agents work. |
 | **A permanent chat log** | Every 15 minutes each tool's chat records are copied into the project they belong to, as one file: a searchable database, with secrets replaced by `[redacted]`. No model is asked, so it costs no tokens. |
 | **Plan limits and cost at a glance** | Session and weekly limits per account for Claude, Codex and Antigravity, and what each conversation would cost at list prices. |
-| **Rebuilds from this folder** | `install.sh` sets a machine up; `build-tmux.sh` builds the patched tmux with no download and no sudo. `agents --doctor` checks that everything is in place; `test-fleet.sh` tries the launcher on a throw-away fleet. |
+| **Rebuilds from this folder** | `install.sh` sets a machine up; `build-tmux.sh` builds the patched tmux with no download and no sudo; `build-deb.sh` makes the installer, a `.deb` for an Ubuntu desktop. `agents --doctor` checks that everything is in place; `test-fleet.sh` tries the launcher on a throw-away fleet. |
 
 ## What you see
 
@@ -287,6 +287,7 @@ What a turn leaves behind, and where.
 | `bin/afc-reflow`, `bin/afc-gap` | | make Claude redraw after a resize, and close the gap its pop-ups leave |
 | `bin/afc-longcopy`, `bin/afc-model-menu` | | long copy, and the Alt+M menu |
 | `bin/afc-copy` | | what a mouse copy puts on the clipboard: the text without the agent's quote bar, marks and margin, with the lines the pane's width broke joined again (it is tmux's `copy-command`). Short lines of code, list items and tables keep their breaks. Shift+drag is still Alacritty's own selection: the screen exactly as shown |
+| `bin/afc-splash` | | the splash: the logo's animation on a white card while the fleet window opens and no window shows the fleet yet, and during the `.deb`'s first run. `splash off` in `settings` turns it off |
 | `bin/autonice`, `bin/jobq`, `bin/keepawake-agents` | copy: `~/.local/bin/` | the resource guard: renices, caps and queues heavy jobs; keeps the machine awake while agents work |
 | `lib/afc/pb.py` | link: `~/.local/lib/afc/` | reads Antigravity's binary records |
 | `tmux/tmux.conf` | link: `~/.tmux.conf` | all keys, bars, hooks and the scrollbar |
@@ -298,8 +299,11 @@ What a turn leaves behind, and where.
 | `config/alacritty/` | copy: `~/.config/alacritty/` | the terminal the fleet window runs in |
 | `config/claude/`, `config/gemini/` | | only the fleet's keys from those tools' settings, to merge by hand |
 | `share/` | link: `~/.local/share/`; the desktop launcher `applications/agents.desktop` is a copy (KDE refuses to start a launcher that is a link to a file outside its own folders) | the desktop launcher, the window-raise script, the no-browser stand-ins |
+| `logo.png`, `share/icons/`, `share/acf/` | copy: `~/.local/share/icons/`, `~/.local/share/acf/` | the logo (an animated PNG: its first frame is empty, so a viewer that shows only that frame shows nothing), and what `build-logo.py` makes from it: the icon in nine sizes (the launcher, the taskbar, the `.deb`), `acf.ico` for the Windows Terminal profile, and the splash's frames |
+| `VERSION` | | the version the `.deb` gets |
 | `lib/afc/` | link: `~/.local/lib/afc/` | shared pieces: `mac.sh` and `macproc.py`, what the programs read instead of `/proc` on a Mac |
-| `_tools/` | | `collect.sh`, `install.sh`, `build-tmux.sh`, `test-fleet.sh`, `test-rules.sh`, `test-idle.sh`, `test-single.sh`, `test-turn.sh`, `test-copy.sh`, `test-even.sh`, `test-council.sh`, `test-wsl.sh`, `server-setup.sh`, `mac-setup.sh`, `windows-setup.sh` |
+| `_tools/` | | `collect.sh`, `install.sh`, `build-tmux.sh`, `build-logo.py`, `build-deb.sh`, `first-run.sh`, `test-fleet.sh`, `test-rules.sh`, `test-idle.sh`, `test-single.sh`, `test-turn.sh`, `test-copy.sh`, `test-even.sh`, `test-council.sh`, `test-wsl.sh`, `server-setup.sh`, `mac-setup.sh`, `windows-setup.sh` |
+| `dist/` | | the built `.deb` (not in the repository) |
 | `logs/acf/` | | this folder's own chat log, written by `afc-logs` when an agent works here (raw transcripts: they name the real account) |
 
 Not here, on purpose: sign-ins, other projects' chats and logs, and the built tmux program (it is rebuilt from `tmux/` and stays on the home disk, so tmux itself starts even without this drive).
@@ -329,6 +333,26 @@ It takes about a minute, installs into `~/.local/opt/tmux-3.8`, and keeps the pr
 
 To change tmux itself: unpack the source, apply the patch, edit, then write the new differences back to `tmux/afc-tmux-3.8.patch` (same `orig/tmux-3.8/…` and `src/tmux-3.8/…` path style, applied with `patch -p2`) and run the build script.
 
+## The installer (.deb)
+
+For a new Ubuntu desktop (24.04, amd64) the fleet comes as one package, built from this folder:
+
+```bash
+bash _tools/build-deb.sh
+```
+
+It takes under a minute (the patched tmux is compiled for the package) and writes `dist/agentic-cli-fleet_<VERSION>_amd64.deb`. On the new machine:
+
+```bash
+sudo apt install ./agentic-cli-fleet_1.0.0_amd64.deb
+```
+
+The package puts the fleet in `/opt/agentic-cli-fleet` (tmux built, in `tmux-3.8/` there), the **Agents** entry in the app menu with the logo, and what software centres show for it. It changes no home folder. The first time a user opens Agents, the splash plays and a terminal window sets the fleet up for that user with no sudo (`_tools/first-run.sh`: `server-setup.sh` with the package's tmux, linger left off, keep-awake on); Enter then opens the fleet. After that the same entry opens the fleet, or brings its window forward.
+
+What goes in, and what does not: this folder without `.git`, `logs/`, `dist/` and the hand-kept `.bak` copies. The lists under `config/agents/` go in as templates (each tool's default account, named `main`; no projects, no labels, no chat-log folders), and the two places that name this machine's paths are made general. The build stops if any of this machine's paths is still in the package. The maintainer field is the repository's git author unless `ACF_DEB_MAINTAINER` says otherwise.
+
+The logo files are made from `logo.png` with `python3 _tools/build-logo.py` (it needs Pillow). They are committed, so a machine that only runs the fleet needs no Pillow; run it again after the logo changes. `build-deb.sh` refuses to pack logo files older than `logo.png`.
+
 ## On other machines
 
 The fleet was written for this Kubuntu workstation. Two other kinds of machine run it, each with one script that sets the whole thing up:
@@ -337,7 +361,8 @@ The fleet was written for this Kubuntu workstation. Two other kinds of machine r
 |---|---|---|
 | **Ubuntu server, no desktop** | `bash _tools/server-setup.sh` | the desktop launcher and keep-awake. Everything else is there, budget included, sized for that machine. Sign in over SSH: the agents print a link, you open it on your own computer and paste the code back. Tried end to end on fresh 24.04 and 26.04. |
 | **Mac** (Apple silicon or Intel) | `bash _tools/mac-setup.sh` | the budget (`agents.slice`, `autonice`, `jobq` are cgroups and systemd), keep-awake, desktop notifications, and the plan limits in the pane headers — Claude keeps its sign-in in the Keychain there, not in a file the fleet can read. |
-| **Windows 10/11** | `bash _tools/windows-setup.sh`, inside WSL | keep-awake (Windows decides when it sleeps, and the agents sleep with it), and the "Open the tab" button on a notification. |
+| **Ubuntu desktop** | the `.deb` (above), or `bash _tools/install.sh --apply` from a copy of this folder | nothing: it is this machine's set-up |
+| **Windows 10/11** | `bash _tools/windows-setup.sh`, inside WSL (the Fleet profile gets the logo as its icon) | keep-awake (Windows decides when it sleeps, and the agents sleep with it), and the "Open the tab" button on a notification. |
 
 All three leave sign-ins and the agents themselves alone, and skip every step already done, so running them again is safe. `--dry-run` says what they would do and changes nothing.
 

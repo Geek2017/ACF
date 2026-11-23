@@ -6,6 +6,8 @@
 #   bash _tools/build-tmux.sh --prefix DIR    install somewhere else (to try a build safely)
 #   bash _tools/build-tmux.sh --dry-run       check the parts and say what it would do
 #   bash _tools/build-tmux.sh --system-deps   build against this machine's own packages, not tmux/deps
+#   bash _tools/build-tmux.sh --prefix P --destdir D   install into D/P, for a package (build-deb.sh):
+#                                             the program is built for P, where it will be in the end
 #
 # Uses: tmux/src/tmux-3.8.tar.gz   the official tmux 3.8 source
 #       tmux/afc-tmux-3.8.patch    the fleet's changes (thin scrollbar, header-click position, hover)
@@ -24,12 +26,13 @@
 # target, it is kept beside the new one as bin/tmux-before-<date>. A running fleet keeps using the
 # old program until it is restarted; this script does not restart anything.
 set -euo pipefail
-PREFIX="$HOME/.local/opt/tmux-3.8"; DRY=0; SYSDEPS=0
+PREFIX="$HOME/.local/opt/tmux-3.8"; DRY=0; SYSDEPS=0; DEST=""
 while (( $# )); do
   case "$1" in
     --prefix) PREFIX=${2:?--prefix needs a folder}; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --system-deps) SYSDEPS=1; shift ;;
+    --destdir) DEST=${2:?--destdir needs a folder}; shift 2 ;;
     *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
   esac
 done
@@ -49,7 +52,7 @@ fi
 echo "source : $SRC"
 echo "patch  : $PATCH ($(grep -c '^+++ ' "$PATCH") files)"
 echo "deps   : ${#debs[@]} package(s) from the folder$( (( ${#debs[@]} )) || echo ' (none: using the system'"'"'s)')"
-echo "install: $PREFIX"
+echo "install: $DEST$PREFIX"
 if (( DRY )); then echo "DRY RUN: parts are all here and intact; nothing built."; exit 0; fi
 
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
@@ -72,10 +75,10 @@ echo "configuring..."
 ./configure --prefix="$PREFIX" ${CONF[@]+"${CONF[@]}"} CPPFLAGS="$CPP" LDFLAGS="$LDF" > "$W/configure.log" 2>&1 || { tail -15 "$W/configure.log"; exit 1; }
 echo "compiling (low priority)..."
 nice -n 10 make -j2 > "$W/make.log" 2>&1 || { grep -n ' error' "$W/make.log" | head -20; exit 1; }
-if [[ -x "$PREFIX/bin/tmux" ]]; then cp -p "$PREFIX/bin/tmux" "$PREFIX/bin/tmux-before-$(date +%Y%m%d-%H%M%S)"; fi
-make install > "$W/install.log" 2>&1 || { tail -10 "$W/install.log"; exit 1; }
-cp -p "$PATCH" "$PREFIX/afc-thin-scrollbar.patch"
+if [[ -z "$DEST" && -x "$PREFIX/bin/tmux" ]]; then cp -p "$PREFIX/bin/tmux" "$PREFIX/bin/tmux-before-$(date +%Y%m%d-%H%M%S)"; fi
+make install ${DEST:+DESTDIR="$DEST"} > "$W/install.log" 2>&1 || { tail -10 "$W/install.log"; exit 1; }
+cp -p "$PATCH" "$DEST$PREFIX/afc-thin-scrollbar.patch"
 
-echo "built: $("$PREFIX/bin/tmux" -V) at $PREFIX/bin/tmux"
+echo "built: $("$DEST$PREFIX/bin/tmux" -V) at $DEST$PREFIX/bin/tmux"
 [[ "$PREFIX" == "$HOME/.local/opt/tmux-3.8" ]] && echo "The fleet uses it after its next restart (~/.local/bin/tmux must point at $PREFIX/bin/tmux)."
 exit 0

@@ -11,3 +11,6 @@ __pycache__/
 
 # Copies kept by hand before an edit (agents.bak-20261121 ...): not programs, not for the repo
 *.bak-*
+
+# Built packages (_tools/build-deb.sh): made from this folder, not kept in the repository
+dist/

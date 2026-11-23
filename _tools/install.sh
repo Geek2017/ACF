@@ -49,6 +49,12 @@ copy() {  # <path inside the project> <target file> [mode]
   if [[ "$1" == config/* ]] && (( ${#UNSWAP[@]} )) && grep -Iq . "$src" 2>/dev/null; then
     sed "${UNSWAP[@]}" "$src" > "$TMP/f"; touch -r "$src" "$TMP/f"; chmod --reference="$src" "$TMP/f"; src="$TMP/f"
   fi
+  # A launcher runs `agents` by its full path, so it names this machine's home folder, not the one
+  # it was collected from.
+  if [[ "$1" == share/applications/*.desktop ]]; then
+    sed -E "s|^(Exec=)[^ ]*/\.local/bin/|\1$HOME/.local/bin/|" "$src" > "$TMP/f"
+    touch -r "$src" "$TMP/f"; chmod --reference="$src" "$TMP/f"; src="$TMP/f"
+  fi
   if [[ -e "$dst" && ! -L "$dst" ]] && cmp -s "$src" "$dst"; then same=$((same + 1)); return 0; fi
   changed=$((changed + 1))
   if (( ! APPLY )); then echo "  would $([[ -e "$dst" || -L "$dst" ]] && echo replace || echo create) $dst (copy)"; return 0; fi
@@ -92,6 +98,10 @@ if (( DESKTOP )); then
   # folders ("Access denied, not owned by root and executable flag not set"), so a link into this
   # folder leaves the Agents menu entry and its shortcut dead.
   copy share/applications/agents.desktop "$HOME/.local/share/applications/agents.desktop" 755
+  # The logo (made from logo.png by build-logo.py): the launcher's and the taskbar's icon, and the
+  # splash's frames. Real files, so they still show when this folder's disk is not mounted.
+  for f in "$HERE"/share/icons/hicolor/*/apps/acf.png; do [[ -f "$f" ]] && copy "${f#"$HERE"/}" "$HOME/.local/${f#"$HERE"/}"; done
+  for f in "$HERE"/share/acf/*; do [[ -f "$f" ]] && copy "share/acf/${f##*/}" "$HOME/.local/share/acf/${f##*/}"; done
 fi
 for f in "$HERE"/share/llm-usage/nobrowser/*; do link "share/llm-usage/nobrowser/$(basename "$f")" "$HOME/.local/share/llm-usage/nobrowser/$(basename "$f")" 755; done
 

@@ -192,6 +192,7 @@ BYPASS=--allow-dangerously-skip-permissions
 #   ram-wall <percent>       ... nor once the whole machine's RAM is this full (R: in the bar)   (90)
 #   cpu-wall <percent>       no new agent by hand once the machine's CPU is this busy (C: in the
 #                            bar); agents coming back after a restart are let through            (90)
+#   splash on|off            the logo's animation while the fleet window opens (afc-splash)     (on)
 SETTINGS="${AGENTS_SETTINGS:-$HOME/.config/agents/settings}"
 setting() {  # name default -> its value
   local n v _
@@ -2075,6 +2076,13 @@ if ($p -and $s.AppActivate($p.Id)) { "ok" }' 10)" == ok ]]; then exit 0; fi
         exec wt.exe -w new --title Agents wsl.exe -d "$d" --cd "~" -- "$self"
       fi
       exec cmd.exe /c start "Agents" wsl.exe -d "$d" --cd "~" -- "$self"
+    fi
+    # The splash (afc-splash): the logo's animation in the middle of the screen while the fleet's
+    # window opens behind it. Only when no window shows the fleet yet (not for a second window on
+    # another monitor); `splash off` in the settings turns it off.
+    if [[ -z "$(t list-clients -t "$SESSION" 2>/dev/null || true)" && "$(setting splash on)" != off \
+          && -x "$HOME/.local/bin/afc-splash" ]]; then
+      setsid "$HOME/.local/bin/afc-splash" >/dev/null 2>&1 < /dev/null &
     fi
     # -q, with log_level = "Error" in alacritty.toml (it needs both): no warning bar over the fleet.
     # It goes after --class Agents: --window looks for a window by the start of this command line.

@@ -1,11 +1,13 @@
 [Desktop Entry]
 Type=Application
 Name=Agents
-Comment=Claude agent fleet: one tab per project, Claude already running
+GenericName=Agentic CLI Fleet
+Comment=Agentic CLI Fleet: one tab per project, the agents already running
 Exec=/home/jmg/.local/bin/agents --window
-Icon=utilities-terminal
+Icon=acf
 Terminal=false
 Categories=Development;
+StartupWMClass=Agents
 Actions=new-window;
 
 [Desktop Action new-window]

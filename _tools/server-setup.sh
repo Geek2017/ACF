@@ -42,6 +42,7 @@ ME=$(id -un)
 # Windows half, so it asks for its own wording and its own closing advice:
 #   ACF_SETUP_NAME  what to call this machine in what is printed   ACF_SETUP_TAIL=0  no closing advice
 #   ACF_SETUP_LEFT  a file to write what could not be done into, one per line
+#   ACF_SETUP_LINGER=0  leave linger off (the .deb's first run on a desktop: no sudo asked)
 WHAT=${ACF_SETUP_NAME:-this server}
 PATH_BEFORE=$PATH
 export PATH="$HOME/.local/bin:$PATH"
@@ -56,10 +57,14 @@ command -v apt-get >/dev/null || { echo "This script is for Ubuntu / Debian: it 
 
 step "1. Packages"
 ID=""; VERSION_ID=""; [[ -r /etc/os-release ]] && . /etc/os-release
-pk=(git build-essential pkg-config patch jq python3 curl ca-certificates procps)
+pk=(git jq python3 curl ca-certificates procps)
+# The build tools only when tmux is to be built here: the .deb brings it built (_tools/first-run.sh
+# points ~/.local/opt/tmux-3.8 at it), so a machine set up from the package needs no sudo for them.
+BUILT=0; [[ -x "$HOME/.local/opt/tmux-3.8/bin/tmux" ]] && BUILT=1
+(( BUILT )) || pk+=(build-essential pkg-config patch)
 SYSDEPS=()
 if [[ "$(dpkg --print-architecture)" != amd64 || "$ID" != ubuntu || "$VERSION_ID" != 24.04 ]]; then
-  SYSDEPS=(--system-deps); pk+=(libevent-dev libncurses-dev bison)
+  SYSDEPS=(--system-deps); (( BUILT )) || pk+=(libevent-dev libncurses-dev bison)
 fi
 need=()
 for p in "${pk[@]}"; do
@@ -172,6 +177,7 @@ if ! command -v systemctl >/dev/null || ! command -v loginctl >/dev/null; then
   LEFT+=("No systemd here: nothing caps the agents and afc-logs is not scheduled.")
 else
   if [[ "$(loginctl show-user "$ME" -p Linger --value 2>/dev/null)" == yes ]]; then echo "  linger is already on"
+  elif [[ "${ACF_SETUP_LINGER:-1}" == 0 ]]; then echo "  linger left off (on a desktop the fleet runs while you are logged in)"
   else run sudo loginctl enable-linger "$ME"; fi
   if (( DRY )); then
     echo "  would run: systemctl --user daemon-reload"

@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""afc-splash: the fleet's splash screen, the logo's animation on a white card in the middle of
+the screen.
+
+    afc-splash [--text "Starting the fleet…"]     play it once (about 6 s), then close
+    afc-splash --save FILE [--frame N]             draw one frame to a PNG instead (no window)
+
+It plays when the fleet window opens and nothing of the fleet runs yet (agents --new-window), and
+while the .deb's first run sets the fleet up. A click or Esc closes it early. It never takes the
+keyboard from the window opening behind it.
+Off: `splash off` in ~/.config/agents/settings, or ACF_SPLASH=0.
+
+The frames are made from logo.png by _tools/build-logo.py: share/acf/splash.png (every frame side
+by side) and splash.json (each frame's time and strength). Needs GTK 3 for Python (python3-gi,
+gir1.2-gtk-3.0); without it, or without a screen, it does nothing and exits 0.
+"""
+import fcntl
+import json
+import math
+import os
+import sys
+
+TITLE = "Agentic CLI Fleet"
+
+
+def assets():
+    """share/acf beside this program (its real path: the fleet's folder), else the copies."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for d in (os.path.join(here, "..", "share", "acf"), os.path.expanduser("~/.local/share/acf"),
+              "/opt/agentic-cli-fleet/share/acf"):
+        if os.path.exists(os.path.join(d, "splash.png")) and os.path.exists(os.path.join(d, "splash.json")):
+            return os.path.normpath(d)
+    return None
+
+
+def splash_off():
+    if os.environ.get("ACF_SPLASH", "").lower() in ("0", "off", "no"):
+        return True
+    path = os.environ.get("AGENTS_SETTINGS") or os.path.expanduser("~/.config/agents/settings")
+    try:
+        with open(path) as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 2 and p[0] == "splash":
+                    return p[1].lower() in ("off", "0", "no")
+    except OSError:
+        pass
+    return False
+
+
+def arg(name, default=None):
+    a = sys.argv[1:]
+    return a[a.index(name) + 1] if name in a and a.index(name) + 1 < len(a) else default
+
+
+class Card:
+    """What is drawn: the white card, the frame, the name and the status line."""
+    PAD, CAPTION = 28, 64
+
+    def __init__(self, strip, meta, text):
+        self.strip, self.meta, self.text = strip, meta, text
+        self.fw, self.fh = meta["width"], meta["height"]
+        self.w = self.fw + 2 * self.PAD
+        self.h = self.fh + self.PAD + self.CAPTION
+
+    def draw(self, cr, i, rounded=True):
+        from gi.repository import Gdk
+        cr.set_operator(0)                      # CLEAR: the corners stay see-through
+        cr.paint()
+        cr.set_operator(2)                      # OVER
+        r = 18 if rounded else 0
+        w, h = self.w, self.h
+        cr.new_sub_path()
+        if r:
+            cr.arc(w - r - 0.5, r + 0.5, r, -math.pi / 2, 0)
+            cr.arc(w - r - 0.5, h - r - 0.5, r, 0, math.pi / 2)
+            cr.arc(r + 0.5, h - r - 0.5, r, math.pi / 2, math.pi)
+            cr.arc(r + 0.5, r + 0.5, r, math.pi, 3 * math.pi / 2)
+        else:
+            cr.rectangle(0.5, 0.5, w - 1, h - 1)
+        cr.close_path()
+        cr.set_source_rgb(1, 1, 1)
+        cr.fill_preserve()
+        cr.set_source_rgba(0.13, 0.19, 0.23, 0.18)
+        cr.set_line_width(1)
+        cr.stroke()
+        Gdk.cairo_set_source_pixbuf(cr, self.strip, self.PAD - i * self.fw, self.PAD)
+        cr.rectangle(self.PAD, self.PAD, self.fw, self.fh)
+        cr.fill()
+        cr.select_font_face("Sans", 0, 1)       # normal, bold
+        cr.set_font_size(17)
+        self.centre(cr, TITLE, self.PAD + self.fh + 24, (0.13, 0.19, 0.23))
+        cr.select_font_face("Sans", 0, 0)
+        cr.set_font_size(12.5)
+        self.centre(cr, self.text, self.PAD + self.fh + 46, (0.42, 0.46, 0.5))
+
+    def centre(self, cr, text, y, rgb):
+        ext = cr.text_extents(text)
+        cr.move_to((self.w - ext.width) / 2 - ext.x_bearing, y)
+        cr.set_source_rgb(*rgb)
+        cr.show_text(text)
+
+
+def main():
+    save = arg("--save")
+    if not save and (splash_off() or not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))):
+        return 0
+    d = assets()
+    if not d:
+        return 0
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+    except (ImportError, ValueError):
+        return 0
+    with open(os.path.join(d, "splash.json")) as f:
+        meta = json.load(f)
+    strip = GdkPixbuf.Pixbuf.new_from_file(os.path.join(d, "splash.png"))
+    card = Card(strip, meta, arg("--text", "Starting the fleet…"))
+
+    if save:                                    # one frame to a PNG, for a look without a window
+        import cairo
+        n = meta["frames"]
+        i = int(arg("--frame", str(n - 1)))
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, card.w, card.h)
+        card.draw(cairo.Context(surf), max(0, min(n - 1, i)))
+        surf.write_to_png(save)
+        return 0
+
+    # one splash at a time (a second press of the launcher while it plays shows nothing more)
+    run = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    lock = open(os.path.join(run, f"afc-splash-{os.getuid()}.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+
+    from gi.repository import Gdk, GLib, Gtk
+    win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    win.set_title(TITLE)
+    win.set_icon_name("acf")
+    win.set_decorated(False)
+    win.set_type_hint(Gdk.WindowTypeHint.SPLASHSCREEN)
+    win.set_skip_taskbar_hint(True)
+    win.set_skip_pager_hint(True)
+    win.set_keep_above(True)
+    win.set_accept_focus(False)
+    win.set_focus_on_map(False)
+    win.set_resizable(False)
+    win.set_default_size(card.w, card.h)
+    win.set_position(Gtk.WindowPosition.CENTER)
+    win.set_app_paintable(True)
+    screen = win.get_screen()
+    rounded = bool(screen.is_composited() and screen.get_rgba_visual())
+    if rounded:
+        win.set_visual(screen.get_rgba_visual())
+    state = {"i": 0}
+    strength = meta.get("strength") or [1] * meta["frames"]
+    last_full = max([k for k, s in enumerate(strength) if s >= 1] or [meta["frames"] - 1])
+
+    def on_draw(_w, cr):
+        card.draw(cr, state["i"], rounded)
+        return False
+
+    def step():
+        i = state["i"] + 1
+        if i >= meta["frames"]:
+            Gtk.main_quit()
+            return False
+        state["i"] = i
+        if i > last_full:                       # the logo's own fade-out takes the card with it
+            Gtk.Widget.set_opacity(win, max(0.0, strength[i]))
+        win.queue_draw()
+        GLib.timeout_add(meta["durations"][i], step)
+        return False
+
+    def close(*_):
+        Gtk.main_quit()
+        return True
+
+    win.connect("draw", on_draw)
+    win.connect("delete-event", close)
+    win.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.KEY_PRESS_MASK)
+    win.connect("button-press-event", close)
+    win.connect("key-press-event", lambda _w, e: close() if e.keyval == Gdk.KEY_Escape else False)
+    GLib.timeout_add(meta["durations"][0], step)
+    GLib.timeout_add(sum(meta["durations"]) + 4000, close)    # never stays up, whatever happens
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
