@@ -40,7 +40,7 @@ badge() {
   who=$("$HOME/.local/bin/agents" --who "$1" 2>/dev/null | head -1)
   [[ -n "$who" ]] || { echo "terminal"; return; }
   tool=${who%% *}
-  case "$tool" in claude) letter=C ;; codex) letter=X ;; gemini) letter=G ;; agy) letter=A ;; *) letter=$tool ;; esac
+  case "$tool" in claude) letter=C ;; codex) letter=X ;; gemini) letter=G ;; agy) letter=A ;; copilot) letter=H ;; opencode) letter=F ;; *) letter=$tool ;; esac
   [[ "$who" == *' '* ]] || { echo "$letter"; return; }
   acct=${who#* }; label=$acct
   if [[ -r "$HOME/.config/agents/account-labels" ]]; then

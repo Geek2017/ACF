@@ -1129,6 +1129,21 @@ class Meeting:
         self.started = time.strftime("%Y-%m-%d %H:%M")
         self.file = None
 
+    def project(self):
+        """The project this council was opened from (its folder's name); "" for a council about no project."""
+        return "" if self.general else (os.path.basename(self.owner.rstrip("/")) or self.owner)
+
+    def subject(self):
+        """What the members are told the topic is. A council opened from a project is about that project,
+        whatever the first message of a meeting that is carried on said; a subject given with /new or
+        /topic is added to it. A council about no project: its subject, else its first message."""
+        name = self.project()
+        if not name:
+            return self.topic or (self.thread[0]["text"] if self.thread else "")
+        return (f"the project {name}, in the folder {self.owner}, which is your working folder. Take every "
+                "question as being about this project unless the chair says otherwise; its files are there "
+                "to read when an answer needs them." + (f"\nThis meeting's subject: {self.topic}" if self.topic else ""))
+
     # -- this meeting's own folder
     def open_session(self, folder=None):
         """A new folder for this meeting (named by the time; the topic joins its name with the first
@@ -1268,7 +1283,7 @@ class Meeting:
             who += f" ({TOOLS[m.tool]})"
         if not (m.made and m.persona) and getattr(m, "lean", "free") != "free":
             who += ". " + LEANS[m.lean]
-        topic = self.topic or (self.thread[0]["text"] if self.thread else "")
+        topic = self.subject()
         return (f"{who}. You are one member of a council of AI models and agents in a group chat, chaired by a "
                 f"human. At the table: {roster}.\n\n{RULES.replace('WORDS', str(self.words())).replace('PERMS', PERM_TEXT[self.perm_of(m)])}\n\nTopic: {topic}\n\n"
                 f"--- The thread so far ---\n"
@@ -1608,7 +1623,7 @@ class Meeting:
         os.makedirs(self.dir, exist_ok=True)
         roster = "\n".join(f"- {m.label()}" + (f": {m.persona}" if m.made and m.persona else "") + ("" if m.seated else " (benched)")
                            for m in self.members)
-        body = [f"# Council: {self.topic or self.thread[0]['text'][:80]}", "",
+        body = [f"# Council{' on ' + self.project() if self.project() else ''}: {self.topic or self.thread[0]['text'][:80]}", "",
                 f"Started {self.started} in {os.path.basename(self.owner) or self.owner}. Mode: {self.mode}.", "",
                 "Members:", roster, ""]
         for e in self.thread:
@@ -1984,7 +1999,8 @@ class Grid:
                     perm, "#[fg=colour111,bold]perm: PLAN")
         tmx("set-option", "-p", "-t", self.me, "@council_chat", "1")    # ✕ / Alt+Q here: the council quits
         tmx("set-option", "-p", "-t", self.me, "pane-border-format",
-            f" #[fg=colour252,bold]council#[default] {mode} #[fg=colour244](Shift+Tab)#[default] · {perm} "
+            f" #[fg=colour252,bold]council{(' · ' + meeting.project().replace('#', '##')) if meeting.project() else ''}"
+            f"#[default] {mode} #[fg=colour244](Shift+Tab)#[default] · {perm} "
             "#[fg=colour244](Alt+P)#[default] · " + ("one view" if meeting.conf.get("view") == "one" else "grid") +
             " #[fg=colour244](Alt+O)#[default] · + add #[fg=colour244](Alt+A)#[default] · new topic #[fg=colour244](Alt+T)#[default] · @name to tag · /help · "
             "Ctrl+C stops#[default]#[align=right]#[fg=colour244] close ✕ #[default]")
@@ -3053,7 +3069,8 @@ def main(argv):
     if TTY:
         threading.Thread(target=refresh_models, daemon=True).start()
     about = meeting.topic or next((e.get("text", "") for e in meeting.thread if e.get("who") == "chair"), "")
-    remembered = (f"carrying on “{fit(about, 40)}” ({carried} messages) · /new for a fresh one · /resume for "
+    remembered = ((f"{meeting.project()} · " if meeting.project() else "") +
+                  f"carrying on “{fit(about, 40)}” ({carried} messages) · /new for a fresh one · /resume for "
                   "another") if carried else ""
     if FEED["grid"]:
         replay(meeting)

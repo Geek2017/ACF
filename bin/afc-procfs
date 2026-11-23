@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.expanduser("~"), ".local/lib/afc"))
 import macproc  # noqa: E402
 
 BASE = os.path.join((os.environ.get("TMPDIR") or "/tmp").rstrip("/"), "afc-proc")
-KEEP_ENV = ("CLAUDE_CONFIG_DIR", "GEMINI_CLI_HOME", "CODEX_HOME", "HOME", "TMUX_PANE")
+KEEP_ENV = ("CLAUDE_CONFIG_DIR", "GEMINI_CLI_HOME", "CODEX_HOME", "COPILOT_HOME", "HOME", "TMUX_PANE")
 SKIP_FILES = ("/dev/", "/System/", "/usr/", "/opt/", "/Library/", "/private/var/db/", "/Applications/")
 
 

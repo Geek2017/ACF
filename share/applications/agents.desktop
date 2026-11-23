@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Agents
+Name=ACF
 GenericName=Agentic CLI Fleet
 Comment=Agentic CLI Fleet: one tab per project, the agents already running
 Exec=/home/jmg/.local/bin/agents --window
@@ -11,5 +11,5 @@ StartupWMClass=Agents
 Actions=new-window;
 
 [Desktop Action new-window]
-Name=New Agents Window (another monitor)
+Name=New ACF Window (another monitor)
 Exec=/home/jmg/.local/bin/agents --new-window

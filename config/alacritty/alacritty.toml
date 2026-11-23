@@ -1,5 +1,5 @@
 # Alacritty 0.13 — drawn on the GPU. Tabs and splits come from tmux (~/.tmux.conf).
-# Fleet: run `agents`, or the "Agents" entry in the KDE menu.
+# Fleet: run `agents`, or the "ACF" entry in the KDE menu.
 
 [window]
 padding = { x = 8, y = 6 }

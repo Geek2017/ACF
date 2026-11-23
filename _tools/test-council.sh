@@ -126,7 +126,8 @@ p=$(cat $(since | head -1))
 has "a member is told to be honest and raw, and to disagree by name" "$p" 'honest, raw take'
 has "... and that it changes nothing" "$p" 'you change nothing'
 has "... and to be short and direct: at most 60 words" "$p" 'Short and direct: lead with your answer, at\s*$|at most 60 words'
-has "... and gets the topic" "$p" '^Topic: Should we rewrite the billing service in Rust\?'
+has "a council opened from a project has that project as its topic" "$p" '^Topic: the project proj, in the folder .*/proj, which is your working folder'
+hasnt "... not the first message of the meeting" "$p" '^Topic: Should we rewrite'
 a=$(cat "$T/log/argv")
 has "Claude runs one-shot with no saved session, read-only tools" "$a" 'secretacct1[[:space:]]-p --no-session-persistence .*--allowedTools Read Grep Glob WebSearch WebFetch --disallowedTools Bash Edit Write NotebookEdit'
 has "Codex runs read-only, ephemeral, answer to a file" "$a" 'codex:secretacct4[[:space:]]exec --sandbox read-only --skip-git-repo-check --ephemeral --color never -C .* -o .* -$'
@@ -431,6 +432,7 @@ gd=$(ls -d "$G"/*/ 2>/dev/null | head -1); gd=${gd%/}
 has "a council about no project keeps its meeting in a folder of its own" "$gd" "^$G/[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4}(-[0-9]+)?_codex-what-now$"
 has "... saved there" "$(cat "$gd/thread.md" 2>/dev/null)" '(ANSWER|POINT) from @codex'
 has "... and its members work in that folder" "$(cat "$T/log/argv")" "-C $gd -o"
+has "... and its topic is still its first message (no project to be about)" "$(cat "$T"/log/prompt* 2>/dev/null)" '^Topic: @codex what now\?'
 printf '%s\n' "@codex and again" | env -u TMUX AFC_COUNCIL_GENERAL="$G" timeout 180 python3 "$COUNCIL" --general > /dev/null 2>&1
 is "... the next one is a folder of its own too" "$(ls "$G"/*/thread.md | wc -l | tr -d ' ')" 2
 has "... and its settings are its own: ~/Council/settings.json" "$(ls "$G")" '^settings\.json$'
@@ -613,6 +615,7 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
   has "... on the model picked from its list (2: claude-haiku-5-5)" "$(python3 -c 'import json,sys; print([a for a in json.load(open(sys.argv[1]))["agents"] if a["name"] == "Judge"])' "$T/council.json")" "claude-haiku-5-5"
   has "... with its soul in its folder" "$(cat "$T/proj/agents/judge/SOUL.md" 2>/dev/null)" 'Fairness above all'
   has "... and its rules" "$(cat "$T/proj/agents/judge/RULES.md" 2>/dev/null)" 'Hear both sides first'
+  for _ in $(seq 1 20); do [[ -n "$(pane_of judge)" ]] && break; sleep 0.25; done   # its pane is labelled a moment after it opens
   has "... and its lean (1: opposition), shown in its header" "$(hdr judge)" 'opposition'
   # + add, Remove everyone…, y: the whole table off, as ✕ on each would; the chat box and + add stay
   tm run-shell -b "$HOME/.local/bin/afc-council --add-menu '$CL' '$cw'"; sleep 0.8

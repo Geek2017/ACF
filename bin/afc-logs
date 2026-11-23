@@ -9,6 +9,8 @@ No model is asked anything: it reads files, so it costs no tokens.
   afc-logs search WORDS [--all] [--tool T] [--since YYYY-MM-DD] [--limit N]
   afc-logs show THREAD                               print one thread (id, or the start of one)
   afc-logs file THREAD                               write one thread to a readable file, print its path
+  afc-logs time [THREAD] [--top N]                   where a thread's time went: the model, each tool, waiting
+                                                     for you, and its slowest steps (no THREAD: this project's latest)
   afc-logs prune-md [--all] [--dry-run]              remove the readable .md files of earlier runs
 
 Where it goes, per project:   <project>/logs/acf/acf.db     one file: the searchable database
@@ -1382,6 +1384,148 @@ def cmd_file(args):
     return 0
 
 
+def span(sec):
+    """A length of time, short: 42 s, 3.2 min, 1 h 05 min."""
+    sec = max(0, sec)
+    if sec < 90:
+        return f"{sec:.0f} s"
+    if sec < 3600:
+        return f"{sec / 60:.1f} min"
+    return f"{int(sec // 3600)} h {int(sec % 3600 // 60):02d} min"
+
+
+def step_words(who, text, width=70):
+    """What a tool call was, in a few words: its command, file, pattern or address."""
+    what = ""
+    try:
+        d = json.loads(text) if text and text.lstrip().startswith("{") else None
+    except ValueError:
+        d = None
+    if isinstance(d, dict):
+        for k in ("command", "cmd", "file_path", "path", "pattern", "query", "url", "description", "prompt", "skill"):
+            if isinstance(d.get(k), str) and d[k].strip():
+                what = d[k]; break
+        if not what:
+            what = next((v for v in d.values() if isinstance(v, str) and v.strip()), "")
+    else:
+        # the call's text is read only in part, so long ones are not whole JSON: take the first telling field
+        m = re.search(r'"(?:command|cmd|file_path|path|pattern|query|url|description|prompt|skill)"\s*:\s*"((?:[^"\\]|\\.)*)', text or "")
+        what = m.group(1).replace("\\n", " ").replace('\\"', '"').replace("\\\\", "\\") if m else (text or "")
+    what = " ".join(what.split())
+    return (who or "tool") + (": " + (what if len(what) <= width else what[:width - 1] + "…") if what else "")
+
+
+PAUSE = 3 * 3600      # a gap longer than this is the session closed or the machine asleep, not work
+# "tools" that only put a question to you: their time is yours, not the agent's
+ASKS = {"AskUserQuestion", "ExitPlanMode", "EnterPlanMode", "ask_user", "request_user_input", "ask_followup_question"}
+
+
+def cmd_time(args):
+    """Where a thread's time went, from the times its steps were written at. The time before a step is
+    what that step took: before a tool's result, the tool was running; before the agent's next words,
+    thinking or tool call, the model was working; before your next message, it was waiting for you.
+    Hook records and attachments are stepped over. Results are matched to calls in order, so when the
+    agent starts several tools at once their total is right and the split between them is not exact.
+    Times are to the second; a gap over three hours counts as a pause, not as work. A tool's time
+    includes any wait for your permission to run it, which the log cannot tell from running; tools
+    that only ask you something (ASKS) count as waiting for you."""
+    top = int(opt(args, "--top", "8") or 8)
+    want = next((a for a in args if not a.startswith("--") and a != opt(args, "--top")), None)
+    if want:
+        found = find_thread(want)
+        if not found:
+            print(f"no thread matching {want}"); return 1
+        _, db, tid, _ = found
+    else:
+        db = open_db(project_here())
+        r = db and (db.execute("SELECT id FROM threads WHERE parent IS NULL OR parent='' ORDER BY last_ts DESC LIMIT 1").fetchone()
+                    or db.execute("SELECT id FROM threads ORDER BY last_ts DESC LIMIT 1").fetchone())
+        if not r:
+            print("no threads logged for this project yet (afc-logs run collects them)"); return 1
+        tid = r[0]
+    tool, title = db.execute("SELECT tool, title FROM threads WHERE id=?", (tid,)).fetchone()
+
+    def when(ts):
+        try:
+            return datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    steps = [(when(ts), ts, kind, who, text) for ts, kind, who, text in db.execute(
+        "SELECT ts, kind, who, substr(text, 1, 600) FROM entries WHERE thread=? AND kind IN "
+        "('user','assistant','thinking','tool_call','tool_result') ORDER BY ts, id", (tid,))]
+    steps = [x for x in steps if x[0] is not None]
+    if len(steps) < 2:
+        print(f"{tid}: too few timed steps to say"); return 1
+    model = wait = away = paused = 0.0
+    asked = 0
+    tools, slow, pending = {}, [], []          # tool -> [seconds, calls, slowest]
+    lent = set()                              # calls already matched to the result written just before them
+    for i, ((t0, _, _, _, _), (t1, ts, kind, who, text)) in enumerate(zip(steps, steps[1:])):
+        gap = max(0.0, t1 - t0)
+        if kind == "tool_call" and i + 1 not in lent:
+            pending.append((who or "tool", text))
+        # Gemini's record has a result just ahead of its call, at the same second: take that call's name
+        if kind == "tool_result" and not pending and i + 2 < len(steps) and steps[i + 2][2] == "tool_call" \
+                and steps[i + 2][0] == t1:
+            pending.append((steps[i + 2][3] or "tool", steps[i + 2][4]))
+            lent.add(i + 2)
+        if kind == "user":
+            if gap > PAUSE:
+                away += gap            # you came back to it another time
+            else:
+                wait += gap
+        elif gap > PAUSE:
+            paused += gap
+            if kind == "tool_result" and pending:
+                pending.pop(0)
+        elif kind == "tool_result":
+            if who:                            # the result names its tool itself (Gemini): its call, if one is waiting
+                k = next((j for j, c in enumerate(pending) if c[0] == who), None)
+                name, call = pending.pop(k) if k is not None else (who, "")
+            else:
+                name, call = pending.pop(0) if pending else ("(tool not named)", "")
+            if name in ASKS:                   # it was waiting for your answer
+                wait += gap
+                asked += 1
+                continue
+            rec = tools.setdefault(name, [0.0, 0, 0.0])
+            rec[0] += gap; rec[1] += 1; rec[2] = max(rec[2], gap)
+            slow.append((gap, ts, step_words(name, call)))
+        else:
+            model += gap
+            slow.append((gap, ts, "the model: thinking and writing"))
+    used = sum(v[0] for v in tools.values())
+    work = model + used
+    local = lambda ts: datetime.datetime.fromtimestamp(when(ts)).strftime("%Y-%m-%d %H:%M")
+    print(f"{tid}   {tool}   {' '.join((title or '').split())[:60]}")
+    print(f"{local(steps[0][1])} to {local(steps[-1][1])}   {sum(1 for x in steps if x[2] == 'user')} messages from you, "
+          f"{sum(v[1] for v in tools.values())} tool calls")
+    print()
+    pct = lambda v: f"{100 * v / work:3.0f}%" if work else "   "
+    print(f"  Working time        {span(work):>12}")
+    print(f"    the model         {span(model):>12}  {pct(model)}   thinking and writing")
+    print(f"    tools running     {span(used):>12}  {pct(used)}")
+    for name, (sec, n, worst) in sorted(tools.items(), key=lambda kv: -kv[1][0])[:top]:
+        print(f"      {name[:28]:28} {span(sec):>10}  {pct(sec)}   {n} call{'s' if n != 1 else ''}, longest {span(worst)}")
+    if len(tools) > top:
+        rest = sorted(tools.items(), key=lambda kv: -kv[1][0])[top:]
+        print(f"      {'(' + str(len(rest)) + ' more tools)':28} {span(sum(v[0] for _, v in rest)):>10}")
+    print(f"  Waiting for you     {span(wait):>12}" + (f"        with {asked} question{'s' if asked != 1 else ''} it put to you" if asked else ""))
+    if away:
+        print(f"  Between sittings    {span(away):>12}        gaps over {PAUSE // 3600} h before your next message")
+    if paused:
+        print(f"  Paused              {span(paused):>12}        gaps over {PAUSE // 3600} h in the middle of a turn: closed or asleep")
+    print()
+    print(f"  The {min(top, len(slow))} longest steps   (a tool's time includes waiting for your permission to run it)")
+    for gap, ts, what in sorted(slow, key=lambda x: -x[0])[:top]:
+        print(f"    {span(gap):>9}   {local(ts)[5:]}   {what}")
+    if tool == "gemini":
+        print()
+        print("  Gemini writes most tool calls down only when they end, with their result, so much of its")
+        print("  tool time is counted here with the model's.")
+    return 0
+
+
 def cmd_prune_md(args):
     """Remove the readable files earlier runs wrote. Only a file the database lists as its own, only
     when that thread's entries are in the database, and only after the database passed a check."""
@@ -1449,6 +1593,8 @@ def main(argv):
             return cmd_show(args)
         if cmd == "file":
             return cmd_file(args)
+        if cmd == "time":
+            return cmd_time(args)
         if cmd == "prune-md":
             return cmd_prune_md(args)
     except BrokenPipeError:

@@ -10,7 +10,7 @@
 #      Linger is left off: on a desktop the fleet runs while you are logged in.
 #   3. keep-awake on (the screen and the machine stay up while agents work)
 #
-# The "Agents" app-menu entry runs it (through /usr/bin/agentic-cli-fleet) in a terminal window,
+# The "ACF" app-menu entry runs it (through /usr/bin/agentic-cli-fleet) in a terminal window,
 # with the splash in front, the first time; after that the same entry opens the fleet. By hand:
 #   bash /opt/agentic-cli-fleet/_tools/first-run.sh [--dry-run]
 set -euo pipefail

@@ -5,7 +5,7 @@
 #   [plan limits]
 # and, for the bottom bar (--machine):  [C:12%|R:40%|F:4 1.0G/12G]
 #   CPU and RAM of the machine, then the fleet: panes running, memory / limit
-#   LLM letters match the split menu keys: C Claude, X Codex, G Gemini, A Antigravity.
+#   LLM letters: C Claude, X Codex, G Gemini, A Antigravity, H Copilot (GitHub), F OpenCode (Cloudflare).
 #   Model, effort and tokens: Claude panes get them from afc-statusline; Codex, Gemini and Antigravity
 #   panes from afc-agent-info (no dollar cost there). afc-statusline also saves
 #   the pane's own plan limits, which stand in when claude-usage returns an error.
@@ -220,7 +220,7 @@ fi
 if [[ -n "$who" ]]; then
   tool=${who%% *}
   case "$tool" in
-    claude) letter=C ;; codex) letter=X ;; gemini) letter=G ;; agy) letter=A ;;
+    claude) letter=C ;; codex) letter=X ;; gemini) letter=G ;; agy) letter=A ;; copilot) letter=H ;; opencode) letter=F ;;
     *) letter=$(printf '%s' "${tool:0:1}" | tr '[:lower:]' '[:upper:]') ;;
   esac
   # The account is shown by its label from ~/.config/agents/account-labels (a neutral stand-in, so a

@@ -1,0 +1,5 @@
+# OpenCode for the fleet: the terminal agent Cloudflare documents for its models (Workers AI, AI Gateway).
+# OpenCode has no folder switch, so there is one line here; it keeps several sign-ins itself:
+#   agents --as opencode:main auth login      add a provider (Cloudflare: account ID and API token)
+#   agents --as opencode:main auth switch     which sign-in a provider uses
+main     ~

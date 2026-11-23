@@ -88,6 +88,8 @@ ACCOUNT_NOW="$HOME/.config/agents/account"   # the account new agents start on; 
 ACCOUNTS_GEMINI="${AGENTS_ACCOUNTS_GEMINI:-$HOME/.config/agents/accounts-gemini}"
 ACCOUNTS_CODEX="${AGENTS_ACCOUNTS_CODEX:-$HOME/.config/agents/accounts-codex}"
 ACCOUNTS_AGY="${AGENTS_ACCOUNTS_AGY:-$HOME/.config/agents/accounts-agy}"
+ACCOUNTS_COPILOT="${AGENTS_ACCOUNTS_COPILOT:-$HOME/.config/agents/accounts-copilot}"
+ACCOUNTS_OPENCODE="${AGENTS_ACCOUNTS_OPENCODE:-$HOME/.config/agents/accounts-opencode}"
 # AGENTS_STAT: another memory.stat, so the tests can hand the memory wall a full fleet to look at
 STAT="${AGENTS_STAT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/agents.slice/memory.stat}"
 
@@ -468,8 +470,10 @@ pane_agent() {  # pane-pid -> "<pid> claude|gemini|codex": the agent in that pan
         codex)  echo "$p codex"; return 0 ;;
         agy)    echo "$p agy"; return 0 ;;
         gemini) echo "$p gemini"; return 0 ;;
-        node)   # Gemini is a node script
-                tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null | grep -qE '/bin/gemini |gemini-cli/' && { echo "$p gemini"; return 0; } ;;
+        opencode) echo "$p opencode"; return 0 ;;
+        node)   # Gemini is a node script; so is Copilot's loader (its work runs in a child called MainThread)
+                tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null | grep -qE '/bin/gemini |gemini-cli/' && { echo "$p gemini"; return 0; }
+                tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null | grep -qE '/bin/copilot |/@github/copilot/' && { echo "$p copilot"; return 0; } ;;
       esac
     done
     pids=$(for p in $pids; do pgrep -P "$p" || true; done)
@@ -504,13 +508,17 @@ claude_dir() {  # claude pid -> the config folder (account) it runs on
 # folder: every dotfile of the real home linked in except .gemini, where its sign-in and sessions live
 # (GEMINI_FORCE_FILE_STORAGE keeps the token in that folder instead of the shared keyring).
 # The tool-generic helpers below cover all four; the claude_* ones above stay as the Claude fast path.
-TOOLS=(claude gemini codex agy)
-tool_file()    { case "$1" in claude) echo "$ACCOUNTS" ;; gemini) echo "$ACCOUNTS_GEMINI" ;; codex) echo "$ACCOUNTS_CODEX" ;; agy) echo "$ACCOUNTS_AGY" ;; esac; }
-tool_default() { case "$1" in claude) echo "$HOME/.claude" ;; gemini|agy) echo "$HOME" ;; codex) echo "$HOME/.codex" ;; esac; }
-tool_var()     { case "$1" in claude) echo CLAUDE_CONFIG_DIR ;; gemini) echo GEMINI_CLI_HOME ;; codex) echo CODEX_HOME ;; agy) echo HOME ;; esac; }
-tool_bin()     { case "$1" in claude) echo "${AGENTS_CLAUDE:-claude}" ;; gemini) echo "${AGENTS_GEMINI:-gemini}" ;; codex) echo "${AGENTS_CODEX:-codex}" ;; agy) echo "${AGENTS_AGY:-agy}" ;; esac; }
+# GitHub Copilot CLI (copilot) keeps everything in COPILOT_HOME (~/.copilot). OpenCode (opencode), the
+# terminal agent Cloudflare documents for its models, has no folder switch: one account here, and its
+# own sign-ins (opencode auth login / auth switch) decide which provider answers.
+TOOLS=(claude gemini codex agy copilot opencode)
+tool_file()    { case "$1" in claude) echo "$ACCOUNTS" ;; gemini) echo "$ACCOUNTS_GEMINI" ;; codex) echo "$ACCOUNTS_CODEX" ;; agy) echo "$ACCOUNTS_AGY" ;; copilot) echo "$ACCOUNTS_COPILOT" ;; opencode) echo "$ACCOUNTS_OPENCODE" ;; esac; }
+tool_default() { case "$1" in claude) echo "$HOME/.claude" ;; gemini|agy|opencode) echo "$HOME" ;; codex) echo "$HOME/.codex" ;; copilot) echo "$HOME/.copilot" ;; esac; }
+tool_var()     { case "$1" in claude) echo CLAUDE_CONFIG_DIR ;; gemini) echo GEMINI_CLI_HOME ;; codex) echo CODEX_HOME ;; agy) echo HOME ;; copilot) echo COPILOT_HOME ;; opencode) echo OPENCODE_NO_HOME_SWITCH ;; esac; }
+tool_bin()     { case "$1" in claude) echo "${AGENTS_CLAUDE:-claude}" ;; gemini) echo "${AGENTS_GEMINI:-gemini}" ;; codex) echo "${AGENTS_CODEX:-codex}" ;; agy) echo "${AGENTS_AGY:-agy}" ;; copilot) echo "${AGENTS_COPILOT:-copilot}" ;; opencode) echo "${AGENTS_OPENCODE:-opencode}" ;; esac; }
 tool_now()     { case "$1" in claude) echo "$ACCOUNT_NOW" ;; *) echo "$ACCOUNT_NOW-$1" ;; esac; }
-tool_label()   { case "$1" in claude) echo Claude ;; gemini) echo Gemini ;; codex) echo Codex ;; agy) echo Antigravity ;; esac; }
+has_tool()     { case "$1" in copilot|opencode) command -v "$(tool_bin "$1")" >/dev/null 2>&1 ;; *) return 0 ;; esac; }   # the newer two are optional
+tool_label()   { case "$1" in claude) echo Claude ;; gemini) echo Gemini ;; codex) echo Codex ;; agy) echo Antigravity ;; copilot) echo Copilot ;; opencode) echo OpenCode ;; esac; }
 
 tool_accounts() {  # tool -> "name<TAB>folder" per account (just the default when there is no list)
   [[ "$1" == claude ]] && { account_list; return; }
@@ -570,6 +578,22 @@ for m in re.finditer(rb"eyJ[A-Za-z0-9_-]+\.(eyJ[A-Za-z0-9_-]+)\.", raw):   # any
     except Exception:
         pass
 print("signed in")' "$2/.gemini/antigravity-cli/antigravity-oauth-token" "$2/.config/antigravity/credential-user-scope" "$2" ;;
+    # Copilot keeps its token in the system keyring; config.json (JSON with comments) names who is
+    # signed in. With nobody named it may still run on gh's own sign-in (gh auth token).
+    copilot) python3 -I -c 'import re,sys
+try:
+    t = open(sys.argv[1], errors="replace").read()
+except OSError:
+    t = ""
+m = re.search(r"\"login\"\s*:\s*\"([^\"]+)\"", t)
+print(m.group(1) if m else "not signed in (copilot login)")' "$2/config.json" ;;
+    # OpenCode keeps its sign-ins in its database: how many there are (a provider each)
+    opencode) python3 -I -c 'import sqlite3,sys
+try:
+    n = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True).execute("select count(*) from credential").fetchone()[0]
+    print(("%d sign-in%s" % (n, "" if n == 1 else "s")) if n else "not signed in (opencode auth login)")
+except Exception:
+    print("not signed in (opencode auth login)")' "${XDG_DATA_HOME:-$2/.local/share}/opencode/opencode.db" ;;
   esac
 }
 tool_share() {  # tool folder: a new Gemini/Codex home gets the main one's settings (MCP servers, model, hooks) by link
@@ -591,12 +615,17 @@ tool_share() {  # tool folder: a new Gemini/Codex home gets the main one's setti
             done
             mkdir -p "$HOME/.gemini/config"
             [[ -e "$dir/.gemini/config" ]] || ln -s "$HOME/.gemini/config" "$dir/.gemini/config" ;;
+    copilot) # a new Copilot home gets the main one's MCP servers by link; its sign-in is its own
+            [[ "$dir" == "$HOME/.copilot" ]] && return 0; mkdir -p "$dir"
+            [[ -e "$dir/mcp-config.json" || ! -e "$HOME/.copilot/mcp-config.json" ]] || ln -s "$HOME/.copilot/mcp-config.json" "$dir/mcp-config.json" ;;
+    opencode) return 0 ;;
   esac
 }
 tool_run() {  # tool account [args...]: that agent on that account
   local tool="$1" dir var; dir=$(tool_dir "$tool" "$2") || { echo "Unknown $tool account: $2 (see: agents --accounts)" >&2; return 1; }
   shift 2; tool_share "$tool" "$dir"; var=$(tool_var "$tool")
   if [[ "$tool" == agy ]]; then env "HOME=$dir" GEMINI_FORCE_FILE_STORAGE=true "$(tool_bin "$tool")" "$@"   # HOME is always set
+  elif [[ "$tool" == opencode ]]; then "$(tool_bin "$tool")" "$@"                                            # no folder switch
   elif [[ "$dir" == "$(tool_default "$tool")" ]]; then env -u "$var" "$(tool_bin "$tool")" "$@"
   else env "$var=$dir" "$(tool_bin "$tool")" "$@"; fi
 }
@@ -727,16 +756,17 @@ scan_procs() {
 }
 
 scan_agent() {  # pane pid -> AP and AK: its agent's pid and kind, found as pane_agent finds them, from scan_procs' table
-  local pids="$1" p next _ re='/bin/gemini |gemini-cli/'
+  local pids="$1" p next _ re='/bin/gemini |gemini-cli/' rec='/bin/copilot |/@github/copilot/'
   local -a args
   AP=""; AK=""
   for _ in 1 2 3 4; do
     next=""
     for p in $pids; do
       case "${COMM[$p]:-}" in
-        claude|codex|agy|gemini) AP=$p; AK=${COMM[$p]}; return 0 ;;
-        node) args=(); mapfile -d '' args 2>/dev/null < "$PROC/$p/cmdline" || true   # Gemini is a node script
-              if [[ "${args[*]} " =~ $re ]]; then AP=$p; AK=gemini; return 0; fi ;;
+        claude|codex|agy|gemini|opencode) AP=$p; AK=${COMM[$p]}; return 0 ;;
+        node) args=(); mapfile -d '' args 2>/dev/null < "$PROC/$p/cmdline" || true   # Gemini and Copilot's loader are node scripts
+              if [[ "${args[*]} " =~ $re ]]; then AP=$p; AK=gemini; return 0; fi
+              if [[ "${args[*]} " =~ $rec ]]; then AP=$p; AK=copilot; return 0; fi ;;
       esac
       next+="${KIDS[$p]:-}"
     done
@@ -803,6 +833,14 @@ pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its
               if [[ "$OF" =~ $re ]]; then chat=${BASH_REMATCH[1]}; rf=$OF; else arg_after "$p" --conversation; chat=$PV; fi
               arg_after "$p" --mode; [[ "$PV" == plan ]] && mode=p ;;
       gemini) arg_after "$p" --approval-mode; [[ "$PV" == plan ]] && mode=p ;;
+      # Copilot writes each chat to session-state/<id>/events.jsonl; one that was resumed has the id on its command line
+      copilot) agent_open "$p" '/session-state/[^/]+/events\.jsonl$'; re='/session-state/([^/]+)/events\.jsonl$'
+              if [[ "$OF" =~ $re ]]; then chat=${BASH_REMATCH[1]}; rf=$OF
+              else arg_after "$p" --resume; chat=$PV
+                   [[ -n "$chat" ]] || { re=' --resume=([A-Za-z0-9_.-]+)'; rec=$(tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null || true); [[ " $rec" =~ $re ]] && chat=${BASH_REMATCH[1]}; }; fi
+              arg_after "$p" --mode; [[ "$PV" == plan ]] && mode=p ;;
+      # OpenCode keeps every chat in one database: only a chat it was started on is known (else "the last", as Gemini)
+      opencode) arg_after "$p" --session; chat=$PV ;;
     esac
     # Antigravity and Gemini may hold nothing open that names their chat. afc-agent-info then finds the
     # folder's newest chat, as it does for the pane header. That is this split's chat only for the first
@@ -828,7 +866,7 @@ pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its
     fi
     # Codex and Antigravity have no hooks that tell the fleet a turn began: the watcher reads that
     # from the record each keeps (activity). Which pane, which agent, which file:
-    if [[ "$kind" == codex || "$kind" == agy || ( "$kind" == gemini && -z "$GEMINI_HOOKED" ) ]]; then TRK[$3]="$kind$TAB$p$TAB$rf"; fi
+    if [[ "$kind" == codex || "$kind" == agy || ( "$kind" == copilot && -n "$rf" ) || ( "$kind" == gemini && -z "$GEMINI_HOOKED" ) ]]; then TRK[$3]="$kind$TAB$p$TAB$rf"; fi
   else
     kind=term; cwd=$(readlink "$PROC/$1/cwd" 2>/dev/null || true)
     # No agent, but the pane's own command is still the launcher, not yet the shell it ends in: an
@@ -1001,7 +1039,7 @@ layout_show() {  # the saved layout, readable (accounts by their label, as the f
     case "$kind" in
       W) printf '  %s%s\n' "$a" "$([[ "$b" == - ]] && echo '   (not a project tab)' || true)" ;;
       P) case "$a" in term) a=terminal; b=""; c="" ;; *) b=$(label_of "$b")
-            if [[ "$c" != - ]]; then c="chat ${c:0:8}"; elif [[ "$a" == gemini ]]; then c="latest chat"; else c="new chat"; fi ;;
+            if [[ "$c" != - ]]; then c="chat ${c:0:8}"; elif [[ "$a" == gemini || "$a" == opencode ]]; then c="latest chat"; else c="new chat"; fi ;;
          esac
          printf '      %-9s %-10s %-14s %s%s%s\n' "$a" "$b" "$c" "$e" "$([[ "$d" == *m* ]] && echo '   (minimised)' || true)" "$([[ "$d" == *p* ]] && echo '   (plan mode)' || true)" ;;
     esac
@@ -1043,7 +1081,7 @@ restore_tab() {  # reopens one saved tab from the caller's name, project, layout
       if [[ "$flag" == *m* ]]; then [[ $pass == minimised ]] || continue; else [[ $pass == shown ]] || continue; fi
       [[ "$tool$acct$chat" =~ ^[A-Za-z0-9_.-]+$ ]] || continue   # a damaged line
       [[ -d "$cwd" ]] || cwd="${dir:-$HOME}"
-      if [[ "$tool" == gemini && "$chat" == - && "$gem" != *"|$acct$TAB$cwd|"* ]]; then chat=last; gem+="|$acct$TAB$cwd|"; fi
+      if [[ ( "$tool" == gemini || "$tool" == opencode ) && "$chat" == - && "$gem" != *"|$tool$acct$TAB$cwd|"* ]]; then chat=last; gem+="|$tool$acct$TAB$cwd|"; fi
       mode=-; [[ "$flag" == *p* ]] && mode=plan
       wait=0
       # A project tab always comes back with an agent: when none was left in it (they had all ended),
@@ -1230,6 +1268,8 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     has gemini && { printf '    g  Gemini\n'; keys+="g"; }
     has codex && { printf '    x  Codex\n'; keys+="x"; }
     { has agy || has antigravity; } && { printf '    n  Antigravity\n'; keys+="n"; }
+    has copilot && { printf '    d  Copilot (GitHub)\n'; keys+="d"; }
+    has opencode && { printf '    f  OpenCode (Cloudflare)\n'; keys+="f"; }
     printf '    t  a plain terminal\n\n'; keys+="t"
     ask=$(sed 's/./&, /g; s/, $//; s/\(.*\), /\1 or /' <<< "$keys")   # "c, g, x, n or t"
     while :; do
@@ -1244,6 +1284,8 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       g) exec "$self" --pane gemini $$ ;;
       x) exec "$self" --pane codex $$ ;;
       n) exec "$self" --pane agy $$ ;;
+      d) exec "$self" --pane copilot $$ ;;
+      f) exec "$self" --pane opencode $$ ;;
       t) exec "$self" --pane term $$ ;;
     esac
     ;;
@@ -1287,6 +1329,8 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       gemini*) acct="${4:-$(tool_current gemini)}" ;;   # gemini|gemini-plan|gemini-bypass <pid> [account]
       codex*)  acct="${4:-$(tool_current codex)}" ;;
       agy*)    acct="${4:-$(tool_current agy)}" ;;
+      copilot*)  acct="${4:-$(tool_current copilot)}" ;;
+      opencode*) acct="${4:-$(tool_current opencode)}" ;;
     esac
     # The memory wall (mem_room): no new agent once the fleet is near its memory limit, because one
     # more there slows down every agent already running. The split itself is already open by now --
@@ -1295,7 +1339,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     case "$what" in
       term|tab) needs_agent=0 ;;   # a shell costs nothing, and may be what you need to free memory
       # a split coming back from the saved layout: only the ones that held an agent count
-      restore) case "${4:-term}" in claude|gemini|codex|agy) ;; *) needs_agent=0 ;; esac ;;
+      restore) case "${4:-term}" in claude|gemini|codex|agy|copilot|opencode) ;; *) needs_agent=0 ;; esac ;;
     esac
     case "$needs_agent" in
       0) ;;
@@ -1327,6 +1371,13 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       agy)           tool_run agy "$acct" || true ;;
       agy-plan)      tool_run agy "$acct" --mode plan || true ;;
       agy-bypass)    tool_run agy "$acct" --dangerously-skip-permissions || true ;;
+      copilot)        tool_run copilot "$acct" || true ;;
+      copilot-plan)   tool_run copilot "$acct" --mode plan || true ;;
+      copilot-bypass) tool_run copilot "$acct" --allow-all || true ;;
+      # OpenCode in a server of its own, so it lives and ends with its pane and stays in the fleet's budget.
+      # It has no start flag for its plan mode (Tab inside switches agents); --auto approves what is not denied.
+      opencode)        tool_run opencode "$acct" --standalone || true ;;
+      opencode-bypass) tool_run opencode "$acct" --standalone --auto || true ;;
       handoff)
         # Alt+G to another tool, "this chat": agents --pane handoff 0 <tool> <account>. The log of the
         # chat that is handed on was noted for this pane by --switch.
@@ -1342,15 +1393,18 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
           codex)  tool_run codex "$acct" "${ask[@]}" || true ;;
           gemini) if (( ${#ask[@]} )); then tool_run gemini "$acct" -i "${ask[0]}" || true; else tool_run gemini "$acct" || true; fi ;;
           agy)    if (( ${#ask[@]} )); then tool_run agy "$acct" --prompt-interactive "${ask[0]}" || true; else tool_run agy "$acct" || true; fi ;;
+          copilot)  if (( ${#ask[@]} )); then tool_run copilot "$acct" -i "${ask[0]}" || true; else tool_run copilot "$acct" || true; fi ;;
+          opencode) if (( ${#ask[@]} )); then tool_run opencode "$acct" --standalone --prompt "${ask[0]}" || true; else tool_run opencode "$acct" --standalone || true; fi ;;
         esac ;;
       restore)
         # A split the fleet had open when it last stopped (layout_restore), back on its own account and chat.
         # Usage: agents --pane restore 0 <tool> <account|-> <chat id|last|-> [plan|-] [seconds to wait first]
         tool="${4:-term}"; acct="${5:--}"; chat="${6:--}"; plan=()
-        case "$tool" in claude|gemini|codex|agy) ;; *) tool=term ;; esac
+        case "$tool" in claude|gemini|codex|agy|copilot|opencode) ;; *) tool=term ;; esac
         case "$tool:${7:--}" in   # a split that was started in plan mode comes back in plan mode
           claude:plan) plan=(--permission-mode plan) ;; gemini:plan) plan=(--approval-mode plan) ;;
           codex:plan)  plan=(--sandbox read-only) ;;    agy:plan)    plan=(--mode plan) ;;
+          copilot:plan) plan=(--mode plan) ;;
         esac
         if [[ "$tool" != term ]]; then
           start_wait "${8:-0}"
@@ -1366,6 +1420,12 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
             codex:*)  tool_run codex "$acct" resume "$chat" "${plan[@]}" || true ;;
             agy:-)    tool_run agy "$acct" "${plan[@]}" || true ;;
             agy:*)    tool_run agy "$acct" --conversation "$chat" "${plan[@]}" || true ;;
+            copilot:-) tool_run copilot "$acct" "${plan[@]}" || true ;;
+            copilot:*) tool_run copilot "$acct" "${plan[@]}" --resume="$chat" || true ;;
+            # the folder's last chat; when there is none OpenCode starts a new one itself
+            opencode:last) began=$SECONDS; tool_run opencode "$acct" --standalone --continue || (( SECONDS - began > 10 )) || tool_run opencode "$acct" --standalone || true ;;
+            opencode:-)    tool_run opencode "$acct" --standalone || true ;;
+            opencode:*)    tool_run opencode "$acct" --standalone --session "$chat" || true ;;
             # the folder's latest chat; when there is none Gemini stops at once, and a new chat starts instead
             gemini:last) began=$SECONDS; tool_run gemini "$acct" "${plan[@]}" --resume latest || (( SECONDS - began > 10 )) || tool_run gemini "$acct" "${plan[@]}" || true ;;
             gemini:*) tool_run gemini "$acct" "${plan[@]}" || true ;;
@@ -1517,7 +1577,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     ;;
   --as)
     case "${2:?usage: agents --as <account> | gemini:<account> | codex:<account> [args]}" in
-      gemini:*|codex:*|agy:*) tool_run "${2%%:*}" "${2#*:}" "${@:3}" ;;
+      gemini:*|codex:*|agy:*|copilot:*|opencode:*) tool_run "${2%%:*}" "${2#*:}" "${@:3}" ;;
       *) claude_as "$2" "${@:3}" ;;
     esac
     ;;
@@ -1599,6 +1659,14 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
           "New Antigravity, bypass (no asking)" u "$(split agy-bypass)"
           "New Antigravity on another account..." e "$(again pick:agy)"
           ""
+          "New Copilot (GitHub, fresh chat)"   d "$(split copilot)"
+          "New Copilot in plan mode"           l "$(split copilot-plan)"
+          "New Copilot, bypass (no asking)"    q "$(split copilot-bypass)"
+          "New Copilot on another account..."  r "$(again pick:copilot)"
+          ""
+          "New OpenCode (Cloudflare, fresh chat)" f "$(split opencode)"
+          "New OpenCode, bypass (no asking)"   v "$(split opencode-bypass)"
+          ""
           "New agent in its own work folder..." k "$(again wt)"
           ""
           "Agent from another tab"           a "choose-tree -Zw \"join-pane $how -t %$pane -s '%%' ; $even\""
@@ -1610,20 +1678,21 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
           { t display-message -d 4000 "This folder is not a git project, so a split cannot get a work folder of its own here"; exit 0; }
         title="Own work folder (a git worktree on a new branch)"
         items=("Claude" c "$(split wt-claude)" "Gemini" g "$(split wt-gemini)" "Codex" x "$(split wt-codex)"
-               "Antigravity" n "$(split wt-agy)" "" "Plain terminal" t "$(split wt-term)") ;;
+               "Antigravity" n "$(split wt-agy)" "Copilot" d "$(split wt-copilot)" "OpenCode" f "$(split wt-opencode)"
+               "" "Plain terminal" t "$(split wt-term)") ;;
       pick)
         title="New Claude on which account?"; items=(); key=0; mine=$(pane_account "$pid")
         while IFS=$'\t' read -r name dir; do
           [[ "$name" == "$mine" ]] && start=$key     # open the list on this pane's account
           key=$((key + 1)); items+=("$(shown "$name" "$(account_email "$dir")")" "$key" "$(again "$name")")
         done < <(account_list) ;;
-      pick:gemini|pick:codex|pick:agy)
+      pick:gemini|pick:codex|pick:agy|pick:copilot|pick:opencode)
         tool="${5#pick:}"; title="New $(tool_label "$tool") on which account?"; items=(); key=0
         while IFS=$'\t' read -r name dir; do
           key=$((key + 1)); items+=("$(shown "$name" "$(tool_email "$tool" "$dir")")" "$key" "$(again "$tool:$name")")
         done < <(tool_accounts "$tool")
         items+=("" "Add one: a line in $(tool_file "$tool" | sed "s|$HOME|~|")" "" "display-message 'agents --accounts shows how to sign it in'") ;;
-      gemini:*|codex:*|agy:*)
+      gemini:*|codex:*|agy:*|copilot:*|opencode:*)
         tool="${5%%:*}"; name="${5#*:}"
         tool_dir "$tool" "$name" >/dev/null || { t display-message "agents: no $tool account called $name"; exit 1; }
         title="New $(tool_label "$tool") on $(label_of "$name")"
@@ -1631,6 +1700,8 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
           gemini) items=("Fresh chat" g "$(split gemini "$name")" "Plan mode" h "$(split gemini-plan "$name")" "Bypass (no asking)" i "$(split gemini-bypass "$name")") ;;
           codex)  items=("Fresh chat" x "$(split codex "$name")" "Read-only (plan)" y "$(split codex-plan "$name")" "Bypass (no asking)" z "$(split codex-bypass "$name")") ;;
           agy)    items=("Fresh chat" n "$(split agy "$name")" "Plan mode" m "$(split agy-plan "$name")" "Bypass (no asking)" u "$(split agy-bypass "$name")") ;;
+          copilot)  items=("Fresh chat" d "$(split copilot "$name")" "Plan mode" l "$(split copilot-plan "$name")" "Bypass (no asking)" q "$(split copilot-bypass "$name")") ;;
+          opencode) items=("Fresh chat" f "$(split opencode "$name")" "Bypass (no asking)" v "$(split opencode-bypass "$name")") ;;
         esac ;;
       *)
         account_dir "$5" >/dev/null || { t display-message "agents: no account called $5"; exit 1; }
@@ -1659,8 +1730,9 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       item "Claude  $(shown "$name" "$(account_email "$dir")")${u:+   $u}$room" "$key" "$name" "claude $name"
     done < <(account_list)
     items+=("")   # separator
-    for tool in gemini codex agy; do
-      case "$tool" in gemini) key=g ;; codex) key=x ;; agy) key=n ;; esac
+    for tool in gemini codex agy copilot opencode; do
+      has_tool "$tool" || continue
+      case "$tool" in gemini) key=g ;; codex) key=x ;; agy) key=n ;; copilot) key=d ;; opencode) key=f ;; esac
       while IFS=$'\t' read -r name dir; do
         if (( $(tool_count "$tool") > 1 )); then item "$(tool_label "$tool")  $(shown "$name" "$(tool_email "$tool" "$dir")")" "$key" "$tool:$name" "$tool $name"
         elif [[ "$(label_of "$name")" != "$name" ]]; then item "$(tool_label "$tool")" "$key" "$tool:$name" "$tool"
@@ -1680,7 +1752,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     to="${2:?account, gemini[:account], codex[:account] or agy[:account]}"; pane="%${3#%}"; pid="${4:?pane pid}"; dir="" tdir=""
     orig="$2"; how="${5:-}"; client="${6:-}"   # ask <client>: from the Alt+G menu; handoff | fresh: its answer
     case "$to" in
-      gemini|codex|agy|gemini:*|codex:*|agy:*)
+      gemini|codex|agy|copilot|opencode|gemini:*|codex:*|agy:*|copilot:*|opencode:*)
         tool="${to%%:*}"; name="${to#*:}"; [[ "$name" == "$to" ]] && name=$(tool_current "$tool")
         tdir=$(tool_dir "$tool" "$name") || { t display-message "agents: no $tool account called $name"; exit 1; }
         tool_share "$tool" "$tdir"; mkdir -p "${ACCOUNT_NOW%/*}"; printf '%s\n' "$name" > "$(tool_now "$tool")"
@@ -1734,6 +1806,23 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     fi
     t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$cwd" "$HOME/.local/bin/agents $run"
     t display-message "This pane is now $who"
+    ;;
+  --tab-menu)
+    # The tabs as a list. A click on the tab dropdown in the bottom bar opens it; the dropdown takes
+    # the place of the tab row when the window is narrow and the tabs do not fit (tmux.conf, @tabs_squeezed).
+    # Each tab has its number as its key. Usage: agents --tab-menu <client>
+    client="${2:?client}"; items=()
+    sess=$(t display-message -p -c "$client" '#{session_name}' 2>/dev/null || true); sess=${sess:-$SESSION}
+    while IFS=$'\t' read -r idx name active unseen busy; do
+      mark="  "; [[ "$active" == 1 ]] && mark="● "
+      state=""; [[ "$busy" == *1* ]] && state="   ▶ working"; [[ -n "$unseen" ]] && state="   ✓ has news"
+      key=""; (( idx < 10 )) && key=$idx
+      items+=("$mark$idx  ${name//#/##}$state" "$key" "select-window -t :=$idx")
+    done < <(t list-windows -t "$sess" -F $'#{window_index}\t#{window_name}\t#{window_active}\t#{@unseen}\t#{P:#{@busy}}')
+    (( ${#items[@]} )) || exit 0
+    # -O: it is opened by a mouse click, and without it tmux closes a menu when the button comes up
+    # again (the list flashed and was gone)
+    t display-menu -O -M -c "$client" -T "#[align=centre] Tabs " -x M -y S "${items[@]}"
     ;;
   --view)
     # agents --view                         say which view the settings ask for
@@ -2061,11 +2150,11 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     for tool in "${TOOLS[@]}"; do
       while IFS=$'\t' read -r name dir; do
         who=$(tool_email "$tool" "$dir")
-        if [[ "$who" == "not signed in" ]]; then note "$(tool_label "$tool") account $(label_of "$name") is not signed in"; fi
+        if [[ "$who" == "not signed in"* ]]; then note "$(tool_label "$tool") account $(label_of "$name") is $who"; fi
       done < <(tool_accounts "$tool")
     done
     if [[ -r "$SETTINGS" ]]; then
-      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap|log-md|mem-wall|rules|rules-recap)$/ { printf " %s", $1 }' "$SETTINGS")
+      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap|start-agent|log-md|mem-wall|ram-wall|cpu-wall|rules|rules-recap|splash|claude-view)$/ { printf " %s", $1 }' "$SETTINGS")
       if [[ -n "$odd" ]]; then no "unknown names in $SETTINGS:$odd"; else ok "settings: $SETTINGS"; fi
     fi
     echo
@@ -2148,7 +2237,7 @@ if ($p -and $s.AppActivate($p.Id)) { "ok" }' 10)" == ok ]]; then exit 0; fi
       exec "$0" --new-window
     fi
     # An Agents window is already open: raise it through a one-shot KWin script instead of opening another
-    if pgrep -f '^alacritty --title Agents --class Agents' >/dev/null && command -v qdbus >/dev/null; then
+    if pgrep -f '^alacritty --title (ACF|Agents) --class Agents' >/dev/null && command -v qdbus >/dev/null; then
       js="$HOME/.local/share/agents/kwin-focus.js"
       k() { qdbus org.kde.KWin /Scripting "org.kde.kwin.Scripting.$1" "${@:2}" >/dev/null 2>&1; }
       k unloadScript agents-focus || true
@@ -2172,9 +2261,9 @@ if ($p -and $s.AppActivate($p.Id)) { "ok" }' 10)" == ok ]]; then exit 0; fi
       d="${WSL_DISTRO_NAME:-$(wslpath -w / 2>/dev/null | sed -E 's|^\\\\wsl[^\\]*\\([^\\]*).*|\1|')}"
       cd /mnt/c 2>/dev/null || cd /
       if command -v wt.exe >/dev/null; then
-        exec wt.exe -w new --title Agents wsl.exe -d "$d" --cd "~" -- "$self"
+        exec wt.exe -w new --title ACF wsl.exe -d "$d" --cd "~" -- "$self"
       fi
-      exec cmd.exe /c start "Agents" wsl.exe -d "$d" --cd "~" -- "$self"
+      exec cmd.exe /c start "ACF" wsl.exe -d "$d" --cd "~" -- "$self"
     fi
     # The splash (afc-splash): the logo's animation in the middle of the screen, 5 seconds, and the
     # fleet's window opens once it is done, not under it. Only when no window shows the fleet yet
@@ -2190,7 +2279,7 @@ if ($p -and $s.AppActivate($p.Id)) { "ok" }' 10)" == ok ]]; then exit 0; fi
     fi
     # -q, with log_level = "Error" in alacritty.toml (it needs both): no warning bar over the fleet.
     # It goes after --class Agents: --window looks for a window by the start of this command line.
-    if command -v alacritty >/dev/null; then exec alacritty --title Agents --class Agents -q -e "$self"
+    if command -v alacritty >/dev/null; then exec alacritty --title ACF --class Agents -q -e "$self"
     else exec konsole -e "$self"; fi
     ;;
   -h|--help)

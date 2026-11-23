@@ -92,6 +92,7 @@ Everything with a button also lights up under the pointer and can be clicked, me
 | `afc-logs search WORDS` | search this project's chat log (`--all` for every project) |
 | `afc-logs threads`, `afc-logs show THREAD` | list the threads, print one |
 | `afc-logs prune-md` | remove the readable `.md` files earlier versions wrote beside the database (`--all` for every project, `--dry-run` to look first) |
+| `afc-logs time [THREAD]` | where a thread's time went: the model thinking and writing, each tool (calls, total, longest), waiting for you, and its longest steps. Worked out from the times the steps were logged at; no THREAD means this project's latest. Gemini logs most tool calls only when they end, so its tool time is partly counted as the model's |
 | `afc-rules show` | what the rule check found in this TokenOps project (`--all` for every project in the fleet) |
 | `afc-rules replay` | judge the last two weeks of chats in TokenOps projects as the check would have (`--days N`, `-v` per turn); changes nothing |
 | `afc-rules install`, `afc-rules doctor` | add the rule check's hooks to all four tools' settings (`--dry-run`, `--remove`); see what is in place |
@@ -181,9 +182,16 @@ The fleet runs no model and sits in none of these requests. It decides where an 
 
 ### 2 · The ACF agents
 
-An agent is one of the four tools running in a split of the fleet's tmux window: one tab per project, any number of splits per tab.
+An agent is one of the tools running in a split of the fleet's tmux window: one tab per project, any number of splits per tab. Four are wired in fully (Claude, Codex, Gemini, Antigravity). Two more can be started, switched to, split and restored, and show in the pane header by letter:
 
-**Starting the fleet** (`agents`, or the Agents entry in the desktop menu)
+| Agent | Letter | What it is | Accounts and sign-in | Not wired in yet |
+|---|---|---|---|---|
+| **Copilot** (`copilot`) | H | GitHub Copilot CLI (`npm install -g @github/copilot`, Node 22+) | `config/agents/accounts-copilot`: a `COPILOT_HOME` per account. `agents --as copilot:main login` | model, tokens and cost in the header; plan limits; the chat log; a council seat; the rule hooks |
+| **OpenCode** (`opencode`) | F | the terminal agent Cloudflare documents for its models (Workers AI, AI Gateway); Cloudflare has no terminal agent of its own (`npm install -g @opencode/cli`) | one line in `config/agents/accounts-opencode`: OpenCode has no folder switch and keeps several sign-ins itself. `agents --as opencode:main auth login`, then pick Cloudflare and give the account ID and API token | the same, and working / done in the tab (it keeps its chats in one database, with no file to watch); it has no start flag for plan mode |
+
+Each runs with fresh, plan (Copilot) and no-asking starts from the split menu (Alt+\\), the start menu of a new tab and the account menu (Alt+G). OpenCode is started with `--standalone`, a server of its own per pane, so it ends with its pane and stays inside the fleet's budget. The fleet tells Copilot by its command line (it is a node script whose work runs in a child called `MainThread`) and OpenCode by its program name. Both are optional: a machine without them shows neither in the menus that check.
+
+**Starting the fleet** (`agents`, or the ACF entry in the desktop menu)
 
 1. `agents` reads the project list, `~/.config/agents/projects`: one `<tab name> <folder>` per line.
 2. It starts the tmux server inside `agents.slice`, so everything started from a tab falls under the budget.
@@ -348,7 +356,7 @@ It takes under a minute (the patched tmux is compiled for the package) and write
 sudo apt install ./agentic-cli-fleet_1.0.0_amd64.deb
 ```
 
-The package puts the fleet in `/opt/agentic-cli-fleet` (tmux built, in `tmux-3.8/` there), the **Agents** entry in the app menu with the logo, and what software centres show for it. It changes no home folder. The first time a user opens Agents, the splash plays and a terminal window sets the fleet up for that user with no sudo (`_tools/first-run.sh`: `server-setup.sh` with the package's tmux, linger left off, keep-awake on); Enter then opens the fleet. After that the same entry opens the fleet, or brings its window forward.
+The package puts the fleet in `/opt/agentic-cli-fleet` (tmux built, in `tmux-3.8/` there), the **ACF** entry in the app menu with the logo, and what software centres show for it. It changes no home folder. The first time a user opens ACF, the splash plays and a terminal window sets the fleet up for that user with no sudo (`_tools/first-run.sh`: `server-setup.sh` with the package's tmux, linger left off, keep-awake on); Enter then opens the fleet. After that the same entry opens the fleet, or brings its window forward.
 
 What goes in, and what does not: this folder without `.git`, `logs/`, `dist/` and the hand-kept `.bak` copies. The lists under `config/agents/` go in as templates (each tool's default account, named `main`; no projects, no labels, no chat-log folders), and the two places that name this machine's paths are made general. The build stops if any of this machine's paths is still in the package. The maintainer field is the repository's git author unless `ACF_DEB_MAINTAINER` says otherwise.
 

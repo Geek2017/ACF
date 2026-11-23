@@ -18,11 +18,11 @@
 #                                      terminal window with the splash in front
 #   /usr/share/applications/agents.desktop, /usr/share/icons/hicolor/*/apps/acf.png,
 #   /usr/share/metainfo/io.github.acf.agents.metainfo.xml
-#                                      the "Agents" app-menu entry with the logo, and what software
+#                                      the "ACF" app-menu entry with the logo, and what software
 #                                      centres show for the package (name, summary, logo)
 # Installing it changes nothing in any home folder; the first run does that, as the user, with no
 # sudo (first-run.sh). The per-user launcher it installs (~/.local/share/applications/agents.desktop)
-# has the same name, so the menu keeps one "Agents" entry.
+# has the same name, so the menu keeps one "ACF" entry.
 #
 # Staged on ext4 (~/.cache/acf-deb): an NTFS folder cannot hold the modes dpkg-deb insists on.
 # Installs nothing. Install the result with:  sudo apt install ./dist/agentic-cli-fleet_<VERSION>_amd64.deb
@@ -118,7 +118,7 @@ fi
 install -d "$STAGE/usr/bin"
 cat > "$STAGE/usr/bin/$PKG" <<EOF
 #!/bin/sh
-# Agentic CLI Fleet (from the .deb): what the "Agents" entry in the app menu runs.
+# Agentic CLI Fleet (from the .deb): what the "ACF" entry in the app menu runs.
 # Set up for this user already: open the fleet window, or bring it forward (agents --window).
 # Not yet: set the fleet up first ($OPT/_tools/first-run.sh), in a terminal window, with the
 # splash in front. Nothing here needs sudo.
@@ -145,7 +145,7 @@ install -d "$STAGE/usr/share/applications"
 cat > "$STAGE/usr/share/applications/agents.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Agents
+Name=ACF
 GenericName=Agentic CLI Fleet
 Comment=Agentic CLI Fleet: one tab per project, the agents already running
 Exec=/usr/bin/$PKG
@@ -157,7 +157,7 @@ StartupWMClass=Agents
 Actions=new-window;
 
 [Desktop Action new-window]
-Name=New Agents Window (another monitor)
+Name=New ACF Window (another monitor)
 Exec=/usr/bin/$PKG --new-window
 EOF
 for d in "$HERE"/share/icons/hicolor/*/apps/acf.png; do
@@ -195,7 +195,7 @@ Agentic CLI Fleet for Ubuntu
 
 The fleet lives in $OPT. Installing the package changes no home folder.
 
-The first time a user opens "Agents" from the app menu (or runs $PKG), it sets the fleet
+The first time a user opens "ACF" from the app menu (or runs $PKG), it sets the fleet
 up for that user, with no sudo ($OPT/_tools/first-run.sh): its programs are linked into
 ~/.local/bin, its tmux config, launcher, logo, lists and systemd user units are put in place,
 the patched tmux the package brings is used ($OPT/tmux-3.8), Claude Code is installed when it
@@ -246,7 +246,7 @@ Description: coding agents side by side, one tab per project
  from slowing the machine, a chat log keeps every conversation in its project,
  and the council lets several models discuss one question.
  .
- Open "Agents" from the app menu: the first time, it sets the fleet up for
+ Open "ACF" from the app menu: the first time, it sets the fleet up for
  your user (no sudo); after that it opens the fleet.
 EOF
 cat > "$STAGE/DEBIAN/postinst" <<EOF
@@ -254,7 +254,7 @@ cat > "$STAGE/DEBIAN/postinst" <<EOF
 set -e
 if [ "\$1" = configure ]; then
   echo "Agentic CLI Fleet $VERSION is in $OPT."
-  echo "Open \"Agents\" from the app menu (or run $PKG): the first time, it sets the fleet up for you."
+  echo "Open \"ACF\" from the app menu (or run $PKG): the first time, it sets the fleet up for you."
 fi
 exit 0
 EOF

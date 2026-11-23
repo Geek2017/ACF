@@ -1,0 +1,4 @@
+# GitHub Copilot CLI accounts for the fleet: <name> <COPILOT_HOME folder>. ~/.copilot is the default.
+# Add a line, then sign it in: agents --as copilot:<name> login
+# A new home gets ~/.copilot/mcp-config.json linked in (MCP servers); its sign-in and chats are its own.
+main     ~/.copilot
