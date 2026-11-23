@@ -10,7 +10,8 @@ the fleet from this folder needs no Pillow):
                                               dark panel without one)
   share/acf/acf.ico                           the same for Windows (the Windows Terminal profile)
   share/acf/splash.png + splash.json          every frame side by side, cut to the part that ever
-                                              shows, and each frame's time: what afc-splash plays
+                                              shows, 120 px high, and each frame's time: what
+                                              afc-splash plays (it fits the whole to 5 seconds)
 
 Needs Pillow (python3-pil). Run it again after logo.png changes:
     python3 _tools/build-logo.py [--check]      --check: say what is out of date, write nothing
@@ -25,7 +26,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGO = os.path.join(HERE, "logo.png")
 SIZES = (16, 22, 24, 32, 48, 64, 128, 256, 512)
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
-SPLASH_SCALE = 0.5            # 1440x960 frames -> the splash's logo is about 370x280
+SPLASH_H = 120                # the splash's logo is this many pixels high (a small card, beside the name)
 
 
 def frames(path):
@@ -88,8 +89,8 @@ def build(check=False):
     pad = 12
     box = (max(0, box[0] - pad), max(0, box[1] - pad), min(fr[0][0].width, box[2] + pad),
            min(fr[0][0].height, box[3] + pad))
-    w = round((box[2] - box[0]) * SPLASH_SCALE)
-    h = round((box[3] - box[1]) * SPLASH_SCALE)
+    k = SPLASH_H / (box[3] - box[1])
+    w, h = round((box[2] - box[0]) * k), SPLASH_H
 
     def strip(d):
         s = Image.new("RGBA", (w * len(fr), h), (0, 0, 0, 0))

@@ -17,4 +17,4 @@
 #ram-wall 90          # ... nor once the whole machine's RAM is this full (R: in the bottom bar); 0 = no wall
 #cpu-wall 90          # no agent added by hand (split, agents --add) once the machine's CPU is this busy
                       # (C: in the bottom bar); agents coming back after a restart are let through; 0 = no wall
-#splash on            # the logo's animation in the middle of the screen while the fleet window opens (afc-splash)
+#splash on            # the logo's animation (5 s) in the middle of the screen before the fleet window opens (afc-splash)

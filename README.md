@@ -287,7 +287,7 @@ What a turn leaves behind, and where.
 | `bin/afc-reflow`, `bin/afc-gap` | | make Claude redraw after a resize, and close the gap its pop-ups leave |
 | `bin/afc-longcopy`, `bin/afc-model-menu` | | long copy, and the Alt+M menu |
 | `bin/afc-copy` | | what a mouse copy puts on the clipboard: the text without the agent's quote bar, marks and margin, with the lines the pane's width broke joined again (it is tmux's `copy-command`). Short lines of code, list items and tables keep their breaks. Shift+drag is still Alacritty's own selection: the screen exactly as shown |
-| `bin/afc-splash` | | the splash: the logo's animation on a white card while the fleet window opens and no window shows the fleet yet, and during the `.deb`'s first run. `splash off` in `settings` turns it off |
+| `bin/afc-splash` | | the splash: a small white rectangle with the logo's animation, the name, and a bar that fills over 5 seconds. It plays when the fleet window opens and no window shows the fleet yet, and the window opens once it is done; also during the `.deb`'s first run. A click or Esc ends it sooner; `splash off` in `settings` turns it off |
 | `bin/autonice`, `bin/jobq`, `bin/keepawake-agents` | copy: `~/.local/bin/` | the resource guard: renices, caps and queues heavy jobs; keeps the machine awake while agents work |
 | `lib/afc/pb.py` | link: `~/.local/lib/afc/` | reads Antigravity's binary records |
 | `tmux/tmux.conf` | link: `~/.tmux.conf` | all keys, bars, hooks and the scrollbar |
