@@ -20,6 +20,7 @@
 #   agents --as <acct> [..] run Claude on that account in any terminal (sign one in: agents --as company, /login)
 #   agents --as gemini:<acct> | codex:<acct> [..]  the same for Gemini (then /auth) and Codex (agents --as codex:<acct> login)
 #   agents --express [project]  the express lane: list it, or put a project's tab on it / off it (Alt+E in the tab)
+#   agents --view [compact|classic] [pane|all]  how Claude draws its chat: compact folds a turn's steps into one line
 #
 # Project list: ~/.config/agents/projects — one per line: <name> <folder>
 # Accounts:     ~/.config/agents/accounts        — one per line: <name> <Claude config folder>   (CLAUDE_CONFIG_DIR)
@@ -193,6 +194,7 @@ BYPASS=--allow-dangerously-skip-permissions
 #   cpu-wall <percent>       no new agent by hand once the machine's CPU is this busy (C: in the
 #                            bar); agents coming back after a restart are let through            (90)
 #   splash on|off            the logo's animation (5 s) before the fleet window opens (afc-splash) (on)
+#   claude-view classic|compact   how Claude draws its chat in the panes it is started in  (classic)
 SETTINGS="${AGENTS_SETTINGS:-$HOME/.config/agents/settings}"
 setting() {  # name default -> its value
   local n v _
@@ -203,6 +205,26 @@ setting() {  # name default -> its value
   fi
   echo "$2"
 }
+
+# How Claude draws its chat in the fleet's panes: `claude-view` in the settings.
+#   classic  every command and its output in the chat, which stays in tmux's history, so the
+#            scrollbar on the pane's right edge has the chat
+#   compact  a turn's steps folded into one line ("Read 4 files, ran 2 shell commands"), the step
+#            running now with its seconds, then the answer. It is Claude's focus view, which only
+#            its full-screen display has; the chat then scrolls inside Claude (the wheel, PgUp and
+#            PgDn; Ctrl+O shows the steps, /focus switches the folding off and on), and the tmux
+#            scrollbar has nothing for that pane.
+# It rides on $BYPASS, so every way the fleet starts Claude gets it, and it is asked for on the
+# command line, so ~/.claude/settings.json and Claude outside the fleet stay as they are. A
+# settings FILE, not JSON in the line: the line also goes through tmux and bash -c, where the
+# quotes would be eaten. Read when an agent starts: one that is running keeps the view it has.
+if [[ "$(setting claude-view classic)" == compact ]]; then
+  VIEWFILE="$HOME/.config/agents/claude-compact.json"
+  if [[ "$VIEWFILE" != *[[:space:]]* ]]; then
+    [[ -s "$VIEWFILE" ]] || printf '{"tui": "fullscreen", "viewMode": "focus"}\n' > "$VIEWFILE" 2>/dev/null || true
+    if [[ -s "$VIEWFILE" ]]; then BYPASS="$BYPASS --settings $VIEWFILE"; fi
+  fi
+fi
 
 # The memory wall. agents.slice slows the whole fleet down once it passes MemoryHigh, so one more
 # agent there does not get its own memory: it makes every agent already running crawl. Past that
@@ -1261,6 +1283,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     acct=$(current_account)
     case "$what" in
       claude|plan|bypass) acct="${4:-$(pane_account "${3:-0}")}" ;;   # the pane it was split from decides
+      resume) acct="${5:-$acct}" ;;                                   # resume <pid> <chat> [account]: --view keeps the pane's own
       gemini*) acct="${4:-$(tool_current gemini)}" ;;   # gemini|gemini-plan|gemini-bypass <pid> [account]
       codex*)  acct="${4:-$(tool_current codex)}" ;;
       agy*)    acct="${4:-$(tool_current agy)}" ;;
@@ -1712,6 +1735,41 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$cwd" "$HOME/.local/bin/agents $run"
     t display-message "This pane is now $who"
     ;;
+  --view)
+    # agents --view                         say which view the settings ask for
+    # agents --view compact|classic         write claude-view to the settings: every Claude the fleet
+    #                                       starts from now on uses it
+    # agents --view compact|classic <pane>|all   ... and restart the Claude in that pane (or in every
+    #                                       pane) so it shows that way now: in its own chat, on the
+    #                                       account it is on. A Claude that is working is left alone;
+    #                                       it gets the view the next time it starts.
+    want="${2:-}"; which="${3:-}"
+    if [[ -z "$want" ]]; then echo "claude-view: $(setting claude-view classic)"; exit 0; fi
+    [[ "$want" == compact || "$want" == classic ]] || { echo "Usage: agents --view [compact|classic] [pane|all]" >&2; exit 2; }
+    mkdir -p "${SETTINGS%/*}"; touch "$SETTINGS"
+    if grep -q '^claude-view[[:space:]]' "$SETTINGS"; then sed -i "s/^claude-view[[:space:]].*/claude-view $want/" "$SETTINGS"
+    else printf 'claude-view %s\n' "$want" >> "$SETTINGS"; fi
+    echo "claude-view is now $want: every Claude the fleet starts from now on uses it."
+    [[ -n "$which" ]] || exit 0
+    fleet_up || { echo "The fleet is not running: nothing to restart."; exit 0; }
+    [[ "$which" == all ]] || which="%${which#%}"
+    done_n=0; busy_n=0
+    while IFS=$'\t' read -r pane pid busy; do
+      [[ "$which" == all || "$which" == "$pane" ]] || continue
+      read -r p kind < <(pane_agent "$pid") || continue
+      [[ "$kind" == claude ]] || continue
+      if [[ "$busy" == 1 ]]; then busy_n=$((busy_n + 1)); continue; fi
+      cdir=$(claude_dir "$p"); acct=$(account_name "$cdir" || true)
+      chat=$(jq -r '.sessionId // empty' "$cdir/sessions/$p.json" 2>/dev/null || true)
+      [[ "$chat" =~ ^[A-Za-z0-9-]+$ ]] || chat=last
+      pf "$p"; cwd=$(readlink "$PROC/$p/cwd" 2>/dev/null || true)
+      [[ -d "$cwd" ]] || continue
+      t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$cwd" "$HOME/.local/bin/agents --pane resume 0 $chat $acct"
+      done_n=$((done_n + 1))
+    done < <(t list-panes -a -F $'#{pane_id}\t#{pane_pid}\t#{?#{@busy},#{@busy},0}')
+    echo "$done_n Claude pane(s) restarted in the $want view, each in its own chat."
+    if (( busy_n )); then echo "$busy_n left alone: working now. They get it at their next start, or run this again when they are done."; fi
+    ;;
   --close)
     # Alt+Q, after its y/n: close that pane. When it is the last pane of a project tab (@project), the
     # project leaves the list too, so a restart doesn't reopen it (back with: agents --add <folder>).
@@ -1935,7 +1993,10 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       done
       if [[ -z "$lack" ]]; then ok "Claude: the five hooks call agents --mark"; else no "Claude: no agents --mark hook for:$lack" "merge config/claude/settings.fleet-keys.json into ~/.claude/settings.json"; fi
       if jq -e '.statusLine.command | test("afc-statusline")' "$cs" >/dev/null 2>&1; then ok "Claude: the status line is afc-statusline"; else no "Claude: the status line is not afc-statusline, so pane headers lack model, tokens and cost"; fi
-      if [[ "$(jq -r '.tui // empty' "$cs" 2>/dev/null)" == default ]]; then ok "Claude: classic mode (tui default), so the scrollbar has the chat"; else note "Claude: \"tui\" is not \"default\": the tmux scrollbar will have nothing to scroll"; fi
+      if [[ "$(setting claude-view classic)" == compact ]]; then
+        if [[ -s "$HOME/.config/agents/claude-compact.json" ]]; then ok "Claude: compact view (claude-view compact): steps folded, the chat scrolls inside Claude, the tmux scrollbar is empty for its panes"
+        else no "Claude: claude-view is compact but ~/.config/agents/claude-compact.json could not be written, so panes start in the classic view"; fi
+      elif [[ "$(jq -r '.tui // empty' "$cs" 2>/dev/null)" == default ]]; then ok "Claude: classic mode (tui default), so the scrollbar has the chat"; else note "Claude: \"tui\" is not \"default\": the tmux scrollbar will have nothing to scroll"; fi
     else no "~/.claude/settings.json is missing"; fi
     if grep -qs 'agents --mark' "$HOME/.gemini/settings.json"; then ok "Gemini: hooks call agents --mark"; else note "Gemini: no agents --mark hook in ~/.gemini/settings.json: its tab signals are estimated from its chat file, and it sends no notification"; fi
     note "Codex needs no hook (the watcher reads each turn's start and end from its session file); Antigravity's tab signals are estimated"

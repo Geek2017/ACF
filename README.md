@@ -76,6 +76,7 @@ Everything with a button also lights up under the pointer and can be clicked, me
 | `agents --fresh` | start with one pane per project instead of the saved splits |
 | `agents --layout` | show the saved tabs and splits: what the next start reopens |
 | `agents --overview` | every agent in one list: tab, working / waiting / done, tokens, cost, limits |
+| `agents --view [compact\|classic] [pane\|all]` | how Claude draws its chat: `compact` folds each turn's steps into one line (Claude's focus view), `classic` shows every command and keeps the tmux scrollbar; with a pane or `all`, restarts the idle Claude panes in that view |
 | `agents --express [project]` | list the express lane, or put a project's tab on it / take it off (the same as Alt+E); kept in `~/.config/agents/express`, applied again when the tab is opened, restored or split |
 | `agents --worktrees` | the work folders made for splits; `--prune` removes the finished ones |
 | `agents --doctor` | check that links, hooks, services and the watcher are in place; changes nothing |
@@ -382,7 +383,7 @@ A Mac differs enough to need three pieces of its own. Its bash is 3.2 and the pr
 
 ## Things that will bite
 
-- **Claude runs in classic mode** (`"tui": "default"`): that is what lets tmux keep the chat history for the scrollbar. The price is that Claude does not re-wrap on its own; `afc-reflow` and `afc-gap` press Ctrl+L for it.
+- **Claude runs in classic mode** (`"tui": "default"`): that is what lets tmux keep the chat history for the scrollbar. The price is that Claude does not re-wrap on its own; `afc-reflow` and `afc-gap` press Ctrl+L for it. **Or the compact view** (`claude-view compact` in `settings`, or `agents --view compact`): the fleet then starts Claude on its full-screen display in focus view, where a turn's steps fold into one line ("Read 4 files, ran 2 shell commands"), the step running now shows with its seconds, and the answer follows. The chat scrolls inside Claude there (the wheel, PgUp, PgDn; Ctrl+O shows the steps; `/focus` switches the folding), the tmux scrollbar has nothing for that pane, and a mouse copy reaches only what is on screen. It is asked for on Claude's command line (`--settings ~/.config/agents/claude-compact.json`), so `~/.claude/settings.json` and Claude outside the fleet stay classic. `agents --view compact all` restarts the idle Claude panes in it, each in its own chat; a working one is left alone.
 - **A chat belongs to an account.** A restart reopens each chat on the account that owns it, and a new split takes the account of the pane it came from. Resuming a chat on another organisation's account makes Claude drop its earlier thinking.
 - **A fleet restart stops every agent.** Tabs, splits and chats come back (the saved layout, above). The step an agent was in the middle of, jobs in terminal splits and a maximised split do not, and a terminal split comes back as an empty shell in its folder. A split that ran with no permission prompts comes back in normal mode on purpose: nothing should run unasked after a restart you may not have watched.
 - **A work folder starts from the last commit.** Changes not yet committed in the project are not in it, and neither is anything git ignores (`node_modules`, `.env`), so the agent there may have to install first.
