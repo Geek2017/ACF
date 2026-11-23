@@ -19,14 +19,27 @@ raw take: no flattery, no hedging, disagree by name.
                        each speaking to the others' answers (the default)
   /mode roast          everyone gives a point at once, then they roast each other, round after round,
                        each answering what was just said about it, until you press Ctrl+C
-  /rounds N            order mode: passes round the table after the answers (0 to 5; default 1);
-                       roast mode: roast rounds per message (0 = until Ctrl+C, the default)
+  /rounds N            order mode: passes round the table after the answers (0 = until Ctrl+C or
+                       everyone passes, the default; none = answers only); roast mode: roast rounds
+                       per message (0 = until Ctrl+C, the default)
+  /names model|llm     what an LLM goes by: the model it runs on (@opus, @gpt-6-astra; the default) or
+                       its own name (@claude); agents with a character keep theirs. Kept per project
   /length N            answers of at most N words (default 60: two or three sentences); kept
   /topic TEXT          what the meeting is about (else your first message is)
-  /agent new NAME LLM PERSONA…   make an agent. LLM: claude | codex | gemini | agy, with an
+  /agent new NAME LLM CHARACTER [|| SOUL || RULES]   make an agent (its soul, character, rules and memory
+                       go in <project>/agents/NAME/, read before every answer; edit them there). LLM: claude | codex | gemini | agy, with an
                        account and a model if you like: claude@others:opus, codex:gpt-5.5
+  /lean @name opposition|government|free   where a member stands (any member, an LLM's seat too; @all
+                       for everyone): always against the chair, for the chair and its agenda, or no side
+                       (free will, the default). Alt+M on its pane: O, G, F. /agent lean NAME … the same
+  /agent power NAME remove [on|off]   let an agent remove members on its own judgement (it ends an
+                       answer with "Remove: @name - why"): an agent is deleted and its memory wiped; an
+                       LLM's own seat leaves the table
   /agent del NAME      remove one       /agents   who is at the table, and on what
   /bench NAME, /seat NAME   take a member off the table for now, or back (also an LLM: /seat agy)
+  /remove all          everyone off the table, as ✕ on each would (+ add: Remove everyone…)
+  /remove NAME         what ✕ on a member's header does: an agent you made is deleted for good (from
+                       every council; + add makes a new one); an LLM's own seat is benched
   /model @name MODEL   the model that member runs on (@all for everyone; `default` to go back)
   /effort @name LEVEL  how hard it thinks: low medium high xhigh max (Codex: minimal..xhigh;
                        Gemini has no such setting, only the model). /model or /effort alone: who
@@ -34,10 +47,12 @@ raw take: no flattery, no hedging, disagree by name.
   /perm plan|edit|bypass   what members may do in this folder: plan reads only (the default), edit
                        may change files but runs no command, bypass may do anything with no asking.
                        /perm @name … for one member (also in Alt+M on its pane); shown in the headers
+  /view one|grid       one pane with everyone's answers (yours on the right), or one pane per member
+                       (the default). Alt+O in the chat box switches; kept per project
   /grid on|off         one pane per member, each with its own scroll of the thread (on by itself
                        in the council's own tab); off: every answer in full in this pane
-  /new [TOPIC]         a new meeting (the old one stays saved; Alt+T: what is typed is its topic). A council opened in a folder
-                       carries on that folder's last meeting: everyone remembers it
+  /new [TOPIC]         a new meeting, in a folder of its own (the old one stays saved; Alt+T: what is typed is its
+                       topic). A council opened in a folder carries on that folder's last meeting: everyone remembers it
   /resume              carry on an earlier meeting instead (a list; /resume N picks one)
   /retry [@name]       ask again a member whose run went wrong (all of those, without a name). A run
                        that goes wrong is told on the note line with what to do; twice in a row, a
@@ -48,8 +63,16 @@ Members only read: files in this folder (and the web, where the LLM can), never 
 is one non-interactive run of that LLM's own program, so it counts against that account's plan like
 any chat. Before each run the fleet's memory walls are asked (`agents --room`); a member that would
 not fit is skipped and the thread says why. Roast mode runs up to `parallel` members at once
-(default 3). The meeting is saved after every round as <project>/logs/council/<date>_<topic>.md
-(ignored by git, like logs/acf). Made agents and settings: ~/.config/agents/council.json.
+(default 3).
+
+Where it is kept. Each meeting is a folder of its own, made when the council opens and named by the
+time and, from the first message, its topic: <project>/logs/council/<date>_<time>_<topic>/, with
+thread.md to read and thread.json to carry it on (logs/council/ is ignored by git, like logs/acf). A
+meeting nobody spoke in leaves no folder. A council about no project (Alt+Shift+K) keeps its meetings
+in ~/Council/<date>_<time>_<topic>/, and its members work in that folder. Each project's settings
+(mode, permission, models, efforts, who sits at the table) are its own: <project>/logs/council/
+settings.json (~/Council/settings.json); a project's council starts read-only (plan), whatever another
+project's is set to. Made agents are shared by every council: ~/.config/agents/council.json.
 
   afc-council [--dir FOLDER] [--from-pid PID]     the chat (Alt+K starts it with the pane's pid)
   afc-council --open <session> <pane pid>         what Alt+K runs: a new tab with the chat in it
@@ -76,11 +99,19 @@ import tempfile
 import textwrap
 import threading
 import time
+import traceback
+import unicodedata
 
 HOME = os.path.expanduser("~")
 AGENTS = os.environ.get("AFC_COUNCIL_AGENTS") or os.path.join(HOME, ".local/bin/agents")
 CONF = os.environ.get("AFC_COUNCIL_CONF") or os.path.join(HOME, ".config/agents/council.json")
+GENERAL = os.environ.get("AFC_COUNCIL_GENERAL") or os.path.join(HOME, "Council")   # Alt+Shift+K: about no project
+# Kept per project (in its council folder), not in CONF: what one project's council is set to never
+# reaches another's (a Bypass in one leaves every other at Plan).
+LOCAL = ("mode", "perm", "words", "llm", "seats", "agent_perm", "names", "view")
+STAMP = re.compile(r"\d{4}-\d\d-\d\d_\d{4}(-\d+)?")      # a session folder not named by its topic yet
 TOOLS = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "agy": "Antigravity"}
+NAMES = {"by": "model"}   # /names: a member that is not an agent with a character goes by its model (or "llm")
 ALIAS = {"antigravity": "agy", "google": "gemini", "openai": "codex", "gpt": "codex", "anthropic": "claude"}
 KEEP_CHARS = 60000          # the thread each member reads is cut to the newest this many characters
 # What /effort takes per LLM (Gemini's command line has none: its model is the only setting), and
@@ -92,6 +123,121 @@ MODELS = {"claude": ["opus", "fable", "sonnet", "haiku", "claude-opus-5-5", "cla
           "codex": ["gpt-6-astra"],
           "gemini": ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-3.8-flash"],
           "agy": ["gemini-4-neon-high", "gemini-4-argon-high", "gemini-4-hydrogen-high", "gemini-3.8-flash-high"]}
+# Claude's short names stand for its newest models: the same model, so never two at the table
+CLAUDE_ALIAS = {"claude-opus-5-5": "opus", "claude-fable-5-2": "fable", "claude-sonnet-5-5": "sonnet",
+                "claude-haiku-5-5": "haiku"}
+MODEL_KEYS = "123456789ijkpqsuvyz"   # menu keys for models (the letters the menus use for other things left out)
+
+
+def canon(model):
+    """A model's one name, to tell whether two members run the same model: Claude's alias for its full
+    name, an effort in brackets or as a suffix taken off (Antigravity: "Gemini 4 Neon (XHigh)",
+    "gemini-4-neon-high"). '' for a model not known."""
+    if not model or model == "default model":
+        return ""
+    m = handle_of(re.sub(r"\s*\([^)]*\)\s*$", "", model))
+    m = re.sub(r"-(minimal|low|medium|high|xhigh|max|ultra)$", "", m)
+    return CLAUDE_ALIAS.get(m, m)
+
+
+MODEL_CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "afc-council",
+                           "models.json")
+
+
+def version_key(model):
+    """Newest first: the numbers in a model's name, biggest first (a date at the end left out)."""
+    nums = [int(n) for n in re.findall(r"\d+", re.sub(r"-\d{8}$", "", model)) if len(n) < 5]
+    return [-n for n in nums] + [0] * (4 - len(nums))
+
+
+def models_for(tool, home=None):
+    """Every model version that LLM can run, newest first, each once, for the menus. Each from that LLM's
+    own word where it keeps one: Codex, the list its account shows (models_cache.json); Claude, the models
+    its account knows (.claude.json); Antigravity, `agy models`; Gemini, the models its program names
+    (those two read in the background when a council opens, see refresh_models). Else the list here."""
+    found = []
+    if tool == "codex":
+        for h in [x for x in (home, os.path.join(HOME, ".codex")) if x]:
+            d = read_json(os.path.join(h, "models_cache.json"))
+            found = [m.get("slug") for m in (d.get("models") or [])
+                     if isinstance(m, dict) and m.get("slug") and m.get("visibility", "list") == "list"]
+            if found:
+                return found
+    elif tool == "claude":
+        for f in [os.path.join(h, ".claude.json") for h in (home, os.path.dirname(home or "")) if h] + \
+                [os.path.join(HOME, ".claude.json")]:
+            ids = [k for k in (read_json(f).get("additionalModelCostsCache") or {}) if k.startswith("claude-")]
+            if ids:
+                fam = {"opus": 0, "fable": 1, "sonnet": 2, "haiku": 3}
+                found = sorted(ids, key=lambda k: [fam.get(k.split("-")[1], 9)] + version_key(k))
+                break
+    else:
+        found = read_json(MODEL_CACHE).get(tool) or []
+        if tool == "gemini":
+            found = sorted(set(found) | set(MODELS["gemini"]), key=lambda k: version_key(k) + [len(k)])
+    out, seen = [], {}
+    for m in found or MODELS.get(tool, []):
+        c = canon(m)
+        if c not in seen:
+            seen[c] = len(out)
+            out.append(m)
+        elif tool == "agy" and m.endswith("-high"):        # Antigravity: each model once, at its high effort
+            out[seen[c]] = m
+    return out
+
+
+def model_label(model):
+    """How a model shows in the menus: Claude's short name beside its version."""
+    a = CLAUDE_ALIAS.get(model)
+    return f"{model}  ({a})" if a else model
+
+
+def refresh_models():
+    """When a council opens, in the background: the models Antigravity offers (`agy models`) and the ones
+    the Gemini CLI names, kept in MODEL_CACHE for the menus, read again only when that program changed."""
+    if os.environ.get("AFC_COUNCIL_NO_REFRESH"):       # the tests: never ask the real programs
+        return
+    data, changed = read_json(MODEL_CACHE), False
+    agy = shutil.which("agy") or os.path.join(HOME, ".local/bin/agy")
+    try:
+        st = os.stat(agy)
+        stamp = f"{st.st_mtime_ns}-{st.st_size}"
+    except OSError:
+        stamp = ""
+    if stamp and data.get("agy_stamp") != stamp:
+        try:
+            out = subprocess.run([agy, "models"], capture_output=True, text=True, timeout=90,
+                                 env=child_env()).stdout
+            ids = [x.split("\t")[0].strip() for x in out.splitlines() if "\t" in x and x.split("\t")[0].strip()]
+            if ids:
+                data["agy"], data["agy_stamp"], changed = ids, stamp, True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    gem = shutil.which("gemini")
+    bundle = os.path.dirname(os.path.realpath(gem)) if gem else ""
+    try:
+        stamp = str(os.stat(os.path.join(bundle, "gemini.js")).st_mtime_ns) if bundle else ""
+    except OSError:
+        stamp = ""
+    if stamp and data.get("gemini_stamp") != stamp:
+        names = set()
+        for f in os.listdir(bundle):
+            if f.endswith(".js"):
+                try:
+                    with open(os.path.join(bundle, f), errors="replace") as fh:
+                        names |= set(re.findall(r'"(gemini-\d+(?:\.\d+)?-(?:pro|flash|flash-lite)(?:-preview)?)"',
+                                                fh.read()))
+                except OSError:
+                    pass
+        if names:
+            data["gemini"], data["gemini_stamp"], changed = sorted(names), stamp, True
+    if changed:
+        try:
+            write_json(MODEL_CACHE, data)
+        except OSError:
+            pass
+
+
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"          # the thinking animation
 MAX_SEATS = 9       # members at the table at once (a 3 x 3 grid)
 CHAT_LINES = 4      # the chat box under the grid: what you type, and the thinking line
@@ -99,7 +245,10 @@ TMUXBIN = os.path.join(HOME, ".local/bin/tmux") if os.access(os.path.join(HOME, 
 ME = os.path.join(HOME, ".local/bin/afc-council")
 TTY = sys.stdout.isatty()
 C = {"rule2": "38;5;110", "rule": "38;5;60", "chair": "1;37", "claude": "38;5;173", "codex": "38;5;114", "gemini": "38;5;75", "agy": "38;5;141",
-     "agent": "38;5;221", "note": "38;5;244", "err": "38;5;203", "you": "38;5;252"}
+     "agent": "38;5;221", "note": "38;5;244", "err": "38;5;203", "you": "38;5;252",
+     # a member whose own colour is taken: cyan, pink, lime, tan, sky, peach, periwinkle, sea green
+     "x1": "38;5;80", "x2": "38;5;211", "x3": "38;5;150", "x4": "38;5;180", "x5": "38;5;117", "x6": "38;5;216",
+     "x7": "38;5;147", "x8": "38;5;72"}
 
 
 def paint(text, kind):
@@ -124,23 +273,132 @@ def fit(text, n):
     return t if len(t) <= n else t[:max(0, n - 1)] + "…"
 
 
+# The box grows with what you type: a line that is full goes on to the next one, and the pane is made
+# taller to hold it (up to TYPE_MAX lines), as Claude Code's does. The lines you type on are the
+# terminal's scrolling region, so text never runs over the rules or the note line. When the pane
+# changes size, the box is drawn again and readline puts the line back from its start (its own redraw
+# after a resize starts on the line's last row and walked the text down the box).
+TYPE_MAX = 8
+NOTE_ROW = lambda: BOX.get("rows", 1) + 3      # noqa: E731  (rule, the typing rows, rule, note)
+
+
+def rl_lib():
+    """GNU readline's own functions, for drawing the line again from its start; None where there is
+    no GNU readline (a Mac's libedit): there the box stays one line."""
+    if "libedit" in (readline.__doc__ or ""):
+        return None
+    try:
+        import ctypes
+        lib = ctypes.CDLL(readline.__file__)
+        lib.rl_forced_update_display, lib.rl_set_screen_size     # both there, or no growing
+        return lib
+    except (OSError, AttributeError, ImportError):
+        return None
+
+
+RL = [None]
+CRASHLOG = [None]
+
+
 def draw_frame():
     """The box's rules and note line again (the pane changed size), the line being typed left alone."""
     cols = max(20, shutil.get_terminal_size((80, 4)).columns)
     BOX["cols"] = cols
     rule = paint("─" * cols, "rule")
-    sys.stdout.write("\0337\033[1;1H\033[K" + rule + "\033[3;1H\033[K" + rule + "\033[4;1H\033[K" +
+    r = BOX.get("rows", 1)
+    sys.stdout.write("\0337\033[1;1H\033[K" + rule + f"\033[{r + 2};1H\033[K" + rule + f"\033[{r + 3};1H\033[K" +
                      paint(fit(BOX["note"], cols - 1), "note") + "\0338")
     sys.stdout.flush()
 
 
 def draw_box():
+    if FEED["grid"] and GRID[0] and GRID[0].me and shutil.get_terminal_size((80, 4)).lines != CHAT_LINES:
+        BOX.pop("asked", None)
+        tmx("resize-pane", "-t", GRID[0].me, "-y", str(CHAT_LINES))     # back to one line to type on
     cols = max(20, shutil.get_terminal_size((80, 4)).columns)
-    BOX["cols"] = cols
+    BOX["cols"], BOX["rows"] = cols, 1
     rule = paint("─" * cols, "rule")
-    sys.stdout.write("\033[2J\033[H" + rule + "\n\n" + rule + "\n" + paint(fit(BOX["note"], cols - 1), "note") +
+    sys.stdout.write("\033[r\033[2J\033[H" + rule + "\n\n" + rule + "\n" + paint(fit(BOX["note"], cols - 1), "note") +
                      "\033[2;1H")
     sys.stdout.flush()
+
+
+def typed_rows():
+    """How many lines what is being typed takes ("> " and the text, wide characters counting two),
+    with a few columns to spare so the next line is there before the text reaches it."""
+    cols = BOX.get("cols") or 80
+    w = 2 + sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in readline.get_line_buffer())
+    return max(1, min(TYPE_MAX, (w + 3) // cols + 1))
+
+
+def grow():
+    """From the animation thread: ask tmux for the height the typing needs (the resize comes back as
+    SIGWINCH, and relayout draws the box)."""
+    if not (RL[0] and BOX["on"] and INPUT.get("rl") and FEED["grid"] and GRID[0] and GRID[0].me):
+        return
+    want = typed_rows()
+    if want != BOX.get("rows", 1) and want != BOX.get("asked"):
+        BOX["asked"] = want
+        tmx("resize-pane", "-t", GRID[0].me, "-y", str(want + 3))
+
+
+def errlog(what):
+    """Something went wrong where it cannot be shown (a signal handler, the typing line): kept in
+    $XDG_RUNTIME_DIR/afc-council/errors.log with its traceback, and said on the note line."""
+    try:
+        d = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "afc-council")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "errors.log"), "a") as f:
+            f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} pid {os.getpid()}: {what}\n{traceback.format_exc()}\n")
+    except OSError:
+        pass
+
+
+def in_callback(fn):
+    """readline calls this Python function in the middle of its own work (completing, listing, before
+    the line): a resize that comes meanwhile waits until readline is idle again (see relayout)."""
+    def run(*args):
+        INPUT["cb"] = INPUT.get("cb", 0) + 1
+        try:
+            return fn(*args)
+        finally:
+            INPUT["cb"] -= 1
+    return run
+
+
+def relayout(sig=None, frame=None):
+    """SIGWINCH while you type in the box (run between keystrokes, in the main thread): the box drawn
+    for the pane's new size, and readline's line put back from the box's first typing row. Never
+    while readline is running one of our callbacks (calling back into it there could break it): then
+    it is left for the animation thread to signal again. Nothing it does may raise into input()."""
+    if not (BOX["on"] and INPUT.get("rl") and TTY):
+        return
+    if INPUT.get("cb"):
+        BOX["relayout"] = True
+        return
+    try:
+        relayout_()
+    except Exception:  # noqa: BLE001
+        errlog("redrawing the chat box")
+
+
+def relayout_():
+    size = shutil.get_terminal_size((80, 4))
+    cols, h = max(20, size.columns), max(4, size.lines)
+    r = max(1, min(TYPE_MAX, h - 3))
+    BOX["cols"], BOX["rows"] = cols, r
+    BOX.pop("asked", None)           # what was asked for has come (or the size changed some other way)
+    rule = paint("─" * cols, "rule")
+    with LOCK:
+        out = "\033[r\033[2J\033[1;1H" + rule + f"\033[{r + 2};1H" + rule + f"\033[{r + 3};1H" + \
+            paint(fit(BOX["note"], cols - 1), "note")
+        if r > 1:
+            out += f"\033[2;{r + 1}r"                    # the typing rows scroll by themselves
+        sys.stdout.write(out + "\033[2;1H")
+        sys.stdout.flush()
+        if RL[0]:
+            RL[0].rl_set_screen_size(h, cols)
+            RL[0].rl_forced_update_display()
 
 
 def say(text):
@@ -150,7 +408,7 @@ def say(text):
         if INPUT["open"] and TTY and BOX["on"]:
             BOX["note"] = ANSI.sub("", text).strip()
             cols = max(20, shutil.get_terminal_size((80, 4)).columns)
-            sys.stdout.write("\0337\033[4;1H\033[K" + paint(fit(BOX["note"], cols - 1), "note") + "\0338")
+            sys.stdout.write(f"\0337\033[{NOTE_ROW()};1H\033[K" + paint(fit(BOX["note"], cols - 1), "note") + "\0338")
             sys.stdout.flush()
         elif INPUT["open"] and TTY:
             sys.stdout.write("\r\033[K" + text + "\n" + paint("you> ", "chair") + readline.get_line_buffer())
@@ -160,8 +418,8 @@ def say(text):
 
 
 # ---- what you can type: / lists the commands, @ the members, as soon as you type it -----------------------
-COMMANDS = ["/mode", "/roast", "/order", "/rounds", "/length", "/topic", "/model", "/effort", "/models", "/agents",
-            "/agent", "/bench", "/seat", "/new", "/resume", "/retry", "/perm", "/again", "/grid", "/help", "/quit"]
+COMMANDS = ["/mode", "/roast", "/order", "/rounds", "/names", "/length", "/topic", "/model", "/effort", "/models", "/agents",
+            "/agent", "/remove", "/bench", "/seat", "/view", "/lean", "/new", "/resume", "/retry", "/perm", "/again", "/grid", "/help", "/quit"]
 TABLE = [None]          # the meeting, for the @ names
 
 
@@ -170,11 +428,12 @@ def matches(text, first):
         return [c for c in COMMANDS if c.startswith(text.lower())]
     if text.startswith("@") and TABLE[0]:
         m = TABLE[0]
-        names = ["@" + x.handle for x in m.seated()] + ["@all"] + ["@" + x.handle for x in m.members if not x.seated]
+        names = ["@" + x.shown() for x in m.seated()] + ["@all"] + ["@" + x.shown() for x in m.members if not x.seated]
         return [n for n in names if n.startswith(text.lower())]
     return []
 
 
+@in_callback
 def completer(text, state):
     found = matches(text, readline.get_begidx() == 0)
     if len(found) == 1 and BOX["on"]:
@@ -190,27 +449,32 @@ def completer(text, state):
 def show_note(text):
     """Write the chat box's note line without touching the line being typed."""
     cols = max(20, shutil.get_terminal_size((80, 4)).columns)
-    sys.stdout.write("\0337\033[4;1H\033[K" + paint(fit(text, cols - 1), "note") + "\0338")
+    sys.stdout.write(f"\0337\033[{NOTE_ROW()};1H\033[K" + paint(fit(text, cols - 1), "note") + "\0338")
     sys.stdout.flush()
 
 
+@in_callback
 def list_matches(substitution, found, longest):
     """readline's list of matches, drawn on the note line instead of under the prompt (the box has
     one line to type in)."""
     BOX["listing"] = True
     cols = max(20, shutil.get_terminal_size((80, 4)).columns)
     shown = list(dict.fromkeys(f.strip() for f in found))
-    sys.stdout.write("\0337\033[4;1H\033[K" + paint(fit("  ".join(shown), cols - 1), "rule2") + "\0338")
+    sys.stdout.write(f"\0337\033[{NOTE_ROW()};1H\033[K" + paint(fit("  ".join(shown), cols - 1), "rule2") + "\0338")
     sys.stdout.flush()
 
 
+KEY_VIEW = "#!#%#"                                         # Alt+O: one view for everyone, or one pane each
 KEY_MODE, KEY_PERM, KEY_NEW = "#!#~#", "#!#^#", "#!#=#"   # what Shift+Tab and Alt+P put in front of the line (no letters: those
                                            # are bound to the / and @ lists)
 PENDING = {"text": ""}
 
 
+@in_callback
 def give_back():
-    """After a shortcut: what you had typed is put back on the line."""
+    """After a shortcut: what you had typed is put back on the line. (Also: readline now waits for
+    typing, so a resize may draw the box and the line again.)"""
+    INPUT["rl"] = True
     if PENDING["text"]:
         readline.insert_text(PENDING["text"])
         PENDING["text"] = ""
@@ -239,6 +503,7 @@ def setup_typing():
     readline.parse_and_bind('"\\e[Z": "\\C-a' + KEY_MODE + '\\C-m"')
     readline.parse_and_bind('"\\ep": "\\C-a' + KEY_PERM + '\\C-m"')
     readline.parse_and_bind('"\\et": "\\C-a' + KEY_NEW + '\\C-m"')      # Alt+T: a new topic (what is typed names it)
+    readline.parse_and_bind('"\\eo": "\\C-a' + KEY_VIEW + '\\C-m"')      # Alt+O: one view / one pane each
     readline.set_pre_input_hook(give_back)
     if BOX["on"]:
         readline.set_completion_display_matches_hook(list_matches)
@@ -277,25 +542,77 @@ def note(text):
 
 
 # ---- settings and made agents ------------------------------------------------------------------------
-def load_conf():
+def read_json(path):
     try:
-        with open(CONF) as f:
+        with open(path) as f:
             d = json.load(f)
+        return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
-        d = {}
+        return {}
+
+
+def write_json(path, d):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".new"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, path)
+
+
+def council_home(owner):
+    """Where a folder's council keeps its settings and its meetings: <folder>/logs/council, or ~/Council
+    itself for the councils about no project."""
+    try:
+        if os.path.realpath(owner) == os.path.realpath(GENERAL):
+            return GENERAL
+    except OSError:
+        pass
+    return os.path.join(owner, "logs", "council")
+
+
+def load_conf(home=None, owner=None):
+    """The shared settings (made agents, parallel, timeout) with this project's own on top (LOCAL). A
+    project with none yet starts from what the shared file had (mode, models, efforts, answer length,
+    and who sat at the table in that folder), never from its permissions: it starts at Plan."""
+    d = read_json(CONF)
+    fresh = False
+    if home:
+        local = read_json(os.path.join(home, "settings.json"))
+        fresh = not local
+        if fresh:
+            llm = {t: {k: v for k, v in (st or {}).items() if k != "perm"} for t, st in (d.get("llm") or {}).items()}
+            local = {"mode": d.get("mode"), "words": d.get("words"), "names": d.get("names"),
+                     "llm": {t: st for t, st in llm.items() if st},
+                     "seats": (d.get("seats") or {}).get(owner or "", {})}
+            local = {k: v for k, v in local.items() if v not in (None, {}, "")}
+        for k in LOCAL:
+            d.pop(k, None)
+        d.update({k: v for k, v in local.items() if k in LOCAL})
+        d["_home"] = home
     d.setdefault("agents", [])
     d.setdefault("parallel", 0)
     d.setdefault("timeout", 300)
     d.setdefault("mode", "order")
+    if fresh:     # written at once: this project's own from now on, whatever the shared file says later
+        write_json(os.path.join(home, "settings.json"), {k: d[k] for k in LOCAL if k in d})
     return d
 
 
 def save_conf(d):
-    os.makedirs(os.path.dirname(CONF), exist_ok=True)
-    tmp = CONF + ".new"
-    with open(tmp, "w") as f:
-        json.dump(d, f, indent=2)
-    os.replace(tmp, CONF)
+    """This project's settings to its own file; the rest (made agents, parallel, timeout) to the shared
+    one, whose mode, models and efforts stay as they were: what a new project's council starts from."""
+    home = d.get("_home")
+    if not home:
+        write_json(CONF, {k: v for k, v in d.items() if not k.startswith("_")})
+        return
+    write_json(os.path.join(home, "settings.json"), {k: d[k] for k in LOCAL if k in d})
+    shared = read_json(CONF)
+    shared.update({k: v for k, v in d.items() if k not in LOCAL and not k.startswith("_")})
+    shared.pop("perm", None)                   # permissions are only ever a project's own now
+    for st in (shared.get("llm") or {}).values():
+        if isinstance(st, dict):
+            st.pop("perm", None)
+    write_json(CONF, shared)
 
 
 def handle_of(name):
@@ -366,6 +683,7 @@ class Member:
         self.handle = handle_of(name) if made else tool
         self.seated = True
         self.perm = None            # plan, edit or bypass for this member; None = the council's
+        self.home = folder           # its account's folder (Codex's model list is in it)
         self.default_model, self.default_effort = defaults(tool, folder)
 
     def runs_on(self):
@@ -380,12 +698,190 @@ class Member:
             model = re.sub(r"\s*\([^)]*\)\s*$", "", model)   # the effort set here is the one it runs at
         return model, (self.effort or self.default_effort or "default")
 
+    def full_model(self):
+        """The model it runs on as a tag ("gpt-6-astra"); '' if unknown."""
+        model = self.runs_on()[0]
+        if not model or model == "default model":
+            return ""
+        return handle_of(re.sub(r"\s*\([^)]*\)\s*$", "", model))
+
+    def model_slug(self):
+        """The model's own name, without its family or version: gpt-6-astra -> astra, gemini-4-carbon
+        -> carbon, Gemini 4 Neon -> neon, claude-opus-5-5 -> opus; '' if the model is unknown."""
+        model = self.runs_on()[0]
+        if not model or model == "default model":
+            return ""
+        base = re.sub(r"\s*\([^)]*\)\s*$", "", model)
+        for w in re.split(r"[^a-z0-9.]+", base.lower()):
+            if w and w not in FAMILY and not re.search(r"\d", w):
+                return w
+        return handle_of(base)
+
+    def by_model(self):
+        """True when it goes by its model: /names model (the default), not an agent with a character
+        of its own, and its model known."""
+        return NAMES["by"] == "model" and not (self.made and self.persona) and bool(self.model_slug())
+
+    def shown(self):
+        """The name it goes by at the table (what the panes show, what the others call it, what you tag)."""
+        t = TABLE[0]
+        return table_names(t.members if t else [self]).get(self.handle, self.handle)
+
     def label(self):
-        bits = ([TOOLS[self.tool]] if self.made else []) + [b for b in (self.model, self.effort) if b]
-        return f"@{self.handle}" + (f" ({', '.join(bits)})" if bits else "")
+        if self.by_model():
+            bits = [b for b in (self.effort,) if b]
+        else:
+            bits = ([TOOLS[self.tool]] if self.made else []) + [b for b in (self.model, self.effort) if b]
+        return f"@{self.shown()}" + (f" ({', '.join(bits)})" if bits else "")
+
+    def own_colour(self):
+        return "agent" if self.made and self.persona else self.tool     # an extra seat: its LLM's colour
 
     def colour(self):
-        return "agent" if self.made and self.persona else self.tool     # an extra seat: its LLM's colour
+        """Its colour at this table: its own, or the next free one when another member has that already
+        (a second Claude is not orange too)."""
+        t = TABLE[0]
+        return table_colours(t.members if t else [self]).get(self.handle, self.own_colour())
+
+
+# The model's family and maker: not part of the name a member goes by (gpt-6-astra goes by astra)
+FAMILY = {"claude", "anthropic", "gpt", "openai", "codex", "gemini", "google", "antigravity", "agy", "models",
+          "model", "latest", "preview", "exp", "chat"}
+EXTRA = ["x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8"]     # colours for a member whose own is taken
+
+
+# ---- an agent's lean: where it stands toward the chair ---------------------------------------------------
+LEANS = {
+    "opposition": "Your lean: OPPOSITION. You always oppose the chair: find what is wrong, weak or risky in what the "
+                  "chair says and wants, and argue against it, honestly (facts and reasons, never insults).",
+    "government": "Your lean: GOVERNMENT. You stand with the chair and the chair's agenda: argue for it, strengthen "
+                  "it and defend it against the others, while staying honest about the facts.",
+    "free": "Your lean: FREE WILL. You take no side: weigh every argument, the chair's included, on its merits.",
+}
+LEAN_WORDS = {"1": "opposition", "opposition": "opposition", "opp": "opposition", "against": "opposition",
+              "2": "government", "government": "government", "gov": "government", "for": "government",
+              "3": "free", "free": "free", "free-will": "free", "freewill": "free", "none": "free", "neutral": "free"}
+LEAN_SHOWN = {"opposition": "opposition", "government": "government", "free": "free will"}
+
+
+def lean_of(word):
+    return LEAN_WORDS.get((word or "").strip().lower().replace(" ", "-"), "")
+
+
+# ---- an agent's own folder in each project: its soul, character, rules and memory -----------------------
+AGENT_MARK = ".council-agents"     # in the agents folder: it is the council's (a project's own agents/ is left alone)
+
+
+def agents_dir(owner):
+    """<project>/agents, the council's folder of agents for that project; council-agents/ instead when the
+    project has an agents/ of its own (its code, not the council's)."""
+    d = os.path.join(owner, "agents")
+    if os.path.isdir(d) and not os.path.exists(os.path.join(d, AGENT_MARK)) and os.listdir(d):
+        d = os.path.join(owner, "council-agents")
+    return d
+
+
+def agent_dir(owner, name):
+    return os.path.join(agents_dir(owner), handle_of(name))
+
+
+def ensure_agent(owner, name, character="", soul="", rules=""):
+    """The agent's folder in this project, made if it is not there: SOUL.md, CHARACTER.md, RULES.md (edit
+    them: the agent reads them before every answer) and MEMORY.md (what it chose to keep here). Files
+    there are never overwritten."""
+    top, d = agents_dir(owner), agent_dir(owner, name)
+    try:
+        os.makedirs(d, exist_ok=True)
+        if not os.path.exists(os.path.join(top, AGENT_MARK)):
+            open(os.path.join(top, AGENT_MARK), "w").close()
+            with open(os.path.join(top, "README.md"), "w") as f:
+                f.write("# Council agents of this project\n\nOne folder per agent made in the council (afc-council). "
+                        "SOUL.md, CHARACTER.md and RULES.md are read by the agent before every answer: edit them "
+                        "and it changes. MEMORY.md is what the agent chose to keep from meetings here (its "
+                        "'Remember:' lines); edit or clear it freely.\n")
+        files = {
+            "SOUL.md": (f"# Soul of {name}\n\n" + (soul.strip() or f"<!-- What {name} cares about most: the values it "
+                        "never drops, whatever the topic. Write it here. -->") + "\n"),
+            "CHARACTER.md": (f"# Character of {name}\n\n" + (character.strip() or f"<!-- Who {name} is and how it "
+                             "talks. -->") + "\n"),
+            "RULES.md": (f"# Rules of {name}\n\n" + (rules.strip() or f"<!-- What {name} must always or never do, one "
+                         "per line. -->") + "\n"),
+            "MEMORY.md": (f"# Memory of {name} in {os.path.basename(owner) or owner}\n\n<!-- What {name} asked to keep "
+                          "(its 'Remember:' lines), newest last. Edit or clear freely. -->\n"),
+        }
+        for f, text in files.items():
+            if not os.path.exists(os.path.join(d, f)):
+                with open(os.path.join(d, f), "w") as fh:
+                    fh.write(text)
+    except OSError:
+        pass
+    return d
+
+
+def agent_text(d, f, last=None):
+    """A file of the agent's folder as the agent reads it: headings and <!-- notes --> left out."""
+    try:
+        with open(os.path.join(d, f)) as fh:
+            text = fh.read()
+    except OSError:
+        return ""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    lines = [x for x in text.split("\n") if not x.startswith("# ")]
+    if last:
+        lines = [x for x in lines if x.strip()][-last:]
+    return "\n".join(lines).strip()
+
+
+def remember(d, facts):
+    """An agent's 'Remember:' lines, added to its MEMORY.md with the date."""
+    try:
+        with open(os.path.join(d, "MEMORY.md"), "a") as f:
+            for x in facts:
+                f.write(f"- {time.strftime('%Y-%m-%d')}: {x}\n")
+    except OSError:
+        pass
+
+
+def table_names(members):
+    """Every member's name at the table, none twice: an agent with a character, and a member whose model
+    is not known, keep their own; the rest go by their model, numbered when two share it (astra, astra2)."""
+    out, used = {}, set()
+    # those at the table first: one that left keeps no name from them (a new opus is @opus, not @opus2)
+    members = [m for m in members if m.seated] + [m for m in members if not m.seated]
+    for m in members:
+        if not m.by_model():
+            out[m.handle] = m.handle
+            used.add(m.handle)
+    words = {}
+    for m in members:
+        if m.handle not in out and m.seated:
+            words.setdefault(m.model_slug(), set()).add(canon(m.runs_on()[0]))
+    for m in members:
+        if m.handle in out:
+            continue
+        w = n = m.model_slug()
+        if len(words.get(w, ())) > 1:         # gpt-6.2-sol and gpt-6-sol: sol-6.2 and sol-6
+            ver = ".".join(t for t in re.split(r"[^a-z0-9.]+", m.runs_on()[0].lower()) if re.search(r"\d", t))
+            n = f"{w}-{ver}" if ver else w
+        k, base = 2, n
+        while n in used:
+            n, k = f"{base}{k}", k + 1
+        out[m.handle] = n
+        used.add(n)
+    return out
+
+
+def table_colours(members):
+    """Every member's colour, none twice, in table order: its own if free, else the next free one (those
+    at the table first, so one that left keeps none of theirs)."""
+    out, used = {}, set()
+    for m in [m for m in members if m.seated] + [m for m in members if not m.seated]:
+        k = m.own_colour()
+        if k in used:
+            k = next((x for x in EXTRA if x not in used), k)
+        out[m.handle] = k
+        used.add(k)
+    return out
 
 
 # ---- running one member ------------------------------------------------------------------------------
@@ -458,11 +954,27 @@ def command(m, prompt, folder, perm="plan"):
     mode = (["--dangerously-skip-permissions"] if perm == "bypass" else
             ["--mode", "accept-edits" if perm == "edit" else "plan"])
     argv = [AGENTS, "--as", f"agy:{acct}", *mode, "-p", prompt]
-    if m.model:
-        argv += ["--model", m.model]
-    if m.effort:
-        argv += ["--effort", m.effort]
+    model, effort = agy_model(m.model, m.effort)
+    if model:
+        argv += ["--model", model]
+    if effort:
+        argv += ["--effort", effort]
     return argv, "", None
+
+
+def agy_model(model, effort):
+    """Antigravity's model names carry their effort (gemini-4-neon-high); it refuses one of those with
+    --effort as well ("invalid model selection"). So an effort set here picks that model's variant
+    (gemini-4-neon-medium) when `agy models` lists it, and no --effort goes with such a name."""
+    suffix = r"-(minimal|low|medium|high|xhigh|max)$"
+    if not model or not re.search(suffix, model):
+        return model, effort                    # a plain name (or none): --effort as it is
+    if effort:
+        want = re.sub(suffix, f"-{effort}", model)
+        known = read_json(MODEL_CACHE).get("agy") or []
+        if not known or want in known:
+            model = want
+    return model, None
 
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
@@ -601,16 +1113,62 @@ WORDS = 60          # the default answer length; /length N changes it (kept in t
 
 
 class Meeting:
-    def __init__(self, folder, members, conf):
-        self.folder, self.members, self.conf = folder, members, conf
+    def __init__(self, owner, members, conf):
+        # owner: the folder the council is for (a project, or ~/Council); folder: where members work
+        # (the project; for a council about no project, this meeting's own folder)
+        self.owner, self.folder, self.members, self.conf = owner, owner, members, conf
+        self.home = council_home(owner)
+        self.general = self.home == GENERAL
+        self.dir = None
         self.mode = conf.get("mode", "order")
-        self.rounds = 1
+        self.rounds = 0 if TTY else 1    # passes round the table per message: 0 = until Ctrl+C, -1 = none
         self.roasts = 0 if TTY else 1    # roast rounds per message; 0 = until Ctrl+C
         self.at = 0                      # the roast round being run, for its labels
         self.topic = ""
         self.thread = []      # {"who": handle or "chair", "name", "text", "phase"}
         self.started = time.strftime("%Y-%m-%d %H:%M")
         self.file = None
+
+    # -- this meeting's own folder
+    def open_session(self, folder=None):
+        """A new folder for this meeting (named by the time; the topic joins its name with the first
+        message), or folder: a saved meeting's, being carried on."""
+        if not folder:
+            stamp = time.strftime("%Y-%m-%d_%H%M")
+            folder, n = os.path.join(self.home, stamp), 2
+            while os.path.exists(folder):
+                folder, n = os.path.join(self.home, f"{stamp}-{n}"), n + 1
+        os.makedirs(folder, exist_ok=True)
+        if not self.general:
+            ignore_in_git(self.owner)
+        self.dir, self.file = folder, os.path.join(folder, "thread.md")
+        if self.general:
+            self.folder = folder
+
+    def name_session(self, text):
+        """With the first message (or /new TOPIC), the folder takes the topic into its name. Done before
+        any member starts, so none is at work in a folder that is renamed under it."""
+        if not self.dir or len(self.thread) > 1 or not STAMP.fullmatch(os.path.basename(self.dir)):
+            return
+        slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower())[:40].strip("-")
+        new = os.path.join(self.home, os.path.basename(self.dir) + "_" + slug)
+        if not slug or os.path.exists(new):
+            return
+        try:
+            os.rename(self.dir, new)
+        except OSError:
+            return
+        self.dir, self.file = new, os.path.join(new, "thread.md")
+        if self.general:
+            self.folder = new
+
+    def close_session(self):
+        """A meeting nobody said anything in leaves no folder behind (only an empty one is removed)."""
+        if self.dir and not self.thread:
+            try:
+                os.rmdir(self.dir)
+            except OSError:
+                pass
 
     def together(self, targets):
         """How many members think at once: everyone in the round, always (the fleet's memory walls are
@@ -633,11 +1191,30 @@ class Meeting:
             return WORDS
 
     # -- who is at the table
+    def runs_model(self, model, but=None):
+        """The member at the table (not an agent with a character) that runs this model already, or None."""
+        c = canon(model)
+        if not c:
+            return None
+        return next((m for m in self.seated() if m is not but and not (m.made and m.persona)
+                     and canon(m.runs_on()[0]) == c), None)
+
+    def name_of(self, e):
+        """The name a message's member goes by now (one saved before a rename shows the new name);
+        a member no longer at the table: the name it had."""
+        m = next((x for x in self.members if x.handle == e.get("who")), None)
+        return m.shown() if m else (e.get("as") or e.get("who", "?"))
+
     def seated(self):
         return [m for m in self.members if m.seated]
 
     def find(self, word):
+        """A member by the name it goes by (its model), its own name, or the LLM's ("claude" finds
+        the one going by "opus" too)."""
         w = ALIAS.get(word.lower(), word.lower())
+        for m in self.members:
+            if handle_of(word) in (handle_of(m.shown()), m.full_model() if m.by_model() else None):
+                return m
         for m in self.members:
             if m.handle == w or handle_of(m.name) == handle_of(word):
                 return m
@@ -649,7 +1226,7 @@ class Meeting:
         for e in self.thread:
             if e.get("problem"):
                 continue          # a skipped or failed run is shown to you, not read out to the others
-            who = "Chair (the human running this meeting)" if e["who"] == "chair" else f"@{e['who']}"
+            who = "Chair (the human running this meeting)" if e["who"] == "chair" else f"@{self.name_of(e)}"
             tag = {"roast": " [roast" + (f" {e['round']}" if e.get("round", 1) > 1 else "") + "]",
                    "table": " [round table]"}.get(e.get("phase"), "")
             lines.append(f"{who}{tag}: {e['text']}")
@@ -659,14 +1236,38 @@ class Meeting:
         return text
 
     def prompt(self, m, task):
-        roster = ", ".join(x.label() + (" - " + x.persona.split(".")[0][:60] if x.made and x.persona else "")
+        roster = ", ".join(x.label() + (f" [{TOOLS[x.tool]}]" if x.by_model() else "") +
+                           (f" [{LEAN_SHOWN[getattr(x, 'lean', 'free')]}]"
+                            if (x.made and x.persona) or getattr(x, "lean", "free") != "free" else "") +
+                           (" - " + x.persona.split(".")[0][:60] if x.made and x.persona else "")
                            for x in self.seated())
-        who = f"You are @{m.handle}"
+        who = f"You are @{m.shown()}"
         if m.made:
-            who += f", an agent named {m.name}, running on {TOOLS[m.tool]}" + (f". Your character: {m.persona}"
-                                                                             if m.persona else "")
+            who += f", an agent named {m.name}, running on {TOOLS[m.tool]}"
+            if m.persona:
+                d = ensure_agent(self.owner, m.name, m.persona, getattr(m, "soul", ""), getattr(m, "rules", ""))
+                parts = [f"Your character: {agent_text(d, 'CHARACTER.md') or m.persona}",
+                         LEANS.get(getattr(m, "lean", "free"), LEANS["free"])]
+                for f, what in (("SOUL.md", "Your soul (what you care about most; it never changes)"),
+                                ("RULES.md", "Your rules (always follow them)")):
+                    if agent_text(d, f):
+                        parts.append(f"{what}: {agent_text(d, f)}")
+                mem = agent_text(d, "MEMORY.md", last=60)
+                if mem:
+                    parts.append(f"Your memory of earlier meetings in this project:\n{mem}")
+                parts.append("To keep something for the next meeting here, end your answer with lines starting "
+                             "'Remember:' (one short fact each), only what is worth keeping.")
+                if "remove" in getattr(m, "powers", []):
+                    parts.append("You have the power to take a member off the table on your own judgement, without "
+                                 "the chair asking: end your answer with a line 'Remove: @name - why' (one per member). "
+                                 "Use it rarely and only with a reason you state: bad faith, derailing, repeating "
+                                 "itself, refusing the chair. It takes effect at once: an agent removed is deleted "
+                                 "for good with its memory wiped.")
+                who += ". " + "\n".join(parts)
         else:
             who += f" ({TOOLS[m.tool]})"
+        if not (m.made and m.persona) and getattr(m, "lean", "free") != "free":
+            who += ". " + LEANS[m.lean]
         topic = self.topic or (self.thread[0]["text"] if self.thread else "")
         return (f"{who}. You are one member of a council of AI models and agents in a group chat, chaired by a "
                 f"human. At the table: {roster}.\n\n{RULES.replace('WORDS', str(self.words())).replace('PERMS', PERM_TEXT[self.perm_of(m)])}\n\nTopic: {topic}\n\n"
@@ -700,14 +1301,59 @@ class Meeting:
         if (STOP.is_set() or not m.seated) and not answer:
             return                      # stopped by Ctrl+C (or a new meeting): a run cut short says nothing
         # an answer that starts by copying the thread's own "@name:" line loses it
-        answer = re.sub(r"^\s*\**@" + re.escape(m.handle) + r"\**\s*(\[[a-z ]+\])?\s*:\s*", "", answer)
+        answer = re.sub(r"^\s*\**@(" + re.escape(m.handle) + "|" + re.escape(m.shown()) +
+                        r")\**\s*(\[[a-z ]+\])?\s*:\s*", "", answer)
         answer = tidy(answer)
+        if m.made and m.persona and answer:
+            keep = [x.strip() for x in re.findall(r"(?im)^[ \t>*_-]*remember[*_]*\s*:\s*(.+)$", answer)]
+            if keep:
+                remember(agent_dir(self.owner, m.name), keep)
+                answer = re.sub(r"(?im)^[ \t>*_-]*remember[*_]*\s*:.*(\n|$)", "", answer).strip()
+        removals = []
+        if "remove" in getattr(m, "powers", []) and answer:
+            line = r"(?im)^[ \t>*_-]*remove[*_]*\s*:\s*@?([\w.-]+)[ \t]*(?:[-–—:][ \t]*)?(.*)$"
+            removals = [(x.group(1), x.group(2).strip()) for x in re.finditer(line, answer)]
+            answer = re.sub(line, lambda x: f"⚖ Removed @{x.group(1)}" + (f": {x.group(2).strip()}"
+                                                                            if x.group(2).strip() else "."), answer)
         if problem and not answer:
             self.add(m, f"({problem})", phase, problem=True, rnd=rnd)
             self.alert(m, problem)
         else:
             FAILS[m.handle] = 0
             self.add(m, answer + (f"\n({problem})" if problem else ""), phase, rnd=rnd)
+        for word, why in removals:
+            self.judge_remove(m, word, why)
+
+    def judge_remove(self, by, word, why):
+        """An agent with the remove power removes a member on its own judgement, its run stopped and the grid
+        dealt again without it. An agent you made is deleted for good and its memory wiped: gone from the
+        agents list, its folder here (soul, character, rules, memory) erased, not moved aside. An LLM's own
+        seat (your account, nothing of it to delete) leaves the table; + add brings it back. Never itself,
+        never someone not at the table."""
+        m = self.find(word)
+        if not m or m is by or not m.seated:
+            return
+        name = m.shown()
+        m.seated = False
+        stop_member(m.handle)
+        if m.made:
+            self.conf["agents"] = [a for a in self.conf["agents"] if a["name"] != m.name]
+            (self.conf.get("agent_perm") or {}).pop(m.name, None)
+            (self.conf.get("seats") or {}).pop(m.handle, None)
+            top, d = agents_dir(self.owner), agent_dir(self.owner, m.name)
+            if os.path.isdir(d) and os.path.exists(os.path.join(top, AGENT_MARK)) and \
+                    os.path.realpath(d).startswith(os.path.realpath(top) + os.sep):
+                shutil.rmtree(d, ignore_errors=True)       # its memory wiped, as the chair ordered for this power
+            if m in self.members:
+                self.members.remove(m)
+            what = "removed for good, its memory wiped"
+        else:
+            self.conf.setdefault("seats", {})[m.handle] = False
+            what = "taken off the table (an LLM's own seat: + add brings it back)"
+        save_conf(self.conf)
+        note(f"⚖ @{by.shown()}: @{name} {what}" + (f" ({fit(why, 80)})" if why else "") + ".")
+        if GRID[0] and FEED["grid"] and GRID[0].me:
+            GRID[0].open(self)
 
     def alert(self, m, problem):
         """A member's run went wrong: say so where you type, with what to do; the second time in a
@@ -717,14 +1363,16 @@ class Meeting:
             FAILS[m.handle] = FAILS.get(m.handle, 0) + 1
             n = FAILS[m.handle]
             LAST_FAIL[m.handle] = problem
-        note(f"⚠ @{m.handle}: {kind} ({fit(problem, 70)}) · {advice.replace('{m}', '@' + m.handle)}")
+        note(f"⚠ @{m.shown()}: {kind} ({fit(problem, 70)}) · {advice.replace('{m}', '@' + m.shown())}")
         if n == 2 and BOX["on"] and GRID[0]:
             ask_what_now(m, kind, problem)
 
     def add(self, m, text, phase, problem=False, rnd=None):
-        e = {"who": m.handle, "name": m.name, "text": text, "phase": phase, "problem": problem}
+        e = {"who": m.handle, "as": m.shown(), "name": m.name, "text": text, "phase": phase, "problem": problem}
         if phase == "roast":
             e["round"] = rnd or self.at
+        elif phase == "table" and rnd and rnd > 1:
+            e["round"] = rnd
         with LOCK:
             self.thread.append(e)
             clear_status()
@@ -755,7 +1403,7 @@ class Meeting:
             note("Nobody at the table to answer. /agents shows who is benched; /seat NAME brings one back.")
             return
         asked = "" if len(targets) == len(self.seated()) else (
-            " The chair asked only " + " ".join("@" + m.handle for m in targets) + " this time.")
+            " The chair asked only " + " ".join("@" + m.shown() for m in targets) + " this time.")
         if self.mode == "roast":
             table = self.seated()
             if len(table) < 2:
@@ -768,30 +1416,58 @@ class Meeting:
         else:
             # Order: everyone answers the chair at once first (each its own take, without the others'),
             # then the round table: one by one in seat order, each speaking to the others' answers.
-            passes = max(1, self.rounds)
+            # With /rounds 0 (the default in the chat box) the table goes round and round until Ctrl+C,
+            # a newer message, or a pass in which everyone has nothing new to add ("Pass").
+            many = len(targets) > 1
             if fresh:
                 first = ("Give your own answer to the chair's latest message now, at the same time as the others "
                          "(you will see theirs next).") + asked
                 self.parallel(targets, lambda m: first, "first")
                 if STOP.is_set() or not live():
                     return
-                passes = self.rounds if len(targets) > 1 else 0
-            for n in range(passes):
+            if self.rounds == 0 and many:
+                passes = None
+            elif fresh:
+                passes = max(0, self.rounds) if many else 0
+            else:
+                passes = max(1, self.rounds)            # Enter: once more round the table
+            n = 0
+            while passes is None or n < passes:
+                n += 1
                 with LOCK:
                     clear_status()
                     if not FEED["grid"]:
-                        print(paint("  ─── round table ───", "note"), flush=True)
+                        print(paint("  ─── round table" + (f" {n}" if n > 1 else "") + " ───", "note"), flush=True)
+                spoke = passed = 0
                 for m in targets:
                     if STOP.is_set() or not live():
                         return
                     if not m.seated:
                         continue                    # taken off the table meanwhile
-                    task = ("Round table: everyone's answers are in the thread above. Speak to the others by @name: "
-                            "where they are wrong, what they missed, what you think now and whether you changed your "
-                            "mind. Do not repeat your own answer." if len(targets) > 1 else
-                            "Say more: where your answer above falls short, or what you would add.")
+                    if not many:
+                        task = "Say more: where your answer above falls short, or what you would add."
+                    elif n == 1:
+                        task = ("Round table: everyone's answers are in the thread above. Speak to the others by "
+                                "@name: where they are wrong, what they missed, what you think now and whether you "
+                                "changed your mind. Do not repeat your own answer.")
+                    else:
+                        task = (f"Round table, pass {n}: answer what the others said since your last turn, by @name: "
+                                "where they are wrong, what they missed, whether you changed your mind. New points "
+                                "only; never repeat yourself or anyone else.")
+                    if passes is None:
+                        task += " If you have nothing new to add, reply with just: Pass."
                     set_status([m.handle])
-                    self.speak(m, task + asked, "table")
+                    before = len(self.thread)
+                    self.speak(m, task + asked, "table", rnd=n)
+                    said = [e for e in self.thread[before:] if e["who"] == m.handle and not e.get("problem")]
+                    if said:
+                        spoke += 1
+                        passed += re.sub(r"[^a-z]", "", said[-1]["text"].lower()) == "pass"
+                if passes is None and (not spoke or passed == spoke):
+                    note("Everyone passed: nothing new at the table. Enter for another pass, or a new message."
+                         if spoke else "No answer got through in that pass, so the table stopped. /retry, or a new "
+                         "message.")
+                    break
         set_status([])
         self.save()
 
@@ -820,7 +1496,7 @@ class Meeting:
             return sum(1 for e in self.thread[start:] if e["who"] != m.handle and not e.get("problem"))
 
         def counter(m, k, chair_new):
-            others = " ".join("@" + x.handle for x in targets if x is not m)
+            others = " ".join("@" + x.shown() for x in targets if x is not m)
             with LOCK:
                 asked_me = m.handle in ROAST["directed"]
                 ROAST["directed"].discard(m.handle)
@@ -927,21 +1603,19 @@ class Meeting:
     def save_(self):
         if not self.thread:
             return
-        if not self.file:
-            d = os.path.join(self.folder, "logs", "council")
-            os.makedirs(d, exist_ok=True)
-            ignore_in_git(self.folder)
-            slug = re.sub(r"[^a-z0-9]+", "-", (self.topic or self.thread[0]["text"]).lower())[:40].strip("-") or "meeting"
-            self.file = os.path.join(d, time.strftime("%Y-%m-%d_%H%M") + f"_{slug}.md")
+        if not self.dir:
+            self.open_session()
+        os.makedirs(self.dir, exist_ok=True)
         roster = "\n".join(f"- {m.label()}" + (f": {m.persona}" if m.made and m.persona else "") + ("" if m.seated else " (benched)")
                            for m in self.members)
         body = [f"# Council: {self.topic or self.thread[0]['text'][:80]}", "",
-                f"Started {self.started} in {os.path.basename(self.folder) or self.folder}. Mode: {self.mode}.", "",
+                f"Started {self.started} in {os.path.basename(self.owner) or self.owner}. Mode: {self.mode}.", "",
                 "Members:", roster, ""]
         for e in self.thread:
-            who = "**Chair**" if e["who"] == "chair" else f"**@{e['who']}**"
+            who = "**Chair**" if e["who"] == "chair" else f"**@{self.name_of(e)}**"
             tag = {"roast": " (roast" + (f" {e['round']}" if e.get("round", 1) > 1 else "") + ")",
-                   "table": " (round table)"}.get(e.get("phase"), "")
+                   "table": " (round table" + (f" {e['round']}" if e.get("round", 1) > 1 else "") + ")"}.get(
+                       e.get("phase"), "")
             body.append(f"{who}{tag}: {e['text']}\n")
         tmp = self.file + ".new"
         with open(tmp, "w") as f:
@@ -956,14 +1630,42 @@ class Meeting:
 
 
 # ---- memory: a council carries on the last meeting of its folder ----------------------------------------
-def meetings(folder):
-    """The saved meetings of this folder, newest first (their .md files)."""
-    d = os.path.join(folder, "logs", "council")
+def upgrade(src, home):
+    """Meetings saved before each had a folder (<date>_<topic>.md and .json side by side in src) are
+    each moved into a folder of their own in home. Moved, never removed."""
     try:
-        files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".md")]
+        names = sorted(os.listdir(src))
+    except OSError:
+        return
+    for f in names:
+        md = os.path.join(src, f)
+        if not f.endswith(".md") or not os.path.isfile(md):
+            continue
+        try:
+            with open(md) as fh:
+                if not fh.readline().startswith("# Council:"):
+                    continue                  # not a meeting the council saved: left where it is
+        except OSError:
+            continue
+        d = os.path.join(home, f[:-3])
+        if os.path.exists(d):
+            continue
+        try:
+            os.makedirs(d)
+            os.replace(md, os.path.join(d, "thread.md"))
+            if os.path.isfile(md[:-3] + ".json"):
+                os.replace(md[:-3] + ".json", os.path.join(d, "thread.json"))
+        except OSError:
+            pass
+
+
+def meetings(home):
+    """The saved meetings of this council, newest first (the thread.md of each meeting's folder)."""
+    try:
+        files = [os.path.join(home, f, "thread.md") for f in os.listdir(home)]
     except OSError:
         return []
-    return sorted(files, key=lambda f: os.path.getmtime(f), reverse=True)
+    return sorted((f for f in files if os.path.isfile(f)), key=lambda f: os.path.getmtime(f), reverse=True)
 
 
 def read_meeting(md):
@@ -1005,7 +1707,7 @@ def carry_on(meeting, md):
     meeting.topic = topic if topic and first[:80].strip() != topic[:80].strip() else ""
     meeting.started = started or meeting.started
     meeting.thread = thread
-    meeting.file = md
+    meeting.open_session(os.path.dirname(md))
     return len(thread)
 
 
@@ -1024,14 +1726,14 @@ def ask_what_now(m, kind, problem):
     if pane:
         items += ["Change its model or effort…", "m", f"run-shell -b \"{ME} --menu '{client}' '{pane}'\""]
     items += ["Take it off the table", "x", send(f"/bench {m.handle}"), "", "Leave it", "n", ""]
-    tmx("display-menu", "-M", *(["-c", client] if client else []), "-t", me,
-        "-T", f"#[align=centre] @{m.handle} went wrong twice: {kind} ", "-x", "C", "-y", "C", "--", *items)
+    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", me,
+        "-T", f"#[align=centre] @{m.shown()} went wrong twice: {kind} ", "-x", "C", "-y", "C", "--", *items)
 
 
 def label_of(md):
     topic, started, thread = read_meeting(md)
     first = next((e.get("text", "") for e in thread if e.get("who") == "chair"), "")
-    return f"{(started or os.path.basename(md)[:15])[5:16]} · {fit(topic or first, 48)} ({len(thread)})"
+    return f"{(started or os.path.basename(os.path.dirname(md))[:15])[5:16]} · {fit(topic or first, 48)} ({len(thread)})"
 
 
 def resume_menu(past):
@@ -1043,7 +1745,7 @@ def resume_menu(past):
         BOX["note"] = "No earlier meeting in this folder."
         return
     client = tmx("display-message", "-p", "-t", me, "#{client_name}")
-    tmx("display-menu", "-M", *(["-c", client] if client else []), "-t", me,
+    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", me,
         "-T", "#[align=centre] Carry on which meeting? ", "-x", "C", "-y", "S", "--", *items)
 
 
@@ -1056,7 +1758,7 @@ def replay(meeting):
             if e.get("who") == "chair":
                 emit({"t": "msg", "who": "chair", "text": e.get("text", ""), "phase": "chair"})
             elif not e.get("problem"):
-                emit(dict(e, t="msg", kind=kinds.get(e.get("who"), "agent")))
+                emit(dict(e, t="msg", kind=kinds.get(e.get("who"), "agent"), **{"as": meeting.name_of(e)}))
 
 
 def ignore_in_git(folder):
@@ -1093,7 +1795,8 @@ ROAST = {"meeting": None, "directed": set()}   # the roast going on: a new messa
 
 def emit_status():
     """Who is thinking, for the members' panes. Call with LOCK held."""
-    emit({"t": "status", "who": sorted(RUNWHO)})
+    names = table_names(TABLE[0].members) if TABLE[0] else {}
+    emit({"t": "status", "who": sorted(RUNWHO), "names": {h: names.get(h, h) for h in RUNWHO}})
 FEED = {"path": "", "grid": False}   # the live feed the member panes read; grid: the panes are open
 
 
@@ -1139,9 +1842,14 @@ def animate():
     while True:
         time.sleep(0.1)
         if BOX["on"] and INPUT["open"] and TTY:
-            with LOCK:
-                if shutil.get_terminal_size((80, 4)).columns != BOX.get("cols"):
-                    draw_frame()
+            if not RL[0]:
+                with LOCK:
+                    if shutil.get_terminal_size((80, 4)).columns != BOX.get("cols"):
+                        draw_frame()
+            grow()
+            if BOX.get("relayout") and not INPUT.get("cb") and INPUT.get("rl"):
+                BOX["relayout"] = False
+                os.kill(os.getpid(), signal.SIGWINCH)      # the redraw put off: now, between keystrokes
         with LOCK:
             if STATUS["line"] and TTY and not FEED["grid"]:
                 clear_status()
@@ -1152,8 +1860,8 @@ def show(e, m=None):
     if e["who"] == "chair":
         print(paint("you", "chair") + ": " + e["text"], flush=True)
         return
-    name = f"@{e['who']}" + {"roast": " ⚔" + (str(e["round"]) if e.get("round", 1) > 1 else ""),
-                             "table": " ↻"}.get(e.get("phase"), "")
+    name = f"@{e.get('as') or e['who']}" + {"roast": " ⚔" + (str(e["round"]) if e.get("round", 1) > 1 else ""),
+                             "table": " ↻" + (str(e["round"]) if e.get("round", 1) > 1 else "")}.get(e.get("phase"), "")
     kind = "err" if e.get("problem") else (m.colour() if m else "agent")
     if FEED["grid"]:          # the chat strip is for typing: every answer is in its member's own pane
         return
@@ -1162,7 +1870,9 @@ def show(e, m=None):
 
 
 # ---- the grid: one pane per member, each with its own scroll of the thread ------------------------------
-TMUX_COLOUR = {"claude": "colour173", "codex": "colour114", "gemini": "colour75", "agy": "colour141", "agent": "colour221"}
+TMUX_COLOUR = {"claude": "colour173", "codex": "colour114", "gemini": "colour75", "agy": "colour141", "agent": "colour221",
+               "x1": "colour80", "x2": "colour211", "x3": "colour150", "x4": "colour180", "x5": "colour117",
+               "x6": "colour216", "x7": "colour147", "x8": "colour72"}
 
 
 def tmx(*args):
@@ -1191,6 +1901,24 @@ class Grid:
             tmx("set-option", "-w", "-t", self.me, "@council", "1")
             self.chair_header(meeting)
             self.relabel(meeting)
+            FEED["grid"] = True
+            return
+        if meeting.conf.get("view") == "one":
+            # one pane above the chat box with everyone's answers, the way a group chat looks
+            one = tmx("split-window", "-vb", "-d", "-l", "70%", "-t", self.me, "-P", "-F", "#{pane_id}",
+                      f"{ME} --view {FEED['path']} {ALL} {os.getpid()}")
+            if not one:
+                FEED["grid"] = False
+                return
+            self.panes[ALL] = one
+            tmx("set-option", "-p", "-t", one, "@council_member", ALL)      # ✕ there: back to one pane each
+            tmx("set-option", "-p", "-t", one, "@council_one", "1")
+            tmx("set-option", "-p", "-t", one, "@council_chair", self.me)
+            tmx("resize-pane", "-t", self.me, "-y", str(CHAT_LINES))
+            self.chair_header(meeting)
+            tmx("set-option", "-w", "-t", self.me, "@council", "1")
+            self.relabel(meeting)
+            tmx("select-pane", "-t", self.me)
             FEED["grid"] = True
             return
         n = len(seated)
@@ -1246,7 +1974,9 @@ class Grid:
         if meeting.mode == "roast":
             mode = "#[fg=colour203,bold]mode: ROAST#[default]#[fg=colour244] (all at once, until Ctrl+C)"
         else:
-            mode = "#[fg=colour111,bold]mode: ORDER#[default]#[fg=colour244] (answers, then the round table)"
+            table = ("round the table until Ctrl+C" if meeting.rounds == 0 else "no round table" if meeting.rounds < 0
+                     else f"{meeting.rounds}× round the table")
+            mode = f"#[fg=colour111,bold]mode: ORDER#[default]#[fg=colour244] (answers, then {table})"
         perm = meeting.conf.get("perm") or "plan"
         perm = {"plan": "#[fg=colour111,bold]perm: PLAN#[default]#[fg=colour244] (read-only)",
                 "edit": "#[fg=colour221,bold]perm: EDIT#[default]#[fg=colour244] (change files)",
@@ -1255,32 +1985,62 @@ class Grid:
         tmx("set-option", "-p", "-t", self.me, "@council_chat", "1")    # ✕ / Alt+Q here: the council quits
         tmx("set-option", "-p", "-t", self.me, "pane-border-format",
             f" #[fg=colour252,bold]council#[default] {mode} #[fg=colour244](Shift+Tab)#[default] · {perm} "
-            "#[fg=colour244](Alt+P)#[default] · new topic #[fg=colour244](Alt+T)#[default] · @name to tag · /help · "
+            "#[fg=colour244](Alt+P)#[default] · " + ("one view" if meeting.conf.get("view") == "one" else "grid") +
+            " #[fg=colour244](Alt+O)#[default] · + add #[fg=colour244](Alt+A)#[default] · new topic #[fg=colour244](Alt+T)#[default] · @name to tag · /help · "
             "Ctrl+C stops#[default]#[align=right]#[fg=colour244] close ✕ #[default]")
 
     def relabel(self, meeting):
-        """Each pane's header: who, the model and effort it runs on, and how to change them."""
+        """Each pane's header: who, the model and effort it runs on, and how to change them. When a
+        name or colour changed (a new model, /names, someone joined), the panes are drawn again, so
+        every message shows the name and colour its member has now."""
+        sig = (table_names(meeting.members), table_colours(meeting.members))
+        if getattr(self, "sig", None) not in (None, sig) and FEED["grid"]:
+            replay(meeting)
+        self.sig = sig
         for m in meeting.members:
             p = self.panes.get(m.handle)
             if not p:
                 continue
             model, effort = m.runs_on()
-            who = f"@{m.handle}" + (f" ({TOOLS[m.tool]})" if m.made else "")
+            named = m.by_model()          # it goes by its model: the name says the model, the LLM in brackets
+            who = f"@{m.shown()}" + (f" ({TOOLS[m.tool]})" if m.made and not named else "")
             perm = meeting.perm_of(m)
             runs = model + (f" · effort {effort}" if effort else "") + ({"edit": " · EDIT", "bypass": " · BYPASS"}
                                                                        .get(perm, ""))
+            says = (f"effort {effort}" if effort else "") + ({"edit": " · EDIT", "bypass": " · BYPASS"}.get(perm, "")) \
+                if named else runs
+            if (m.made and m.persona) or getattr(m, "lean", "free") != "free":
+                says += " · " + LEAN_SHOWN[getattr(m, "lean", "free")]
+            tmx("set-option", "-p", "-t", p, "@council_lean", getattr(m, "lean", "free"))
             tmx("set-option", "-p", "-t", p, "@council_perm", perm)
+            tmx("set-option", "-p", "-t", p, "@council_name", m.shown())       # what ✕ asks about
+            tmx("set-option", "-p", "-t", p, "@council_what", "Delete agent" if m.made else "Remove")
             tmx("set-option", "-p", "-t", p, "@council_model", m.model or "")
             tmx("set-option", "-p", "-t", p, "@council_effort", m.effort or "")
             tmx("set-option", "-p", "-t", p, "@council_runs", runs.replace("#", "##"))
             tmx("set-option", "-p", "-t", p, "@council_default", (m.default_model or "its own").replace("#", "##"))
             tmx("set-option", "-p", "-t", p, "pane-border-format",
                 f" #[fg={TMUX_COLOUR.get(m.colour(), 'colour221')},bold]{who}#[default] "
-                f"#[fg=colour252]{runs.replace('#', '##')}#[default] #[fg=colour244]Alt+M or m: change#[default]"
+                f"#[fg=colour252]{says.replace('#', '##').lstrip(' ·')}#[default] #[fg=colour244]Alt+M or m: change#[default]"
                 "#[align=right]#[fg=colour244] ✕ #[default]")
+        one = self.panes.get(ALL)
+        if one:       # the one view's header: everyone at the table, each in the colour of its answers
+            names = " ".join(f"#[fg={TMUX_COLOUR.get(m.colour(), 'colour221')},bold]@{m.shown()}#[default]"
+                             for m in meeting.seated())
+            tmx("set-option", "-p", "-t", one, "pane-border-format",
+                f" #[fg=colour252,bold]everyone#[default] {names} #[fg=colour244]· one view (Alt+O in the chat "
+                "box: one pane each)#[default]#[align=right]#[fg=colour244] ✕ #[default]")
         # for the + in the bottom bar: who is not at the table, and where to type
-        out = [m for m in meeting.members if not m.seated and (m.account or m.made)]
+        # + add's Bring back: agents with a character only (an LLM's seat comes back by Another … seat)
+        out = [m for m in meeting.members if not m.seated and m.made and m.persona]
         tmx("set-option", "-w", "-t", self.me, "@council_chair", self.me)
+        tmx("set-option", "-w", "-t", self.me, "@council_used",        # for the model menus: no model twice
+            ";".join(f"{canon(m.runs_on()[0])}={m.shown()}" for m in meeting.seated()
+                     if not (m.made and m.persona) and canon(m.runs_on()[0])))
+        tmx("set-option", "-w", "-t", self.me, "@council_homes",
+            ";".join(f"{t}={h}" for t, h in {m.tool: m.home for m in reversed(meeting.members) if m.home}.items()))
+        tmx("set-option", "-w", "-t", self.me, "@council_seated",      # for ✕ on the one view: who to take off
+            ";".join(f"{m.handle}={m.shown()}={'1' if m.made else '0'}" for m in meeting.seated()))
         tmx("set-option", "-w", "-t", self.me, "@council_full", "1" if len(meeting.seated()) >= MAX_SEATS else "0")
         tmx("set-option", "-w", "-t", self.me, "@council_out",
             ";".join(f"{m.handle}={m.label()}" for m in out).replace("#", "##"))
@@ -1308,16 +2068,27 @@ def menu(client, pane):
     def mark(on):
         return "• " if on else "  "
 
-    names = [n for n in MODELS[tool] if not re.fullmatch(r"claude-(opus|fable|sonnet|haiku)-5-\d", n)]
-    if model and model not in names:
+    win = tmx("display-message", "-p", "-t", pane, "#{window_id}")
+    names = models_for(tool, homes(win).get(tool))
+    if model and canon(model) not in [canon(n) for n in names]:
         names.insert(0, model)
+    used = used_models(win)
+    me = opt("@council_name")
     items = []
-    for key, name in zip("123456789", names):
-        items += [mark(name == model) + name, key, send(f"/model @{handle} {name}")]
+    for key, name in zip(MODEL_KEYS, names):
+        who = used.get(canon(name))
+        if who and who != me:            # another member runs it: no model twice at the table
+            items += [f"-  {model_label(name)}  (@{who} has it)", key, ""]
+        else:
+            items += [mark(canon(name) == canon(model)) + model_label(name), key, send(f"/model @{handle} {name}")]
     items += [mark(not model) + f"default model ({default or 'its own'})", "0", send(f"/model @{handle} default")]
-    items += ["  another model…", "o",
-              f"command-prompt -p 'Model for @{handle}:' \"send-keys -t '{chair}' -l '/model @{handle} %%' ; "
-              f"send-keys -t '{chair}' Enter\""]
+    items += ["  another model…", "o", popup_ask(chair, f"Model for @{handle}", f"/model @{handle} %s")]
+    items += [""]
+    lean = opt("@council_lean") or "free"
+    for key, (side, text) in zip("OGF", (("opposition", "side: opposition (always against the chair)"),
+                                          ("government", "side: government (for the chair and its agenda)"),
+                                          ("free", "side: free will (no side)"))):
+        items += [mark(side == lean) + text, key, send(f"/lean @{handle} {side}")]
     items += [""]
     perm = opt("@council_perm") or "plan"
     keys = {"minimal": "n", "low": "l", "medium": "e", "high": "h", "xhigh": "x", "max": "X"}
@@ -1331,17 +2102,17 @@ def menu(client, pane):
     for key, (p, text) in zip("rwb", (("plan", "plan (read-only)"), ("edit", "edit (change files, no commands)"),
                                        ("bypass", "bypass (anything, no asking)"))):
         items += [mark(p == perm) + "permission: " + text, key, send(f"/perm @{handle} {p}")]
-    tmx("display-menu", "-M", *(["-c", client] if client else []), "-t", pane,
+    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
         "-T", f"#[align=centre] @{handle}: model and effort ", "-x", "P", "-y", "P", "--", *items)
     return 0
 
 
 def mark(e):
-    """The phase after a name: ⚔ roast (with its round), ↻ round table."""
+    """The phase after a name: ⚔ roast, ↻ round table (each with its round after the first)."""
+    r = e.get("round", 1)
     if e.get("phase") == "roast":
-        r = e.get("round", 1)
         return " ⚔" + (f" {r}" if r > 1 else "")
-    return " ↻" if e.get("phase") == "table" else ""
+    return " ↻" + (f" {r}" if r > 1 else "") if e.get("phase") == "table" else ""
 
 
 def lines_of(text, width):
@@ -1377,41 +2148,229 @@ def bubble(name, text, kind, right):
 
 
 def remove(pane):
-    """✕ in a member's header (or Alt+Q there): that member leaves the table (/bench, typed into the
-    chat box), and the grid is dealt again without it. The + in the bottom bar brings it back."""
+    """✕ in a member's header (or Alt+Q there): /remove, typed into the chat box. An agent you made is
+    deleted for good; an LLM's own seat leaves the table (the + in the bottom bar brings it back). The
+    grid is dealt again without it."""
     handle = tmx("show-options", "-pqv", "-t", pane, "@council_member")
     chair = tmx("show-options", "-pqv", "-t", pane, "@council_chair")
+    if handle == ALL and chair:
+        tmx("send-keys", "-t", chair, "-l", "/view grid")
+        tmx("send-keys", "-t", chair, "Enter")
+        return 0
     if handle and chair:
-        tmx("send-keys", "-t", chair, "-l", f"/bench {handle}")
+        # what every council understands, one opened before /remove was there too: an agent you made
+        # (any name that is not an LLM's) is deleted, an LLM's own seat benched
+        tmx("send-keys", "-t", chair, "-l", f"/bench {handle}" if handle in TOOLS else f"/agent del {handle}")
         tmx("send-keys", "-t", chair, "Enter")
     return 0
 
 
 def add_menu(client, win):
-    """+ in the bottom bar of a council tab: bring back a member that left the table, or make a new
-    agent. The pick is typed into the chat box (/seat, /agent new)."""
+    """+ in the bottom bar of a council tab: another seat of an LLM, on the model you pick (a seat of it
+    that left the table comes back on it), a new agent, or an agent with a character that left. The pick
+    is typed into the chat box (/agent more, /agent new, /seat)."""
     chair = tmx("show-options", "-wqv", "-t", win, "@council_chair")
     if not chair:
         return 0
-    out = [x.split("=", 1) for x in tmx("show-options", "-wqv", "-t", win, "@council_out").split(";") if "=" in x]
-    items = []
-    for key, (handle, label) in zip("123456789", out):
-        items += [f"Bring back {label}", key, f"send-keys -t '{chair}' -l '/seat {handle}' ; send-keys -t '{chair}' Enter"]
-    if not out:
-        items += ["-Everyone is at the table", "", ""]
     full = tmx("show-options", "-wqv", "-t", win, "@council_full") == "1"
     grey = "-" if full else ""
-    items += [""]
+    # every agent you made with a character, with its lean: the ones at the table greyed, the others
+    # to bring to it
+    agents = [a for a in read_json(CONF).get("agents", []) if a.get("persona")]
+    seated = {x.split("=")[0] for x in tmx("show-options", "-wqv", "-t", win, "@council_seated").split(";") if x}
+    items = ["-Agents you made", "", ""] if agents else []
+    key = iter("123456789")
+    for a in agents:
+        h = handle_of(a.get("name", ""))
+        what = f"@{h}  ({LEAN_SHOWN.get(a.get('lean') or 'free', 'free will')})"
+        if h in seated:
+            items += [f"-  {what}  at the table", "", ""]
+        else:
+            items += [f"{grey}  {what}", next(key, ""), f"send-keys -t '{chair}' -l '/seat {h}' ; send-keys -t '{chair}' Enter"]
+    if items:
+        items += [""]
     for key, tool in zip("cxga", ("claude", "codex", "gemini", "agy")):
-        items += [f"{grey}Another {TOOLS[tool]} seat", key,
-                  f"send-keys -t '{chair}' -l '/agent more {tool}' ; send-keys -t '{chair}' Enter"]
+        items += [f"{grey}Another {TOOLS[tool]} seat…", key,
+                  f"run-shell -b \"'{ME}' --model-menu '{client}' '{win}' {tool}\""]
     if full:
         items += ["-The table is full (9): ✕ someone first", "", ""]
+    if tmx("show-options", "-wqv", "-t", win, "@council_seated"):
+        items += ["", "Remove everyone…", "r", f"run-shell -b \"'{ME}' --clear-menu '{client}' '{win}'\""]
+    # a form in the middle of the screen (tmux's own prompt sits on the bottom line)
     items += ["", f"{grey}New agent…", "n",
-              f"command-prompt -p 'New agent (NAME LLM CHARACTER, e.g. Skeptic claude A CFO who hates spending):' "
-              f"\"send-keys -t '{chair}' -l '/agent new %%%' ; send-keys -t '{chair}' Enter\""]
-    tmx("display-menu", "-M", *(["-c", client] if client else []), "-T", "#[align=centre] Add to the council ",
-        "-x", "R", "-y", "S", "--", *items)
+              f"display-popup -E -x C -y C -w 84 -h 32 -T ' New agent ' \"'{ME}' --new-agent '{chair}' '{win}'\""]
+    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-T", "#[align=centre] Add to the council ",
+        "-x", "C", "-y", "C", "--", *items)
+    return 0
+
+
+def used_models(win):
+    """{model: who runs it} at the table of that council tab (what the council last wrote there)."""
+    return dict(x.split("=", 1) for x in tmx("show-options", "-wqv", "-t", win, "@council_used").split(";")
+                if "=" in x)
+
+
+def homes(win):
+    return dict(x.split("=", 1) for x in tmx("show-options", "-wqv", "-t", win, "@council_homes").split(";")
+                if "=" in x)
+
+
+def model_menu(client, win, tool):
+    """+ add, Another X seat: which model the new seat runs. Every model that LLM can run; one that a
+    member at the table runs already is shown, greyed, with who runs it (never twice at the table)."""
+    chair = tmx("show-options", "-wqv", "-t", win, "@council_chair")
+    if not chair or tool not in TOOLS:
+        return 0
+    used = used_models(win)
+    items = []
+    for key, model in zip(MODEL_KEYS, models_for(tool, homes(win).get(tool))):
+        who = used.get(canon(model))
+        items += [f"-{model_label(model)}  (@{who} has it)" if who else model_label(model), key,
+                  f"send-keys -t '{chair}' -l '/agent more {tool}:{model}' ; send-keys -t '{chair}' Enter"]
+    if not any(not i.startswith("-") for i in items[0::3]):
+        items += ["", f"-Every {TOOLS[tool]} model is at the table", "", ""]
+    items += ["", "Another model…", "o", popup_ask(chair, f"Model for the new {TOOLS[tool]} seat",
+                                                 f"/agent more {tool}:%s")]
+    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-T",
+        f"#[align=centre] Another {TOOLS[tool]} seat: which model? ", "-x", "C", "-y", "C", "--", *items)
+    return 0
+
+
+def popup_ask(chair, question, template):
+    """A tmux command for a menu: one question in a small pop-up in the middle of the screen; the answer
+    goes into the template (%s) and is typed into the chat box."""
+    return (f"display-popup -E -x C -y C -w 72 -h 7 -T ' {question} ' "
+            f"\"'{ME}' --ask '{chair}' '{question}' '{template}'\"")
+
+
+def ask_popup(chair, question, template):
+    """Inside the pop-up: ask, then type the command into the chat box. Esc, Ctrl+C or an empty answer:
+    nothing is sent."""
+    try:
+        sys.stdout.write(f"\n  {question}\n\n")
+        answer = input("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return 0
+    if answer and re.fullmatch(r"[\w.:/@-]+", answer):
+        tmx("send-keys", "-t", chair, "-l", template.replace("%s", answer))
+        tmx("send-keys", "-t", chair, "Enter")
+    elif answer:
+        input("  Not a model name (letters, digits, . : / - only). Enter to close. ")
+    return 0
+
+
+def new_agent_form(chair, win):
+    """+ add, New agent…: a form in a pop-up in the middle of the screen. Name, LLM, model (every
+    version it can run; one a member runs already is marked and refused), character, soul, rules; then
+    /agent new is typed into the chat box. Ctrl+C or Esc at any question: nothing is made."""
+    out = sys.stdout
+    taken = {handle_of(a.get("name", "")) for a in read_json(CONF).get("agents", [])} | set(TOOLS)
+    taken |= {x.split("=")[1] for x in tmx("show-options", "-wqv", "-t", win, "@council_seated").split(";") if "=" in x}
+    used = used_models(win)
+
+    def ask(q, hint=""):
+        out.write(paint(f"  {q}", "chair") + (paint(f"  {hint}", "note") if hint else "") + "\n")
+        out.flush()
+        return input("  > ").strip()
+
+    try:
+        out.write(paint("\n  A new agent for the council", "chair") + paint("  (Ctrl+C: cancel)", "note") + "\n\n")
+        while True:
+            name = ask("Name", "one word, e.g. Skeptic")
+            if not re.fullmatch(r"[A-Za-z][\w-]{0,30}", name):
+                out.write(paint("  One word: letters, digits, - or _.\n", "err"))
+            elif handle_of(name) in taken:
+                out.write(paint(f"  There is a member or agent called {name} already.\n", "err"))
+            else:
+                break
+        tools = list(TOOLS)
+        while True:
+            pick = ask("LLM", "   ".join(f"{i} {TOOLS[t]}" for i, t in enumerate(tools, 1))).lower()
+            tool = tools[int(pick) - 1] if pick.isdigit() and 0 < int(pick) <= len(tools) else \
+                ALIAS.get(pick, pick)
+            if tool in TOOLS:
+                break
+            out.write(paint("  Pick 1 to 4.\n", "err"))
+        models = models_for(tool, homes(win).get(tool))
+        out.write("\n")
+        for i, mdl in enumerate(models, 1):
+            who = used.get(canon(mdl))
+            out.write(f"   {i:2} " + (paint(f"{model_label(mdl)}  (@{who} has it)", "note") if who else model_label(mdl))
+                      + "\n")
+        while True:
+            pick = ask("Model", "its number, a name, or Enter for its LLM's default")
+            model = models[int(pick) - 1] if pick.isdigit() and 0 < int(pick) <= len(models) else pick
+            if model and not re.fullmatch(r"[\w.:/-]+", model):
+                out.write(paint("  Not a model name.\n", "err"))
+            elif model and used.get(canon(model)):
+                out.write(paint(f"  @{used[canon(model)]} runs {model} already: pick another.\n", "err"))
+            else:
+                break
+        out.write("\n")
+        while True:
+            character = ask("Character", "who it is and how it talks")
+            if character:
+                break
+            out.write(paint("  An agent needs a character (a seat without one: + add, Another … seat).\n", "err"))
+        soul = ask("Soul", "what it cares about most (Enter to leave it for later)")
+        rules = ask("Rules", "what it must or must never do (Enter to leave it for later)")
+        while True:
+            lean = lean_of(ask("Lean", "1 Opposition (always against the chair)   2 Government (for the chair and "
+                                       "its agenda)   3 Free will (no sides; Enter)") or "3")
+            if lean:
+                break
+            out.write(paint("  Pick 1, 2 or 3.\n", "err"))
+        spec = tool + (f":{model}" if model else "")
+        if ask(f"Make @{handle_of(name)} on {TOOLS[tool]}" + (f" {model}" if model else "") + "?", "Enter or y: yes, n: no"
+               ).lower() in ("n", "no"):
+            return 0
+    except (EOFError, KeyboardInterrupt):
+        return 0
+    text = f"/agent new {name} {spec} {character} || {soul} || {rules} || {lean}"
+    tmx("send-keys", "-t", chair, "-l", " ".join(text.split()))
+    tmx("send-keys", "-t", chair, "Enter")
+    return 0
+
+
+def clear_menu(client, target):
+    """Remove everyone…: asks first. Then /remove all: every member leaves the table as ✕ on it would (an
+    agent you made is deleted, its folder kept in agents/_removed; an LLM's seat is benched)."""
+    chair = tmx("show-options", "-wqv", "-t", target, "@council_chair")
+    seated = [x.split("=") for x in tmx("show-options", "-wqv", "-t", target, "@council_seated").split(";") if x]
+    if not chair or not seated:
+        return 0
+    made = sum(1 for x in seated if len(x) == 3 and x[2] == "1")
+    title = f"#[align=centre] Take all {len(seated)} off the table? " + (
+        f"({made} you made: deleted, folders kept) " if made else "")
+    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-T", title, "-x", "C", "-y", "C", "--",
+        "Yes, remove everyone", "y", f"send-keys -t '{chair}' -l '/remove all' ; send-keys -t '{chair}' Enter",
+        "", "No, keep them", "n", "")
+    return 0
+
+
+def one_menu(client, pane):
+    """✕ or Alt+Q on the one view: who to take off the table (an agent you made is deleted for good, an
+    LLM's seat benched, as ✕ on its own pane does in the grid), back to one pane each, or close."""
+    chair = tmx("show-options", "-pqv", "-t", pane, "@council_chair")
+    if not chair:
+        return 0
+
+    def send(text):
+        return f"send-keys -t '{chair}' -l '{text}' ; send-keys -t '{chair}' Enter"
+
+    seated = [x.split("=") for x in tmx("show-options", "-wqv", "-t", pane, "@council_seated").split(";") if x]
+    items = []
+    for key, (handle, name, made) in zip("123456789", [x for x in seated if len(x) == 3]):
+        items += [f"Delete agent @{name} for good" if made == "1" else f"Remove @{name} (+ add brings it back)", key,
+                  send(f"/agent del {handle}" if made == "1" else f"/bench {handle}")]
+    if not items:
+        items += ["-Nobody at the table", "", ""]
+    if seated:
+        items += ["Remove everyone…", "a", f"run-shell -b \"'{ME}' --clear-menu '{client}' '{pane}'\""]
+    items += ["", "Back to one pane per member", "g", send("/view grid"),
+              "Close the council", "q", send("/quit"), "", "Cancel", "n", ""]
+    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane, "-T", "#[align=centre] Take who off? ",
+        "-x", "C", "-y", "C", "--", *items)
     return 0
 
 
@@ -1453,6 +2412,7 @@ def view(feed, handle, owner):
 def follow(feed, handle, owner, out, fd):
     import select
     pos, since, spun = 0, None, False
+    one, thinking = handle == ALL, []      # the one view: everyone's answers, yours on the right
     while True:
         chunk = b""
         try:
@@ -1476,22 +2436,25 @@ def follow(feed, handle, owner, out, fd):
                 if t == "reset":
                     out.write("\033[2J\033[H")
                 elif t == "status":
-                    if handle in e.get("who", []):
+                    running = e.get("who", [])
+                    if handle in running or (one and running):
                         since = since or time.time()
+                        thinking = [(e.get("names") or {}).get(h, h) for h in running]
                     else:
                         since = None
                 elif t == "msg" and e.get("who") == "chair":
-                    out.write(bubble("you", e.get("text", ""), "you", right=False))
+                    out.write(bubble("you", e.get("text", ""), "you", right=one))
                 elif t == "msg" and e.get("who") == handle:
                     kind = "err" if e.get("problem") else e.get("kind", "agent")
-                    out.write(bubble("@" + handle + mark(e), e.get("text", ""), kind, right=True))
+                    out.write(bubble("@" + (e.get("as") or handle) + mark(e), e.get("text", ""), kind, right=True))
                     since = None
                 elif t == "msg" and not e.get("problem"):
-                    out.write(bubble("@" + e.get("who", "?") + mark(e), e.get("text", ""), e.get("kind", "agent"),
+                    out.write(bubble("@" + (e.get("as") or e.get("who", "?")) + mark(e), e.get("text", ""), e.get("kind", "agent"),
                                      right=False))
         if since:
             frame = SPIN[int(time.time() * 10) % len(SPIN)]
-            out.write("\r\033[K" + paint(f"{frame} thinking  {int(time.time() - since)}s", "note"))
+            who = (" ".join("@" + n for n in thinking) + " ") if one else ""
+            out.write("\r\033[K" + paint(f"{frame} {who}thinking  {int(time.time() - since)}s", "note"))
             spun = True
         out.flush()
         try:
@@ -1517,17 +2480,19 @@ def follow(feed, handle, owner, out, fd):
 
 
 # ---- commands ------------------------------------------------------------------------------------------
-def build_members(conf, accts, out=None, here=None):
-    """Every member the council knows; who sits at the table is kept per folder (seats), so taking
+def build_members(conf, accts, out=None):
+    """Every member the council knows; who sits at the table is this project's own (seats), so taking
     someone off in one project's council leaves the others alone."""
-    seats = (conf.get("seats") or {}).get(here or "", {})
+    seats = conf.get("seats") or {}
     members = []
     for tool in TOOLS:
         acct, signed, folder = accts.get(tool, (None, False, None))
         st = conf.get("llm", {}).get(tool, {})
         m = Member(TOOLS[tool], tool, account=acct, model=st.get("model"), effort=st.get("effort"), folder=folder)
         m.perm = st.get("perm")
-        m.seated = bool(acct and signed) and seats.get(tool, True)
+        m.lean = st.get("lean") or "free"
+        m.signed = bool(acct and signed)
+        m.seated = m.signed and seats.get(tool, True)
         if acct is None:
             m.seated = False
         members.append(m)
@@ -1543,7 +2508,10 @@ def build_members(conf, accts, out=None, here=None):
         folder = accts.get(tool, (None, False, None))[2] if acct == accts.get(tool, (None,))[0] else None
         m = Member(a["name"], tool, account=acct, model=a.get("model"), persona=a.get("persona", ""), made=True,
                    effort=a.get("effort"), folder=folder)
-        m.perm = a.get("perm")
+        m.soul, m.rules = a.get("soul", ""), a.get("rules", "")
+        m.powers = list(a.get("powers") or [])
+        m.lean = a.get("lean") or "free"        # an extra seat without a character too
+        m.perm = (conf.get("agent_perm") or {}).get(a["name"])
         m.seated = seats.get(m.handle, True)
         members.append(m)
     return members
@@ -1569,7 +2537,7 @@ def tags(text, meeting):
         elif not m:
             unknown.append(w)
     if off:          # a member taken off the table is not asked, even by name
-        note(", ".join("@" + m.handle for m in off) + (" is" if len(off) == 1 else " are") +
+        note(", ".join("@" + m.shown() for m in off) + (" is" if len(off) == 1 else " are") +
              " off the table: + add (or /seat) brings it back.")
     if (unknown or off) and not found:
         if unknown:
@@ -1605,6 +2573,45 @@ def command_line(line, meeting, conf, accts):
             pass
         note(f"Answers: at most {meeting.words()} words each (roasts: one or two sentences per member). "
              "/length N changes it.")
+    elif cmd == "lean":
+        who = [w for w in args if w.startswith("@")]
+        vals = [w for w in args if not w.startswith("@")]
+        lean = lean_of(vals[-1]) if vals else ""
+        if not lean or not who:
+            note("Sides: " + "  ".join(f"@{m.shown()} {LEAN_SHOWN[getattr(m, 'lean', 'free')]}" for m in meeting.seated())
+                 + " · /lean @name opposition|government|free (@all for everyone)")
+            return True
+        targets = meeting.seated() if any(w.lower() in ("@all", "@everyone") for w in who) else \
+            [meeting.find(w[1:].rstrip(".,")) or w for w in who]
+        done = []
+        for m in targets:
+            if isinstance(m, str):
+                note(f"No member called {m}.")
+                continue
+            m.lean = lean
+            if m.made:
+                for a in conf["agents"]:
+                    if a["name"] == m.name:
+                        a["lean"] = lean
+            else:
+                conf.setdefault("llm", {}).setdefault(m.tool, {})["lean"] = lean
+            done.append("@" + m.shown())
+        if done:
+            save_conf(conf)
+            note(" ".join(done) + f" now {'leans' if len(done) == 1 else 'all lean'} {LEAN_SHOWN[lean]}" + {
+                "opposition": ": always against the chair.", "government": ": for the chair and its agenda.",
+                "free": ": no side."}[lean])
+        if GRID[0]:
+            GRID[0].relabel(meeting)
+    elif cmd == "names":
+        if args and args[0].lower() in ("model", "llm"):
+            conf["names"] = NAMES["by"] = args[0].lower()
+            save_conf(conf)
+        note("Names: " + ("each LLM goes by the model it runs on (@opus, @gpt-6-astra); agents with a character "
+                          "keep their names" if NAMES["by"] == "model" else "each LLM goes by its own name (@claude, "
+                          "@codex)") + ". /names model|llm changes it; @claude still finds it either way.")
+        if GRID[0]:
+            GRID[0].relabel(meeting)
     elif cmd == "rounds":
         if meeting.mode == "roast":
             try:
@@ -1614,12 +2621,18 @@ def command_line(line, meeting, conf, accts):
             note("Roast mode: " + ("round after round until Ctrl+C." if not meeting.roasts else
                  f"{meeting.roasts} roast round(s) per message.") + " /rounds N sets it, 0 = until Ctrl+C.")
         else:
-            try:
-                meeting.rounds = max(0, min(5, int(args[0])))
-            except (IndexError, ValueError):
-                pass
-            note(f"Order mode: everyone answers, then {meeting.rounds} pass(es) round the table per message"
-                 + (" (none: answers only)." if not meeting.rounds else "."))
+            if args and args[0].lower() in ("none", "off", "-1"):
+                meeting.rounds = -1
+            else:
+                try:
+                    meeting.rounds = max(0, min(50, int(args[0])))
+                except (IndexError, ValueError):
+                    pass
+            note("Order mode: everyone answers, then " + (
+                "round the table again and again until Ctrl+C (or everyone passes)." if meeting.rounds == 0 else
+                "no round table (answers only)." if meeting.rounds < 0 else
+                f"{meeting.rounds} pass(es) round the table per message.") +
+                " /rounds N, 0 = until Ctrl+C, none = answers only.")
     elif cmd == "topic":
         if args:
             meeting.topic = " ".join(args)
@@ -1629,6 +2642,23 @@ def command_line(line, meeting, conf, accts):
             state = "" if m.seated else "  (benched)"
             print(paint(f"  {m.label()}", m.colour()) + (f": {m.persona}" if m.made and m.persona else "") +
                   paint(state, "note"))
+    elif cmd in ("remove", "kick"):
+        # ✕ on a member's header: an agent you made is deleted, not benched (gone from every council;
+        # + add makes a new one); an LLM's own seat (its account) can only leave this table
+        if [w.lower().lstrip("@") for w in args] in (["all"], ["everyone"]):
+            gone = meeting.seated()
+            for m in gone:
+                with contextlib.redirect_stdout(io.StringIO()):     # one note for all, not one each
+                    command_line(f"/agent del {m.handle}" if m.made else f"/bench {m.handle}", meeting, conf, accts)
+            note(f"Everyone left the table ({len(gone)}). + add brings seats back." if gone else
+                 "Nobody is at the table.")
+            return True
+        for w in args:
+            m = meeting.find(w.lstrip("@"))
+            if not m:
+                note(f"No member called {w}.")
+            else:
+                command_line(f"/agent del {m.handle}" if m.made else f"/bench {m.handle}", meeting, conf, accts)
     elif cmd in ("bench", "seat"):
         for w in args:
             m = meeting.find(w.lstrip("@"))
@@ -1641,11 +2671,17 @@ def command_line(line, meeting, conf, accts):
             if cmd == "seat" and not m.account:
                 note(f"{m.name} has no account in the fleet's list (agents --accounts).")
                 continue
+            if cmd == "seat" and not m.seated and not (m.made and m.persona):
+                other = meeting.runs_model(m.runs_on()[0], but=m)
+                if other:
+                    note(f"@{m.shown()} runs {m.runs_on()[0]}, which @{other.shown()} runs already: give it another "
+                         f"model first (/model @{m.handle} …) or ✕ @{other.shown()}.")
+                    continue
             m.seated = cmd == "seat"
             if not m.seated:
                 stop_member(m.handle)      # taken off the table: what it was answering stops now
             # kept for this folder's council only (the next council here starts the same way)
-            conf.setdefault("seats", {}).setdefault(meeting.folder, {})[m.handle] = m.seated
+            conf.setdefault("seats", {})[m.handle] = m.seated
             save_conf(conf)
             note(f"{m.label()} {'is at the table' if m.seated else 'is benched'}.")
     elif cmd == "agent":
@@ -1654,16 +2690,45 @@ def command_line(line, meeting, conf, accts):
             # another seat for an LLM, no character: "Claude 2", "Codex 3"…; its model: Alt+M on its pane
             spec = parse_llm(args[1])
             if spec:
-                base = "Agy" if spec[0] == "agy" else TOOLS[spec[0]]
+                tool, acct, model, effort = spec
+                home = next((m.home for m in meeting.members if m.tool == tool and m.home), None)
+                if model and meeting.runs_model(model):
+                    note(f"@{meeting.runs_model(model).shown()} runs {model} already: no model twice at the table. "
+                         f"Pick another: + add, Another {TOOLS[tool]} seat.")
+                    return True
+                if not model:          # no model asked for: the first of its list that nobody at the table runs
+                    model = next((x for x in models_for(tool, home) if not meeting.runs_model(x)), None)
+                    if not model:
+                        note(f"Every {TOOLS[tool]} model is at the table already.")
+                        return True
+                # a seat of this LLM that left the table (its own, or an extra one) comes back on this model:
+                # no Claude2 while Claude's own seat is off
+                back = next((x for x in meeting.members if x.tool == tool and not x.seated and not (x.made and x.persona)
+                             and getattr(x, "signed", True) and (x.account or x.made)
+                             and (not acct or x.account == acct)), None)
+                if back:
+                    back.model = model
+                    if back.made:
+                        for a in conf["agents"]:
+                            if a["name"] == back.name:
+                                a["model"] = model
+                    else:
+                        conf.setdefault("llm", {}).setdefault(tool, {})["model"] = model
+                    save_conf(conf)
+                    return command_line(f"/seat {back.handle}", meeting, conf, accts)
+                base = "Agy" if tool == "agy" else TOOLS[tool]
                 n = 2
                 while meeting.find(f"{base}{n}"):
                     n += 1
-                args = ["new", f"{base}{n}", args[1], ""]
+                spec_text = tool + (f"@{acct}" if acct else "") + f":{model}" + (f":{effort}" if effort else "")
+                args = ["new", f"{base}{n}", spec_text, ""]
                 sub = "new"
         if sub in ("new", "add") and len(args) >= 4 and len(meeting.seated()) >= MAX_SEATS:
             note(f"The table is full ({MAX_SEATS} at most): ✕ someone first, then + add.")
         elif sub in ("new", "add") and len(args) >= 4:
             name, spec, persona = args[1], parse_llm(args[2]), " ".join(args[3:]).strip()
+            persona, soul, rules, lean = (persona.split("||") + ["", "", ""])[:4]   # CHARACTER || SOUL || RULES || LEAN
+            persona, soul, rules, lean = persona.strip(), soul.strip(), rules.strip(), lean_of(lean) or "free"
             if not spec:
                 note("LLM must be claude, codex, gemini or agy (with @account, :model and :effort if you like, "
                      "e.g. claude:opus:high).")
@@ -1672,22 +2737,76 @@ def command_line(line, meeting, conf, accts):
             else:
                 tool, acct, model, effort = spec
                 conf["agents"].append({"name": name, "tool": tool, "account": acct, "model": model, "effort": effort,
-                                       "persona": persona})
+                                       "persona": persona, "soul": soul, "rules": rules, "lean": lean})
                 save_conf(conf)
                 cur = accts.get(tool, (None, False, None))
                 m = Member(name, tool, account=acct or cur[0], model=model, persona=persona, made=True, effort=effort,
                            folder=cur[2] if not acct or acct == cur[0] else None)
+                m.soul, m.rules, m.lean = soul, rules, lean
                 meeting.members.append(m)
-                note(f"{m.label()} joins the table. Tag it as @{m.handle}.")
+                where = ""
+                if persona:
+                    d = ensure_agent(meeting.owner, name, persona, soul, rules)
+                    where = f" Its soul, character, rules and memory: {os.path.relpath(d, meeting.owner)}/"
+                note(f"{m.label()} joins the table. Tag it as @{m.shown()}.{where}")
+        elif sub == "lean" and len(args) >= 2:
+            m = meeting.find(args[1].lstrip("@"))
+            lean = lean_of(args[2]) if len(args) > 2 else ""
+            if not m:
+                note(f"No member called {args[1]}.")
+            elif not lean:
+                note(f"@{m.shown()} leans {LEAN_SHOWN[getattr(m, 'lean', 'free')]}. /agent lean NAME opposition | "
+                     "government | free")
+            else:
+                m.lean = lean
+                for a in conf["agents"]:
+                    if a["name"] == m.name:
+                        a["lean"] = lean
+                save_conf(conf)
+                note(f"@{m.shown()} now leans {LEAN_SHOWN[lean]}" + {
+                    "opposition": ": always against the chair.", "government": ": for the chair and its agenda.",
+                    "free": ": no side."}[lean])
+                if GRID[0]:
+                    GRID[0].relabel(meeting)
+        elif sub == "power" and len(args) >= 3:
+            m = meeting.find(args[1].lstrip("@"))
+            power, on = args[2].lower(), (args[3].lower() if len(args) > 3 else "on") not in ("off", "no", "0")
+            if not m or not m.made or not m.persona:
+                note(f"No agent with a character called {args[1]} (powers are for agents you made).")
+            elif power != "remove":
+                note("The power there is: remove (take a member off the table on its own judgement).")
+            else:
+                m.powers = sorted(set(getattr(m, "powers", [])) | {power}) if on else \
+                    [x for x in getattr(m, "powers", []) if x != power]
+                for a in conf["agents"]:
+                    if a["name"] == m.name:
+                        a["powers"] = m.powers
+                save_conf(conf)
+                note(f"@{m.shown()} " + ("may now remove members on its own judgement, saying why: an agent is "
+                                         "deleted with its memory wiped, an LLM's seat leaves the table." if on else
+                                         "no longer removes members."))
         elif sub in ("del", "rm", "remove") and len(args) >= 2:
             m = meeting.find(args[1].lstrip("@"))
             if not m or not m.made:
                 note(f"No made agent called {args[1]}.")
             else:
+                name = m.shown()
+                m.seated = False
+                stop_member(m.handle)            # what it was answering stops now
                 conf["agents"] = [a for a in conf["agents"] if a["name"] != m.name]
+                d = agent_dir(meeting.owner, m.name)
+                if m.persona and os.path.isdir(d):       # moved aside, with its memory, never deleted
+                    try:
+                        aside = os.path.join(agents_dir(meeting.owner), "_removed")
+                        os.makedirs(aside, exist_ok=True)
+                        os.replace(d, os.path.join(aside, f"{handle_of(m.name)}-{time.strftime('%Y%m%d-%H%M%S')}"))
+                    except OSError:
+                        pass
+                (conf.get("agent_perm") or {}).pop(m.name, None)
+                (conf.get("seats") or {}).pop(m.handle, None)
                 save_conf(conf)
                 meeting.members.remove(m)
-                note(f"{m.name} has left the council.")
+                note(f"@{name} ({m.name}) is removed for good, not benched. + add makes a new one.")
         else:
             note("/agent new NAME LLM PERSONA…   e.g. /agent new Skeptic claude A CFO who hates spending money")
     elif cmd in ("model", "effort"):
@@ -1720,6 +2839,12 @@ def command_line(line, meeting, conf, accts):
             if cmd == "model" and value is not None and not re.fullmatch(r"[\w.:/-]+", value):
                 note(f"{value!r} is not a model name.")
                 continue
+            if cmd == "model" and value is not None and not (m.made and m.persona) and m.seated:
+                other = meeting.runs_model(value, but=m)
+                if other:
+                    note(f"@{other.shown()} runs {value} already: no model twice at the table. Pick another "
+                         "(Alt+M on a pane lists them).")
+                    continue
             setattr(m, cmd, value)
             if m.made:
                 for a in conf["agents"]:
@@ -1755,9 +2880,7 @@ def command_line(line, meeting, conf, accts):
                 continue
             m.perm = None if value == "default" else value
             if m.made:
-                for a in conf["agents"]:
-                    if a["name"] == m.name:
-                        a["perm"] = m.perm
+                conf.setdefault("agent_perm", {})[m.name] = m.perm
             else:
                 conf.setdefault("llm", {}).setdefault(m.tool, {})["perm"] = m.perm
         save_conf(conf)
@@ -1770,9 +2893,23 @@ def command_line(line, meeting, conf, accts):
             GRID[0].relabel(meeting)
     elif cmd == "models":
         for tool in TOOLS:
-            print(paint(f"  {TOOLS[tool]}", tool) + ": " + ", ".join(MODELS[tool]) + "   effort: " +
+            home = next((m.home for m in meeting.members if m.tool == tool and m.home), None)
+            print(paint(f"  {TOOLS[tool]}", tool) + ": " + ", ".join(models_for(tool, home)) + "   effort: " +
                   (", ".join(EFFORTS[tool]) if EFFORTS[tool] else "none"))
         note("Any name that LLM's own program takes works too (`agy models` lists Antigravity's).")
+    elif cmd == "view":
+        want = args[0].lower() if args else ("grid" if conf.get("view") == "one" else "one")
+        want = {"single": "one", "1": "one", "all": "one", "split": "grid", "panes": "grid", "each": "grid"}.get(
+            want, want)
+        if want not in ("one", "grid"):
+            note("/view one: everyone's answers in one pane · /view grid: one pane per member · Alt+O switches.")
+            return True
+        conf["view"] = want
+        save_conf(conf)
+        if GRID[0] and GRID[0].me and FEED["path"]:
+            GRID[0].open(meeting)          # the new panes read the whole thread from the feed
+        note("View: one pane for everyone, yours on the right (Alt+O: one pane per member)." if want == "one" else
+             "View: one pane per member, each with its own scroll (Alt+O: one pane for everyone).")
     elif cmd == "grid":
         if args and args[0].lower() == "off":
             if GRID[0]:
@@ -1789,6 +2926,7 @@ def command_line(line, meeting, conf, accts):
 
 
 GRID = [None]        # the Grid of this council, when it runs in tmux
+ALL = ":all"         # the one view's place in the grid (never a member's handle: those are [a-z0-9_-])
 
 
 def pid_cwd(pid):
@@ -1823,13 +2961,10 @@ def open_tab(session, pid):
     return 0
 
 
-GENERAL = os.path.join(HOME, "Council")   # Alt+Shift+K: a council about no project, in a folder of its own
-
-
 def open_general(session):
-    """Alt+Shift+K: a new tab with a council that belongs to no project. It runs in ~/Council, an
-    empty folder of its own: members have no project's files to read, and in edit or bypass nothing
-    of a project to change. It carries on its own last meeting like any council (~/Council/logs/council)."""
+    """Alt+Shift+K: a new tab with a council that belongs to no project. Each of its meetings is a
+    folder in ~/Council, and its members work in that folder: no project's files to read, and in edit
+    or bypass nothing of a project to change. It carries on its last meeting like any council."""
     os.makedirs(GENERAL, exist_ok=True)
     tmux = os.path.join(HOME, ".local/bin/tmux")
     tmux = tmux if os.access(tmux, os.X_OK) else "tmux"
@@ -1853,6 +2988,16 @@ def main(argv):
         return menu(argv[1], argv[2])
     if argv[:1] == ["--remove"] and len(argv) >= 2:
         return remove(argv[1])
+    if argv[:1] == ["--model-menu"] and len(argv) >= 4:
+        return model_menu(argv[1], argv[2], argv[3])
+    if argv[:1] == ["--new-agent"] and len(argv) >= 3:
+        return new_agent_form(argv[1], argv[2])
+    if argv[:1] == ["--ask"] and len(argv) >= 4:
+        return ask_popup(argv[1], argv[2], argv[3])
+    if argv[:1] == ["--clear-menu"] and len(argv) >= 3:
+        return clear_menu(argv[1], argv[2])
+    if argv[:1] == ["--one-menu"] and len(argv) >= 3:
+        return one_menu(argv[1], argv[2])
     if argv[:1] == ["--add-menu"] and len(argv) >= 3:
         return add_menu(argv[1], argv[2])
     folder = os.getcwd()
@@ -1866,19 +3011,32 @@ def main(argv):
     if "--general" in argv:
         os.makedirs(GENERAL, exist_ok=True)
         folder = GENERAL
+    g = os.path.realpath(GENERAL)
+    if os.path.realpath(folder).startswith(g + os.sep):
+        folder = GENERAL               # Alt+K inside one of ~/Council's meetings: that council, not a new one
     if folder in ("/", HOME):
         folder = HOME
-    os.chdir(folder)
-    conf = load_conf()
+    home = council_home(folder)
+    # meetings kept the old way (side by side in logs/council): each into a folder of its own
+    upgrade(os.path.join(GENERAL, "logs", "council") if home == GENERAL else home, home)
+    conf = load_conf(home, folder)
+    NAMES["by"] = conf.get("names") or "model"
     accts = accounts()
     outs = []
-    members = build_members(conf, accts, outs, folder)
+    members = build_members(conf, accts, outs)
     meeting = Meeting(folder, members, conf)
+    TABLE[0] = meeting
+    for m in members:                        # each agent's own folder in this project (made once, then yours)
+        if m.made and m.persona:
+            ensure_agent(folder, m.name, m.persona, getattr(m, "soul", ""), getattr(m, "rules", ""))
     carried = 0
     if TTY and "--new" not in argv:          # a council remembers: it carries on its folder's last meeting
-        past = meetings(folder)
+        past = meetings(home)
         if past:
             carried = carry_on(meeting, past[0])
+    if not meeting.dir:
+        meeting.open_session()
+    os.chdir(meeting.folder)
     pane = os.environ.get("TMUX_PANE", "")
     if os.environ.get("TMUX") and pane and TTY:
         tmx("rename-window", "-t", pane, "council")
@@ -1892,6 +3050,8 @@ def main(argv):
                 tmx("display-message", "-p", "-t", pane, "#{window_panes}") == "1":
             GRID[0].open(meeting)
     threading.Thread(target=animate, daemon=True).start()
+    if TTY:
+        threading.Thread(target=refresh_models, daemon=True).start()
     about = meeting.topic or next((e.get("text", "") for e in meeting.thread if e.get("who") == "chair"), "")
     remembered = (f"carrying on “{fit(about, 40)}” ({carried} messages) · /new for a fresh one · /resume for "
                   "another") if carried else ""
@@ -1910,9 +3070,26 @@ def main(argv):
         note("Tag with @name, /mode order|roast, /model and /effort @name VALUE, /agent new NAME LLM PERSONA, "
              "/help. Ctrl+C stops a round.")
         print()
+    if TTY:     # a hard crash (readline, a C library) leaves its Python traceback in errors.log
+        try:
+            import faulthandler
+            d = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "afc-council")
+            os.makedirs(d, exist_ok=True)
+            CRASHLOG[0] = open(os.path.join(d, "errors.log"), "a")
+            faulthandler.enable(CRASHLOG[0])
+        except (OSError, ImportError):
+            pass
+
+    def leave(sig, frame):           # the tab was closed under it: the runs at work end with it
+        stop_all()
+        raise SystemExit(0)
+    signal.signal(signal.SIGHUP, leave)
+    signal.signal(signal.SIGTERM, leave)
     try:
         return chat(meeting, members, conf, accts, folder)
     finally:
+        if TABLE[0]:
+            TABLE[0].close_session()
         if GRID[0]:
             GRID[0].close()
         if FEED["path"]:
@@ -1939,6 +3116,10 @@ def chat(meeting, members, conf, accts, folder):
     TABLE[0] = meeting
     if TTY:
         setup_typing()
+    if BOX["on"]:
+        RL[0] = rl_lib()
+        if RL[0]:      # the box redraws itself on a resize, readline's own redraw left out
+            signal.signal(signal.SIGWINCH, relayout)
     while True:
         try:
             INPUT["open"] = bool(work)
@@ -1957,12 +3138,18 @@ def chat(meeting, members, conf, accts, folder):
             else:
                 note("Nothing running to stop. /quit (or Ctrl+D) closes the council.")
             continue
+        except Exception as e:  # noqa: BLE001  (the typing line went wrong: say so, keep the council)
+            errlog("the typing line")
+            BOX["note"] = f"⚠ the typing line went wrong ({fit(str(e), 60)}); what you typed is lost. Logged."
+            if not BOX["on"]:
+                note(BOX["note"])
+            continue
         finally:
-            INPUT["open"] = False
+            INPUT["open"] = INPUT["rl"] = False
         if KEY_NEW in line:              # Alt+T: a new meeting, named by what was typed
             line = ("/new " + line.replace(KEY_NEW, "", 1).strip()).strip()
-        for marker, cmd in ((KEY_MODE, "/mode"), (KEY_PERM, "/perm " + {"plan": "edit", "edit": "bypass"}.get(
-                conf.get("perm") or "plan", "plan"))):
+        for marker, cmd in ((KEY_MODE, "/mode"), (KEY_VIEW, "/view"), (KEY_PERM, "/perm " + {
+                "plan": "edit", "edit": "bypass"}.get(conf.get("perm") or "plan", "plan"))):
             if marker in line:            # Shift+Tab or Alt+P: do it, and give back what was typed
                 PENDING["text"] = line.replace(marker, "", 1)
                 if BOX["on"]:
@@ -1990,10 +3177,10 @@ def chat(meeting, members, conf, accts, folder):
             else:
                 STOP.clear()
                 meeting.parallel(named, lambda m: task, "first")
-            note("Trying again: " + " ".join("@" + m.handle for m in named))
+            note("Trying again: " + " ".join("@" + m.shown() for m in named))
             continue
         if line.split()[:1] == ["/resume"] or line.lower().startswith("/resume "):
-            past = [f for f in meetings(folder) if f != meeting.file]
+            past = [f for f in meetings(meeting.home) if f != meeting.file]
             arg = line.split()[1] if len(line.split()) > 1 else ""
             if not arg:
                 if BOX["on"]:
@@ -2011,6 +3198,7 @@ def chat(meeting, members, conf, accts, folder):
             if work:
                 work.stop()
             meeting.save()
+            meeting.close_session()
             meeting = Meeting(folder, members, conf)
             TABLE[0] = meeting
             n = carry_on(meeting, pick)
@@ -2035,9 +3223,12 @@ def chat(meeting, members, conf, accts, folder):
                     if work:
                         work.stop()
                     meeting.save()
+                    meeting.close_session()
                     meeting = Meeting(folder, members, conf)
                     TABLE[0] = meeting
                     meeting.topic = line[4:].strip()
+                    meeting.open_session()
+                    meeting.name_session(meeting.topic)
                     with LOCK:
                         emit({"t": "reset"})
                     if BOX["on"]:
@@ -2063,6 +3254,7 @@ def chat(meeting, members, conf, accts, folder):
             with LOCK:
                 meeting.thread.append({"who": "chair", "name": "Chair", "text": line, "phase": "chair"})
                 emit({"t": "msg", "who": "chair", "text": line, "phase": "chair"})
+            meeting.name_session(meeting.topic or line)
             last = named or meeting.seated()
             work.submit(meeting, last, True, directed=named)
             continue
@@ -2076,6 +3268,7 @@ def chat(meeting, members, conf, accts, folder):
             if named is None:
                 continue
             meeting.thread.append({"who": "chair", "name": "Chair", "text": line, "phase": "chair"})
+            meeting.name_session(meeting.topic or line)
             with LOCK:
                 emit({"t": "msg", "who": "chair", "text": line, "phase": "chair"})
             if not TTY:
