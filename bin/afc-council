@@ -714,7 +714,31 @@ def send_cmd(chair, text):
             f"send-keys -t {tmx_quote(chair)} Enter")
 
 
-def open_settings_popup(pane_or_win, start="settings", client="", delay=0.0):
+def _popup_lock_path(win):
+    d = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "afc-council")
+    os.makedirs(d, exist_ok=True)
+    safe = re.sub(r"[^\w.-]+", "_", str(win or "default"))
+    return os.path.join(d, f"popup-{safe}.lock")
+
+
+def _popup_is_open(win):
+    """True when a Council Settings popup is already open for this tmux window."""
+    try:
+        import fcntl
+        fd = os.open(_popup_lock_path(win), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        except OSError:
+            return True
+        finally:
+            os.close(fd)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def open_settings_popup(pane_or_win, start="settings", client="", delay=0.0, auto=False):
     """Open the persistent interactive Council Settings & BP Assignment popup centred on screen.
     Unlike tmux display-menu, it NEVER vanishes when you pick an option and has ← Back on every screen."""
     if not (os.environ.get("TMUX") and pane_or_win):
@@ -725,7 +749,17 @@ def open_settings_popup(pane_or_win, start="settings", client="", delay=0.0):
             time.sleep(delay)
             if tmx("display-message", "-p", "-t", pane_or_win, "#{&&:#{pane_active},#{window_active}}") != "1":
                 return
+            if auto:
+                if BUSY.is_set():
+                    return
+                try:
+                    if INPUT.get("rl") and readline.get_line_buffer().strip():
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
         win = tmx("display-message", "-p", "-t", pane_or_win, "#{window_id}") or pane_or_win
+        if _popup_is_open(win):
+            return
         chair = tmx("show-options", "-wqv", "-t", win, "@council_chair") or pane_or_win
         cl = client or tmx("display-message", "-p", "-t", pane_or_win, "#{client_name}")
         pop_cmd = " ".join(shlex.quote(str(x)) for x in (ME, "--settings-popup", chair, win, start))
@@ -733,10 +767,7 @@ def open_settings_popup(pane_or_win, start="settings", client="", delay=0.0):
             "-w", "84", "-h", "28", "-b", "rounded", "-S", "fg=#bb9af7",
             "-T", " Council Settings ", pop_cmd)
 
-    if delay:
-        threading.Thread(target=go, daemon=True).start()
-    else:
-        threading.Thread(target=go, daemon=True).start()
+    threading.Thread(target=go, daemon=True).start()
 
 
 def format_menu(meeting, pane, wait=1.5):
@@ -744,7 +775,7 @@ def format_menu(meeting, pane, wait=1.5):
     (Esc/Done closes it; AFC_COUNCIL_NO_FORMAT_MENU=1 turns it off for automated tests)."""
     if os.environ.get("AFC_COUNCIL_NO_FORMAT_MENU") or not (os.environ.get("TMUX") and pane and TTY):
         return
-    open_settings_popup(pane, start="settings", delay=wait)
+    open_settings_popup(pane, start="settings", delay=wait, auto=True)
 
 
 def rounds_menu(meeting, pane):
@@ -782,20 +813,41 @@ def _settings_screen_items(screen, conf, meeting, accts, hmap):
         perm = (conf.get("perm") or "plan").upper()
         cast = meeting.bp_cast()
         bp_summary = f"{len(cast)}/8 assigned" + (f" ({len(conf.get('bp_cast') or {})} custom)" if conf.get("bp_cast") else " (auto)")
+        seated_n = len(meeting.seated())
         rows = [
             {"kind": "hdr", "label": f"Council Settings · {meeting.project() or 'General'}   (Judge: {judge_str})"},
             {"kind": "item", "key": "1", "label": "Format", "right": f"{FORMAT_SHOWN[fmt]}  ›", "colour": "purple", "action": ("push", ("format",))},
             {"kind": "item", "key": "2", "label": "Mode (Open Forum)", "right": f"{meeting.mode.upper()}  (toggle)", "colour": "cyan", "action": ("toggle_mode",)},
             {"kind": "item", "key": "3", "label": "Rounds", "right": f"{rounds_val}  ›", "colour": "blue", "action": ("push", ("rounds",))},
             {"kind": "item", "key": "4", "label": "BP Debate Positions (8 speakers, all providers)", "right": f"{bp_summary}  ›", "colour": "amber", "action": ("push", ("bp",))},
+            {"kind": "item", "key": "5", "label": "Table Seats (Open Forum / Win Stake)", "right": f"{seated_n}/{len(meeting.members)} seated  ›", "colour": "green", "action": ("push", ("seats",))},
             {"kind": "sep"},
-            {"kind": "item", "key": "5", "label": "Permission", "right": f"{perm}  (cycle)", "colour": "green" if perm == "PLAN" else ("amber" if perm == "EDIT" else "red"), "action": ("cycle_perm",)},
-            {"kind": "item", "key": "6", "label": "Answer length", "right": f"{meeting.words()} words  (cycle)", "colour": "cyan", "action": ("cycle_words",)},
-            {"kind": "item", "key": "7", "label": "Display names", "right": f"by {conf.get('names') or 'model'}  (toggle)", "colour": "blue", "action": ("toggle_names",)},
+            {"kind": "item", "key": "6", "label": "Permission", "right": f"{perm}  (cycle)", "colour": "green" if perm == "PLAN" else ("amber" if perm == "EDIT" else "red"), "action": ("cycle_perm",)},
+            {"kind": "item", "key": "7", "label": "Answer length", "right": f"{meeting.words()} words  (cycle)", "colour": "cyan", "action": ("cycle_words",)},
+            {"kind": "item", "key": "8", "label": "Display names", "right": f"by {conf.get('names') or 'model'}  (toggle)", "colour": "blue", "action": ("toggle_names",)},
             {"kind": "sep"},
             {"kind": "item", "key": "d", "label": "✓ Done & Apply", "right": "Esc / q", "colour": "green", "action": ("done",)},
         ]
         return "Council Settings", "Council Settings", rows
+
+    if kind == "seats":
+        rows = [{"kind": "hdr", "label": "Table Seats · Click or Enter to toggle who sits in Open Forum / Win Stake"}]
+        for idx, m in enumerate(meeting.members, 1):
+            mark = "● [✓] " if m.seated else "  [ ] "
+            tag = "judge" if "judge" in getattr(m, "powers", []) else (TOOLS.get(m.tool, m.tool) + " · " + m.runs_on()[0])
+            if not getattr(m, "signed", True) and not m.made:
+                tag += " (not signed in)"
+            rows.append({"kind": "item", "key": str(idx) if idx <= 9 else "",
+                         "label": f"{mark}@{m.shown()}", "right": tag,
+                         "colour": m.tool if m.seated else "muted",
+                         "action": ("toggle_seat", m.handle)})
+        rows += [
+            {"kind": "sep"},
+            {"kind": "item", "key": "a", "label": "Seat all signed-in members", "right": "", "colour": "green", "action": ("seat_all",)},
+            {"kind": "item", "key": "b", "label": "← Back to Council Settings", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
+            {"kind": "item", "key": "d", "label": "✓ Done & Apply", "right": "q", "colour": "green", "action": ("done",)},
+        ]
+        return "Table Seats", "Council Settings › Seats", rows
 
     if kind == "format":
         rows = [
@@ -1085,7 +1137,16 @@ def settings_popup(chair, win, start="settings"):
 
     fd = sys.stdin.fileno()
     old = None
+    lock_fd = None
     try:
+        try:
+            import fcntl
+            lock_fd = os.open(_popup_lock_path(win), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            return 0
         old = termios.tcgetattr(fd)
         tty.setraw(fd)
         sys.stdout.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h")
@@ -1103,7 +1164,7 @@ def settings_popup(chair, win, start="settings"):
             sz = shutil.get_terminal_size((84, 28))
             W, H = max(40, sz.columns), max(14, sz.lines)
             body_top = 3
-            body_h = max(4, H - 5)   # 2 header rows + body + 2 footer rows + 1 status row
+            body_h = max(4, H - 5)   # 2 header rows + body + sep + status + footer
             sc = scrolls.get(scr, 0)
             if cur < sc:
                 sc = cur
@@ -1112,32 +1173,38 @@ def settings_popup(chair, win, start="settings"):
             sc = max(0, min(sc, max(0, len(rows) - body_h)))
             scrolls[scr] = sc
 
-            # Draw full frame cleanly without flicker
-            buf = ["\033[H"]
-            # Row 1: Breadcrumb header + Back/Done pill indicators
+            # Explicit cursor positioning (\033[row;1H\033[K) on EVERY row so nothing can EVER wrap
+            # or scroll row H, keeping mouse click coordinates 100% pixel-exact.
+            buf = []
+            # Row 1: Breadcrumb header + exact pill hit rects
             back_pill = " [← Back] " if len(stack) > 1 else ""
             done_pill = " [✓ Done] "
-            pills = back_pill + done_pill
-            left_hdr = " " + fit(crumb, max(10, W - len(pills) - 2))
-            pad_hdr = " " * max(1, W - cells(left_hdr) - cells(pills))
-            buf.append(f"{C['hdr']}{C['bold']}{C['purple']}{left_hdr}{pad_hdr}"
-                       f"{C['amber']}{back_pill}{C['green']}{done_pill}{C['rst']}\r\n")
+            bp_w, dp_w = cells(back_pill), cells(done_pill)
+            pills_w = bp_w + dp_w
+            left_hdr = " " + fit(crumb, max(8, W - pills_w - 3))
+            pad_w = max(0, W - 1 - cells(left_hdr) - pills_w)
+            back_x1 = cells(left_hdr) + pad_w + 1
+            back_x2 = back_x1 + bp_w - 1
+            done_x1 = back_x1 + bp_w
+            done_x2 = done_x1 + dp_w - 1
+            buf.append(f"\033[1;1H\033[K{C['hdr']}{C['bold']}{C['purple']}{left_hdr}{' ' * pad_w}"
+                       f"{C['amber']}{back_pill}{C['green']}{done_pill} {C['rst']}")
             # Row 2: Thin separator
-            buf.append(f"{C['bg']}{C['muted']}{'─' * W}{C['rst']}\r\n")
+            buf.append(f"\033[2;1H\033[K{C['bg']}{C['muted']}{'─' * (W - 1)}{C['rst']}")
 
             row_map = {}   # terminal 1-based Y -> row index in rows
             for vy in range(body_h):
                 ri = sc + vy
                 term_y = body_top + vy
                 if ri >= len(rows):
-                    buf.append(f"{C['bg']}{' ' * W}{C['rst']}\r\n")
+                    buf.append(f"\033[{term_y};1H\033[K{C['bg']}{' ' * (W - 1)}{C['rst']}")
                     continue
                 r = rows[ri]
                 if r["kind"] == "sep":
-                    buf.append(f"{C['bg']}{C['muted']}{'─' * W}{C['rst']}\r\n")
+                    buf.append(f"\033[{term_y};1H\033[K{C['bg']}{C['muted']}{'─' * (W - 1)}{C['rst']}")
                 elif r["kind"] == "hdr":
-                    txt = " " + fit(r["label"], W - 2)
-                    buf.append(f"{C['bg']}{C['bold']}{C['muted']}{txt}{' ' * max(0, W - cells(txt))}{C['rst']}\r\n")
+                    txt = " " + fit(r["label"], max(8, W - 3))
+                    buf.append(f"\033[{term_y};1H\033[K{C['bg']}{C['bold']}{C['muted']}{txt}{' ' * max(0, W - 1 - cells(txt))}{C['rst']}")
                 else:
                     row_map[term_y] = ri
                     is_sel = (ri == cur)
@@ -1146,24 +1213,24 @@ def settings_popup(chair, win, start="settings"):
                     key_s = f"[{r['key']}] " if r.get("key") else "    "
                     ptr = "▸ " if is_sel else "  "
                     right = r.get("right") or ""
-                    max_r = min(cells(right), max(12, W // 2))
+                    max_r = min(cells(right), max(10, W // 2 - 2))
                     right_s = fit(right, max_r) if right else ""
-                    avail_l = max(10, W - len(ptr) - len(key_s) - (cells(right_s) + 2 if right_s else 1))
+                    avail_l = max(8, W - 1 - cells(ptr) - cells(key_s) - (cells(right_s) + 2 if right_s else 1))
                     left_s = fit(r["label"], avail_l)
-                    gap = max(1, W - len(ptr) - len(key_s) - cells(left_s) - cells(right_s) - 1)
-                    buf.append(f"{bg}{C['bold'] if is_sel else ''}{C['cyan']}{ptr}{C['amber']}{key_s}"
-                               f"{col}{left_s}{' ' * gap}{C['muted']}{right_s} {C['rst']}\r\n")
+                    gap = max(1, W - 1 - cells(ptr) - cells(key_s) - cells(left_s) - cells(right_s) - 1)
+                    buf.append(f"\033[{term_y};1H\033[K{bg}{C['bold'] if is_sel else ''}{C['cyan']}{ptr}{C['amber']}{key_s}"
+                               f"{col}{left_s}{' ' * gap}{C['muted']}{right_s} {C['rst']}")
 
-            # Scroll indicator + status + footer buttons
+            # Rows H-2, H-1, H: separator, status, footer (strictly W-1 cells on row H -> zero scroll!)
             scroll_info = f" ({sc + 1}–{min(len(rows), sc + body_h)}/{len(rows)})" if len(rows) > body_h else ""
-            buf.append(f"{C['bg']}{C['muted']}{'─' * W}{C['rst']}\r\n")
-            st = " " + fit(status_msg + scroll_info, W - 2)
-            buf.append(f"{C['bg']}{C['green']}{st}{' ' * max(0, W - cells(st))}{C['rst']}\r\n")
+            buf.append(f"\033[{H - 2};1H\033[K{C['bg']}{C['muted']}{'─' * (W - 1)}{C['rst']}")
+            st = " " + fit(status_msg + scroll_info, max(8, W - 3))
+            buf.append(f"\033[{H - 1};1H\033[K{C['bg']}{C['green']}{st}{' ' * max(0, W - 1 - cells(st))}{C['rst']}")
             foot = ("  [ ← Back (b/Esc) ]   [ ↑/↓ Move ]   [ Enter Select ]   [ ✓ Done (d/q) ]"
                     if len(stack) > 1 else
                     "  [ ↑/↓ Move ]   [ Enter Select / Toggle ]   [ ✓ Done & Apply (d/q/Esc) ]")
-            foot = fit(foot, W - 1)
-            buf.append(f"{C['hdr']}{C['text']}{foot}{' ' * max(0, W - cells(foot))}{C['rst']}")
+            foot = fit(foot, max(8, W - 2))
+            buf.append(f"\033[{H};1H\033[K{C['hdr']}{C['text']}{foot}{' ' * max(0, W - 1 - cells(foot))}{C['rst']}")
             sys.stdout.write("".join(buf))
             sys.stdout.flush()
 
@@ -1185,8 +1252,12 @@ def settings_popup(chair, win, start="settings"):
             elif ev == "pgdn" and items:
                 pos = min(len(items) - 1, items.index(cur) + max(1, body_h - 2))
                 cursors[scr] = items[pos]
-            elif ev in ("back", "left", "esc"):
-                action = ("back",)
+            elif ev == "esc":
+                action = ("back",) if len(stack) > 1 else ("done",)
+            elif ev in ("back", "left"):
+                # Backspace / Left arrow pop sub-screens, but NEVER accidentally close on the root screen
+                if len(stack) > 1:
+                    action = ("back",)
             elif ev == "enter" or ev == "right":
                 if items and cur in items:
                     action = rows[cur].get("action")
@@ -1200,15 +1271,14 @@ def settings_popup(chair, win, start="settings"):
                     cursors[scr] = items[pos]
                 elif btn == 0 and mtype == "M":
                     if my == 1:
-                        # Top right pills: [← Back] [✓ Done]
-                        if mx >= W - len(done_pill) + 1:
+                        if done_x1 <= mx <= done_x2:
                             action = ("done",)
-                        elif len(stack) > 1 and mx >= W - len(pills) + 1:
+                        elif len(stack) > 1 and back_x1 <= mx <= back_x2:
                             action = ("back",)
                     elif my == H:
-                        if len(stack) > 1 and mx <= 22:
+                        if len(stack) > 1 and 3 <= mx <= 20:
                             action = ("back",)
-                        elif mx >= W - 26:
+                        elif mx >= max(30, cells(foot) - 20) and mx <= cells(foot) + 1:
                             action = ("done",)
                     elif my in row_map:
                         ri = row_map[my]
@@ -1236,10 +1306,30 @@ def settings_popup(chair, win, start="settings"):
             elif op == "back":
                 if len(stack) > 1:
                     stack.pop()
-                else:
-                    break
             elif op == "push":
                 stack.append(action[1])
+            elif op == "toggle_seat":
+                h = action[1]
+                m_hit = next((x for x in meeting.members if x.handle == h), None)
+                if m_hit:
+                    if not m_hit.seated and len(meeting.seated()) >= MAX_SEATS:
+                        status_msg = f"⚠ Table full ({MAX_SEATS} max): unseat someone first"
+                    else:
+                        m_hit.seated = not m_hit.seated
+                        conf.setdefault("seats", {})[m_hit.handle] = m_hit.seated
+                        save_conf(conf)
+                        changed = True
+                        status_msg = f"✓ @{m_hit.shown()} {'seated' if m_hit.seated else 'benched'}"
+            elif op == "seat_all":
+                seated_now = 0
+                for m_hit in meeting.members:
+                    if getattr(m_hit, "signed", True) and seated_now < MAX_SEATS:
+                        m_hit.seated = True
+                        conf.setdefault("seats", {})[m_hit.handle] = True
+                        seated_now += 1
+                save_conf(conf)
+                changed = True
+                status_msg = f"✓ Seated {seated_now} signed-in member(s)"
             elif op == "set_format":
                 want = action[1]
                 conf["format"] = want
@@ -1358,6 +1448,11 @@ def settings_popup(chair, win, start="settings"):
     finally:
         if old is not None:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
         sys.stdout.write("\033[?1006l\033[?1000l\033[?25h\033[?1049l")
         sys.stdout.flush()
     if changed and chair:
@@ -4519,12 +4614,16 @@ def command_line(line, meeting, conf, accts):
             except (TypeError, ValueError):
                 pass
         NAMES["by"] = conf.get("names") or "model"
+        seats_map = conf.get("seats") or {}
+        for m in meeting.members:
+            if m.handle in seats_map:
+                m.seated = bool(seats_map[m.handle])
         fmt = meeting.format()
         rdesc = (f"{len(meeting.bp_cast())}/8 BP speakers" if fmt == "bp" else
                  f"{meeting.stake_rounds()} rounds" if fmt == "stake" else
                  f"{meeting.mode} (" + (("until Ctrl+C" if not meeting.roasts else f"{meeting.roasts}×") if meeting.mode == "roast" else
                                        ("until Ctrl+C" if meeting.rounds == 0 else "answers only" if meeting.rounds < 0 else f"{meeting.rounds}×")) + ")")
-        note(f"Settings applied: {FORMAT_SHOWN[fmt]} · {rdesc} · perm {(conf.get('perm') or 'plan').upper()} · {meeting.words()}w.")
+        note(f"Settings applied: {FORMAT_SHOWN[fmt]} · {rdesc} · {len(meeting.seated())} seated · perm {(conf.get('perm') or 'plan').upper()} · {meeting.words()}w.")
     elif cmd == "bp":
         roles = [r[0] for r in BP_ROLES]
         if args and args[0].lower() == "auto":
@@ -5169,6 +5268,8 @@ def main(argv):
         cl, target = argv[1], argv[2]
         start = argv[3] if len(argv) > 3 else "settings"
         win = tmx("display-message", "-p", "-t", target, "#{window_id}") or target
+        if _popup_is_open(win):
+            return 0
         chair = tmx("show-options", "-wqv", "-t", win, "@council_chair") or target
         pop_cmd = " ".join(shlex.quote(str(x)) for x in (ME, "--settings-popup", chair, win, start))
         tmx("display-popup", "-E", *(["-c", cl] if cl else []), "-x", "C", "-y", "C",
@@ -5531,6 +5632,10 @@ def chat(meeting, members, conf, accts, folder):
                                   command_line(line, meeting, conf, accts))
                 except KeyboardInterrupt:
                     keep_going = True
+                except Exception as e:  # noqa: BLE001
+                    errlog(f"command {line[:40]}")
+                    note(f"⚠ Command failed ({fit(str(e), 70)}); logged to errors.log.")
+                    keep_going = True
                 if not keep_going:
                     break
                 if line.split()[0].lower() == "/new":
@@ -5559,9 +5664,13 @@ def chat(meeting, members, conf, accts, folder):
                         BOX["note"] = "A new meeting." + (f" Topic: {meeting.topic}" if meeting.topic else "")
                     else:
                         note("A new meeting." + (f" Topic: {meeting.topic}" if meeting.topic else ""))
-                sync_grid_ui(had_grid)
-                if had_grid and FEED["grid"] and GRID[0] and seats != [m.handle for m in meeting.seated()]:
-                    GRID[0].open(meeting)          # someone joined or left: the grid is dealt out again
+                try:
+                    sync_grid_ui(had_grid)
+                    if had_grid and FEED["grid"] and GRID[0] and seats != [m.handle for m in meeting.seated()]:
+                        GRID[0].open(meeting)          # someone joined or left: the grid is dealt out again
+                except Exception as e:  # noqa: BLE001
+                    errlog("sync_grid_ui")
+                    note(f"⚠ View refresh failed ({fit(str(e), 70)}); logged to errors.log.")
                 continue
         if work:
             # The grid: the round runs in the background and the chat box takes the next message at
@@ -5585,22 +5694,28 @@ def chat(meeting, members, conf, accts, folder):
             work.submit(meeting, last, True, directed=named)
             continue
         STOP.clear()
-        if not line:
-            if not meeting.thread:
-                continue
-            meeting.round(last if last is not None else meeting.seated(), fresh=False)
-        else:
-            named = tags(line, meeting)
-            if named is None:
-                continue
-            meeting.thread.append({"who": "chair", "name": "Chair", "text": line, "phase": "chair"})
-            meeting.name_session(meeting.topic or line)
-            with LOCK:
-                emit({"t": "msg", "who": "chair", "text": line, "phase": "chair"})
-            if not TTY:
-                show(meeting.thread[-1])
-            last = named or meeting.seated()
-            meeting.round(last, fresh=True)
+        try:
+            if not line:
+                if not meeting.thread:
+                    continue
+                meeting.round(last if last is not None else meeting.seated(), fresh=False)
+            else:
+                named = tags(line, meeting)
+                if named is None:
+                    continue
+                meeting.thread.append({"who": "chair", "name": "Chair", "text": line, "phase": "chair"})
+                meeting.name_session(meeting.topic or line)
+                with LOCK:
+                    emit({"t": "msg", "who": "chair", "text": line, "phase": "chair"})
+                if not TTY:
+                    show(meeting.thread[-1])
+                last = named or meeting.seated()
+                meeting.round(last, fresh=True)
+        except KeyboardInterrupt:
+            STOP.set()
+        except Exception as e:  # noqa: BLE001
+            errlog("round")
+            note(f"⚠ Round failed ({fit(str(e), 70)}); logged to errors.log.")
         if STOP.is_set():
             set_status([])
             note("Stopped. What was said so far is kept.")

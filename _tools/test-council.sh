@@ -1001,6 +1001,11 @@ assert feed_esc(b"[I") == ("noop", None) and feed_esc(b"[O") == ("noop", None)
 assert feed_esc(b"[Mabc") == ("noop", None) and feed_esc(b"OH") == ("noop", None)
 assert feed_esc(b"[A") == ("up", None) and feed_esc(b"[<0;12;5M") == ("mouse", (0, 12, 5, "M"))
 
+# 19. Table Seats screen exists in persistent settings popup with Back button
+_ts, _cs, rws_s = g["_settings_screen_items"](("seats",), bp_conf, mt_bp, fake_accts, {})
+acts_s = [r.get("action") for r in rws_s if r["kind"] == "item"]
+assert ("back",) in acts_s and ("seat_all",) in acts_s and any(a and a[0] == "toggle_seat" for a in acts_s), f"seats screen wrong: {acts_s}"
+
 print("REGRESSIONS_OK")
 EOF
 )
