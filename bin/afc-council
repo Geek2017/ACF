@@ -22,7 +22,10 @@ raw take: no flattery, no hedging, disagree by name.
                                12), then each votes for who convinced it most; the judge announces the
                                winner and sums up the top 3.
                        /bp: the BP speakers, four benches of two, each with its model; set by
-                       seat unless chosen (/bp ROLE @name, /bp auto); the menu opens with /format bp.
+                       seat unless chosen (/bp ROLE @name, /bp ROLE provider:model across all
+                       providers, /bp ROLE auto, /bp auto).
+  /settings            persistent council settings & BP position/model setup popup (never vanishes
+                       until Done; has Back buttons on every screen; also ⚙ settings on the bar)
                        The judge: a member with the judge power, else one with the remove power
                        (Supra Omnia); it sits the debate out. With none, the council counts the votes.
   /mode                switch between the two modes below (/order and /roast go straight to one);
@@ -545,7 +548,7 @@ def say(text):
 
 
 # ---- what you can type: / lists the commands, @ the members, as soon as you type it -----------------------
-COMMANDS = ["/format", "/bp", "/mode", "/roast", "/order", "/rounds", "/round", "/sim", "/names", "/length", "/topic", "/model", "/effort", "/models", "/agents",
+COMMANDS = ["/settings", "/menu", "/format", "/bp", "/mode", "/roast", "/order", "/rounds", "/round", "/sim", "/names", "/length", "/topic", "/model", "/effort", "/models", "/agents",
             "/agent", "/remove", "/bench", "/seat", "/view", "/lean", "/new", "/resume", "/retry", "/perm", "/again", "/grid", "/help", "/quit"]
 TABLE = [None]          # the meeting, for the @ names
 
@@ -711,112 +714,655 @@ def send_cmd(chair, text):
             f"send-keys -t {tmx_quote(chair)} Enter")
 
 
-def format_menu(meeting, pane, wait=1.5):
-    """The choice of format, offered when a council opens and on /new (operator, 2026-11-24): a menu in the
-    middle of the screen, the format set now marked; Esc keeps it. The pick is typed into the chat as
-    /format, so the chat says what it is. AFC_COUNCIL_NO_FORMAT_MENU=1 turns it off (the tests)."""
-    if os.environ.get("AFC_COUNCIL_NO_FORMAT_MENU") or not (os.environ.get("TMUX") and pane and TTY):
+def open_settings_popup(pane_or_win, start="settings", client="", delay=0.0):
+    """Open the persistent interactive Council Settings & BP Assignment popup centred on screen.
+    Unlike tmux display-menu, it NEVER vanishes when you pick an option and has ← Back on every screen."""
+    if not (os.environ.get("TMUX") and pane_or_win):
         return
 
-    def go():
-        time.sleep(wait)          # the chat box is ready to take what the pick types
-        if tmx("display-message", "-p", "-t", pane, "#{&&:#{pane_active},#{window_active}}") != "1":
-            return                # user switched away or closed the council before the menu fired
-        client = tmx("display-message", "-p", "-t", pane, "#{client_name}")
-        cur = meeting.format()
-        n = meeting.stake_rounds()
-        adj = meeting.adjudicators()
-        judge = ("judge @" + adj[0].shown()) if adj else "no judge seated"
-        items = []
-        for key, f, what in (("1", "forum", f"Open Forum: {meeting.mode} mode, ends after /rounds"
-                                              + (f" ({judge})" if adj else "")),
-                             ("2", "bp", f"BP debate: up to 8 speakers, then the judge ({judge})"),
-                             ("3", "stake", f"Win Stake: {n} rounds, then the vote ({judge})")):
-            items += [("• " if f == cur else "  ") + what, key, send_cmd(pane, f"/format {f}")]
-        tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
-            "-T", "#[align=centre] Council format (Esc keeps it) ", "-x", "C", "-y", "C", "--", *items)
-    threading.Thread(target=go, daemon=True).start()
-
-
-def show_menu_async(pane, args, delay=0.12):
-    """Open a tmux display-menu in a background thread so command_line() finishes, chair_header()
-    updates, and chat() returns to input() before the user clicks an item."""
     def go():
         if delay:
             time.sleep(delay)
-        if tmx("display-message", "-p", "-t", pane, "#{&&:#{pane_active},#{window_active}}") != "1":
-            return
-        tmx(*args)
-    threading.Thread(target=go, daemon=True).start()
+            if tmx("display-message", "-p", "-t", pane_or_win, "#{&&:#{pane_active},#{window_active}}") != "1":
+                return
+        win = tmx("display-message", "-p", "-t", pane_or_win, "#{window_id}") or pane_or_win
+        chair = tmx("show-options", "-wqv", "-t", win, "@council_chair") or pane_or_win
+        cl = client or tmx("display-message", "-p", "-t", pane_or_win, "#{client_name}")
+        pop_cmd = " ".join(shlex.quote(str(x)) for x in (ME, "--settings-popup", chair, win, start))
+        tmx("display-popup", "-E", *(["-c", cl] if cl else []), "-x", "C", "-y", "C",
+            "-w", "84", "-h", "28", "-b", "rounded", "-S", "fg=#bb9af7",
+            "-T", " Council Settings ", pop_cmd)
+
+    if delay:
+        threading.Thread(target=go, daemon=True).start()
+    else:
+        threading.Thread(target=go, daemon=True).start()
+
+
+def format_menu(meeting, pane, wait=1.5):
+    """Offered when a council opens and on /new: opens the persistent centred Council Settings popup
+    (Esc/Done closes it; AFC_COUNCIL_NO_FORMAT_MENU=1 turns it off for automated tests)."""
+    if os.environ.get("AFC_COUNCIL_NO_FORMAT_MENU") or not (os.environ.get("TMUX") and pane and TTY):
+        return
+    open_settings_popup(pane, start="settings", delay=wait)
 
 
 def rounds_menu(meeting, pane):
-    """How many rounds, in the middle of the screen, after Open Forum or Win Stake is picked (operator,
-    2026-11-24): Win Stake 1 to 12; Open Forum by its mode. Esc keeps what is set; /rounds N does the same."""
+    """Opens the persistent Council Settings popup directly on the Rounds screen (with ← Back)."""
     if os.environ.get("AFC_COUNCIL_NO_FORMAT_MENU") or not (os.environ.get("TMUX") and pane and TTY):
         return
-    client = tmx("display-message", "-p", "-t", pane, "#{client_name}")
-    if meeting.format() == "stake":
-        now, title = meeting.stake_rounds(), " Win Stake: how many rounds? "
-        opts = [(str(n), f"{n} round{'s' if n > 1 else ''}", n) for n in (1, 2, 3, 4, 5, 6, 8, 10, 12)]
-    elif meeting.mode == "roast":
-        now, title = meeting.roasts, " Roast: counters per member? "
-        opts = [(str(n), f"{n}", n) for n in (1, 2, 3, 4, 5, 8)] + [("0", "until Ctrl+C", 0)]
-    else:
-        now, title = meeting.rounds, " Order: passes round the table? "
-        opts = [(str(n), f"{n}", n) for n in (1, 2, 3, 4, 5, 8)] + [("0", "until Ctrl+C or all pass", 0),
-                                                                   ("-", "none (answers only)", "none")]
-    items = []
-    for key, label, val in opts:
-        on = (val == now) or (val == "none" and now == -1)
-        items += [("• " if on else "  ") + label, key if len(key) == 1 else "", send_cmd(pane, f"/rounds {val}")]
-    show_menu_async(pane, ["display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
-                           "-T", f"#[align=centre]{title}", "-x", "C", "-y", "C", "--", *items])
+    open_settings_popup(pane, start="rounds", delay=0.12)
 
 
 def bp_menu(meeting, pane):
-    """The BP debate's speakers, in the middle of the screen: the four benches, two speakers each, with
-    the model each runs on, set by seat unless chosen. A slot opens the list of who can take it."""
+    """Opens the persistent Council Settings popup directly on the BP Debate Positions screen (with ← Back)."""
     if os.environ.get("AFC_COUNCIL_NO_FORMAT_MENU") or not (os.environ.get("TMUX") and pane and TTY):
         return
-    client = tmx("display-message", "-p", "-t", pane, "#{client_name}")
-    cast = dict((r[0], m) for r, m in meeting.bp_cast())
-    chosen = meeting.conf.get("bp_cast") or {}
-    items, key = [], iter("12345678")
-    for bench, side, pair in (("Opening Government", "for the motion", ("PM", "DPM")),
-                              ("Opening Opposition", "against", ("LO", "DLO")),
-                              ("Closing Government", "for the motion", ("MG", "GW")),
-                              ("Closing Opposition", "against", ("MO", "OW"))):
-        items += [f"-#[bold]{bench} ({side})", "", ""]
-        for abbr in pair:
-            m = cast.get(abbr)
-            who = f"@{m.shown()} · {m.runs_on()[0]}" if m else "(empty: + add a member)"
-            mark = "" if abbr in chosen else "  (by seat)"
-            items += [f"   {abbr:<4}{who}{mark}", next(key), send_cmd(pane, f"/bp pick {abbr}")]
-    adj = meeting.adjudicators()
-    items += ["", "Auto-set all by seat", "a", send_cmd(pane, "/bp auto"),
-              "-Judge: " + (" ".join(f"@{j.shown()} · {j.runs_on()[0]}" for j in adj) if adj else "none seated"), "", ""]
-    show_menu_async(pane, ["display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
-                           "-T", "#[align=centre] BP debate: who speaks (Esc when done) ", "-x", "C", "-y", "C", "--", *items])
+    open_settings_popup(pane, start="bp", delay=0.12)
 
 
 def bp_pick_menu(meeting, pane, role):
-    """Who takes one BP role: every member at the table but the judge, with its model and the role it
-    has now (picking one that has a role swaps the two)."""
-    if not (os.environ.get("TMUX") and pane and TTY):
+    """Opens the persistent Council Settings popup directly on the Assign Provider/Model screen for role."""
+    if os.environ.get("AFC_COUNCIL_NO_FORMAT_MENU") or not (os.environ.get("TMUX") and pane and TTY):
         return
-    client = tmx("display-message", "-p", "-t", pane, "#{client_name}")
-    now = {m.handle: r[0] for r, m in meeting.bp_cast()}
+    open_settings_popup(pane, start=f"bp_role:{role}", delay=0.12)
+
+
+def _settings_screen_items(screen, conf, meeting, accts, hmap):
+    """Build (title, breadcrumb, rows) for the persistent interactive Council Settings popup.
+    Each row is a dict: {kind: 'hdr'|'item'|'sep', label, key?, action?, right?, colour?, dim?}."""
+    fmt = meeting.format()
     adj = meeting.adjudicators()
-    items = []
-    for k, m in zip(MODEL_KEYS, [x for x in meeting.seated() if x not in adj]):
-        has = f"  (now {now[m.handle]})" if m.handle in now else "  (listening)"
-        items += [f"@{m.shown()} · {m.runs_on()[0]}{has}", k, send_cmd(pane, f"/bp {role} @{m.handle}")]
-    if not items:
-        items = ["-No seated speakers besides the judge (+ add someone)", "", ""]
-    name = next(r[1] for r in BP_ROLES if r[0] == role)
-    show_menu_async(pane, ["display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
-                           "-T", f"#[align=centre] {name} ({role}): who? ", "-x", "C", "-y", "C", "--", *items])
+    judge_str = ", ".join(f"@{j.shown()} ({j.runs_on()[0]})" for j in adj) if adj else "none seated"
+    kind = screen[0]
+    if kind == "settings":
+        rounds_val = (f"{meeting.stake_rounds()} rounds" if fmt == "stake" else
+                      ("until Ctrl+C" if not meeting.roasts else f"{meeting.roasts}× roast") if meeting.mode == "roast" else
+                      ("until Ctrl+C" if meeting.rounds == 0 else "answers only" if meeting.rounds < 0 else f"{meeting.rounds}× round table"))
+        perm = (conf.get("perm") or "plan").upper()
+        cast = meeting.bp_cast()
+        bp_summary = f"{len(cast)}/8 assigned" + (f" ({len(conf.get('bp_cast') or {})} custom)" if conf.get("bp_cast") else " (auto)")
+        rows = [
+            {"kind": "hdr", "label": f"Council Settings · {meeting.project() or 'General'}   (Judge: {judge_str})"},
+            {"kind": "item", "key": "1", "label": "Format", "right": f"{FORMAT_SHOWN[fmt]}  ›", "colour": "purple", "action": ("push", ("format",))},
+            {"kind": "item", "key": "2", "label": "Mode (Open Forum)", "right": f"{meeting.mode.upper()}  (toggle)", "colour": "cyan", "action": ("toggle_mode",)},
+            {"kind": "item", "key": "3", "label": "Rounds", "right": f"{rounds_val}  ›", "colour": "blue", "action": ("push", ("rounds",))},
+            {"kind": "item", "key": "4", "label": "BP Debate Positions (8 speakers, all providers)", "right": f"{bp_summary}  ›", "colour": "amber", "action": ("push", ("bp",))},
+            {"kind": "sep"},
+            {"kind": "item", "key": "5", "label": "Permission", "right": f"{perm}  (cycle)", "colour": "green" if perm == "PLAN" else ("amber" if perm == "EDIT" else "red"), "action": ("cycle_perm",)},
+            {"kind": "item", "key": "6", "label": "Answer length", "right": f"{meeting.words()} words  (cycle)", "colour": "cyan", "action": ("cycle_words",)},
+            {"kind": "item", "key": "7", "label": "Display names", "right": f"by {conf.get('names') or 'model'}  (toggle)", "colour": "blue", "action": ("toggle_names",)},
+            {"kind": "sep"},
+            {"kind": "item", "key": "d", "label": "✓ Done & Apply", "right": "Esc / q", "colour": "green", "action": ("done",)},
+        ]
+        return "Council Settings", "Council Settings", rows
+
+    if kind == "format":
+        rows = [
+            {"kind": "hdr", "label": "Choose Council Format (stays open — never vanishes)"},
+            {"kind": "item", "key": "1", "label": ("● " if fmt == "forum" else "  ") + "Open Forum",
+             "right": f"{meeting.mode} mode · ends after /rounds", "colour": "blue", "action": ("set_format", "forum")},
+            {"kind": "item", "key": "2", "label": ("● " if fmt == "bp" else "  ") + "BP Debate (British Parliamentary)",
+             "right": "8 positions · 4 benches → configure ›", "colour": "purple", "action": ("set_format", "bp")},
+            {"kind": "item", "key": "3", "label": ("● " if fmt == "stake" else "  ") + "Win Stake",
+             "right": f"{meeting.stake_rounds()} rounds + vote → rounds ›", "colour": "amber", "action": ("set_format", "stake")},
+            {"kind": "sep"},
+            {"kind": "item", "key": "b", "label": "← Back to Council Settings", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
+            {"kind": "item", "key": "d", "label": "✓ Done & Apply", "right": "q", "colour": "green", "action": ("done",)},
+        ]
+        return "Council Format", "Council Settings › Format", rows
+
+    if kind == "rounds":
+        if fmt == "stake":
+            now = meeting.stake_rounds()
+            title = "Win Stake Rounds (1 to 12)"
+            opts = [(str(n) if n <= 9 else "", f"{n} round{'s' if n != 1 else ''}", n) for n in (1, 2, 3, 4, 5, 6, 8, 10, 12)]
+        elif meeting.mode == "roast":
+            now = meeting.roasts
+            title = "Roast Rounds per Message"
+            opts = [(str(n), f"{n} counter{'s' if n != 1 else ''} each", n) for n in (1, 2, 3, 4, 5, 8)] + [("0", "Until Ctrl+C (unlimited)", 0)]
+        else:
+            now = meeting.rounds
+            title = "Order Mode: Passes Round the Table"
+            opts = [("-", "None (initial answers only)", -1)] + \
+                   [(str(n), f"{n} pass{'es' if n != 1 else ''} round the table", n) for n in (1, 2, 3, 4, 5, 8)] + \
+                   [("0", "Until Ctrl+C or everyone passes", 0)]
+        rows = [{"kind": "hdr", "label": title}]
+        for k, lbl, val in opts:
+            on = (val == now)
+            rows.append({"kind": "item", "key": k, "label": ("● " if on else "  ") + lbl,
+                         "right": "active" if on else "", "colour": "green" if on else "blue",
+                         "action": ("set_rounds", val)})
+        rows += [
+            {"kind": "sep"},
+            {"kind": "item", "key": "b", "label": "← Back to Council Settings", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
+            {"kind": "item", "key": "d", "label": "✓ Done & Apply", "right": "q", "colour": "green", "action": ("done",)},
+        ]
+        return title, "Council Settings › Rounds", rows
+
+    if kind == "bp":
+        cast_map = {r[0]: m for r, m in meeting.bp_cast()}
+        chosen = conf.get("bp_cast") or {}
+        rows = [{"kind": "hdr", "label": f"BP Debate · Assign any Provider & Model to all 8 positions (Judge: {judge_str})"}]
+        key_it = iter("12345678")
+        for bench, side, pair in (("Opening Government", "for", ("PM", "DPM")),
+                                  ("Opening Opposition", "against", ("LO", "DLO")),
+                                  ("Closing Government", "for", ("MG", "GW")),
+                                  ("Closing Opposition", "against", ("MO", "OW"))):
+            rows.append({"kind": "hdr", "label": f"  {bench} ({side})"})
+            for abbr in pair:
+                m = cast_map.get(abbr)
+                k = next(key_it)
+                if m:
+                    prov = TOOLS.get(m.tool, m.tool)
+                    mod = m.runs_on()[0]
+                    tag = "custom" if abbr in chosen else "auto"
+                    right = f"{prov} · {mod}  [{tag}] ›"
+                    lbl = f"  {abbr:<4} @{m.shown()}"
+                    col = m.tool
+                else:
+                    lbl = f"  {abbr:<4} (unassigned)"
+                    right = "Pick provider & model ›"
+                    col = "muted"
+                rows.append({"kind": "item", "key": k, "label": lbl, "right": right, "colour": col,
+                             "action": ("push", ("bp_role", abbr))})
+        rows += [
+            {"kind": "sep"},
+            {"kind": "item", "key": "a", "label": "Auto-fill all 8 positions by seat", "right": "clears overrides", "colour": "amber", "action": ("bp_auto_all",)},
+            {"kind": "item", "key": "b", "label": "← Back to Council Settings", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
+            {"kind": "item", "key": "d", "label": "✓ Done & Apply", "right": "q", "colour": "green", "action": ("done",)},
+        ]
+        return "BP Debate Positions", "Council Settings › BP Positions", rows
+
+    if kind == "bp_role":
+        abbr = screen[1]
+        rname, bench = next(((r[1], r[2]) for r in BP_ROLES if r[0] == abbr), (abbr, ""))
+        rows = [{"kind": "hdr", "label": f"Assign {abbr} — {rname} ({bench}): Pick Provider or Agent"}]
+        for idx, tool in enumerate(("claude", "codex", "gemini", "agy", "copilot", "opencode"), 1):
+            acct, signed, folder = accts.get(tool, (None, False, None))
+            home = hmap.get(tool) or folder
+            mlist = models_for(tool, home)
+            status = "✓ signed in" if (acct and signed) else ("free models" if tool == "opencode" else ("account set" if acct else "not signed in"))
+            rows.append({"kind": "item", "key": str(idx), "label": f"{TOOLS[tool]}",
+                         "right": f"{len(mlist)} models · {status}  ›",
+                         "colour": tool if (signed or tool == "opencode" or acct) else "muted",
+                         "action": ("push", ("bp_models", abbr, tool))})
+        # Custom persona agents & seated members
+        adj_set = set(adj)
+        extras = [m for m in meeting.members if m not in adj_set and m.made and m.persona]
+        if extras:
+            rows.append({"kind": "hdr", "label": "  Custom Agents (with persona / soul)"})
+            for m in extras:
+                rows.append({"kind": "item", "key": "", "label": f"  @{m.shown()} ({TOOLS.get(m.tool, m.tool)})",
+                             "right": m.runs_on()[0], "colour": "agent",
+                             "action": ("bp_set_member", abbr, m.handle)})
+        rows += [
+            {"kind": "sep"},
+            {"kind": "item", "key": "0", "label": f"Reset {abbr} to auto (by seat)", "right": "", "colour": "amber", "action": ("bp_reset_role", abbr)},
+            {"kind": "item", "key": "b", "label": "← Back to BP Positions", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
+        ]
+        return f"Assign {abbr}", f"Council Settings › BP › {abbr}", rows
+
+    if kind == "bp_models":
+        abbr, tool = screen[1], screen[2]
+        acct, signed, folder = accts.get(tool, (None, False, None))
+        home = hmap.get(tool) or folder
+        mlist = models_for(tool, home)
+        chosen = conf.get("bp_cast") or {}
+        cur_spec = chosen.get(abbr, "")
+        other_uses = {}
+        for r_k, sp in chosen.items():
+            if r_k != abbr and isinstance(sp, str) and ":" in sp:
+                t2, m2 = sp.split(":", 1)
+                if ALIAS.get(t2.lower(), t2.lower()) == tool and m2:
+                    other_uses.setdefault(canon(m2), []).append(r_k)
+        rows = [{"kind": "hdr", "label": f"{abbr} · Pick {TOOLS[tool]} Model ({len(mlist)} available) — ↑/↓ scroll, Enter picks"}]
+        rows.append({"kind": "item", "key": "0",
+                     "label": ("● " if cur_spec == f"{tool}:" else "  ") + f"{TOOLS[tool]} default model",
+                     "right": defaults(tool, home)[0] or "account default", "colour": tool,
+                     "action": ("bp_set_model", abbr, tool, "")})
+        for idx, mod in enumerate(mlist, 1):
+            is_cur = (cur_spec == f"{tool}:{mod}")
+            also = other_uses.get(canon(mod))
+            rtxt = ("active" if is_cur else "") + (f" (also {','.join(also)})" if also else "")
+            rows.append({"kind": "item", "key": str(idx) if idx <= 9 else "",
+                         "label": ("● " if is_cur else "  ") + model_label(mod),
+                         "right": rtxt.strip(), "colour": "green" if is_cur else tool,
+                         "action": ("bp_set_model", abbr, tool, mod)})
+        rows += [
+            {"kind": "sep"},
+            {"kind": "item", "key": "c", "label": f"Type custom {TOOLS[tool]} model ID…", "right": "any CLI model", "colour": "cyan",
+             "action": ("bp_custom_model", abbr, tool)},
+            {"kind": "item", "key": "b", "label": f"← Back to Providers ({abbr})", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
+            {"kind": "item", "key": "d", "label": "✓ Done & Apply", "right": "q", "colour": "green", "action": ("done",)},
+        ]
+        return f"{abbr} · {TOOLS[tool]}", f"Council Settings › BP › {abbr} › {TOOLS[tool]}", rows
+
+    return "Council Settings", "Council Settings", []
+
+
+def _parse_popup_escape(read_byte, has_more):
+    """Parse an escape sequence starting after the leading 0x1b.
+    ONLY a lone ESC (no follow-up bytes) returns ('esc', None). Focus events (\\x1b[I / \\x1b[O),
+    SS3 sequences, mouse motion/release, and unrecognized CSI sequences return ('noop', None) so
+    they NEVER accidentally close the popup."""
+    if not has_more(0.05):
+        return ("esc", None)
+    b0 = read_byte()
+    if not b0:
+        return ("esc", None)
+    if b0 == b"[":
+        buf = b""
+        while len(buf) < 32:
+            if not has_more(0.03):
+                break
+            b1 = read_byte()
+            if not b1:
+                break
+            buf += b1
+            if 0x40 <= b1[0] <= 0x7E:   # standard CSI final byte (@ through ~)
+                break
+        if buf == b"M":
+            # Legacy X10 mouse event: drain the 3 extra raw bytes so they never leak as 'q'/'d'
+            for _ in range(3):
+                if has_more(0.02):
+                    read_byte()
+            return ("noop", None)
+        s = buf.decode("ascii", "ignore")
+        if s == "A":
+            return ("up", None)
+        if s == "B":
+            return ("down", None)
+        if s == "C":
+            return ("right", None)
+        if s == "D":
+            return ("left", None)
+        if s == "5~":
+            return ("pgup", None)
+        if s == "6~":
+            return ("pgdn", None)
+        if s == "Z":
+            return ("back", None)
+        m_sgr = re.match(r"^<(\d+);(\d+);(\d+)([Mm])$", s)
+        if m_sgr:
+            return ("mouse", (int(m_sgr[1]), int(m_sgr[2]), int(m_sgr[3]), m_sgr[4]))
+        return ("noop", None)
+    if b0 == b"O":
+        # SS3 sequence (e.g. \x1bOA..\x1bOD, \x1bOH, \x1bOF): consume final byte, never treat as ESC
+        b1 = read_byte() if has_more(0.03) else b""
+        return {b"A": ("up", None), b"B": ("down", None), b"C": ("right", None),
+                b"D": ("left", None)}.get(b1, ("noop", None))
+    return ("noop", None)
+
+
+def settings_popup(chair, win, start="settings"):
+    """Persistent interactive TUI popup for Council Settings & BP Debate provider/model setup.
+    Never vanishes on click or focus events; every sub-screen has ← Back; saves immediately and /syncs on exit."""
+    import select
+    import termios
+    import tty
+
+    home = tmx("show-options", "-wqv", "-t", win, "@council_home") if win else ""
+    folder = tmx("show-options", "-wqv", "-t", win, "@council_folder") if win else ""
+    if not folder:
+        folder = os.getcwd()
+    if not home:
+        home = council_home(folder)
+    hmap = homes(win) if win else {}
+    conf = load_conf(home, folder)
+    NAMES["by"] = conf.get("names") or "model"
+    accts = accounts()
+    members = build_members(conf, accts)
+    meeting = Meeting(folder, members, conf)
+    TABLE[0] = meeting
+
+    if start.startswith("bp_role:") and start.split(":", 1)[1]:
+        stack = [("settings",), ("bp",), ("bp_role", start.split(":", 1)[1].upper())]
+    elif start in ("format", "rounds", "bp"):
+        stack = [("settings",), (start,)]
+    else:
+        stack = [("settings",)]
+
+    cursors = {}
+    scrolls = {}
+    status_msg = "Changes save live · Click or ↑/↓ + Enter · Backspace/b = Back · Done/q = Close"
+    changed = False
+
+    C = {
+        "bg": "\033[48;2;26;27;38m", "hdr": "\033[48;2;36;40;59m", "sel": "\033[48;2;46;54;82m",
+        "rst": "\033[0m", "bold": "\033[1m",
+        "white": "\033[38;2;235;240;255m", "text": "\033[38;2;192;202;245m",
+        "muted": "\033[38;2;128;140;180m", "blue": "\033[38;2;122;162;247m",
+        "purple": "\033[38;2;187;154;247m", "green": "\033[38;2;158;206;106m",
+        "amber": "\033[38;2;224;175;104m", "cyan": "\033[38;2;125;207;255m",
+        "red": "\033[38;2;247;118;142m",
+        "claude": "\033[38;5;173m", "codex": "\033[38;5;114m", "gemini": "\033[38;5;75m",
+        "agy": "\033[38;5;141m", "copilot": "\033[38;5;117m", "opencode": "\033[38;5;216m",
+        "agent": "\033[38;5;221m",
+    }
+
+    def selectable_idxs(rows):
+        return [i for i, r in enumerate(rows) if r["kind"] == "item"]
+
+    def read_key(fd):
+        def has_more(timeout):
+            try:
+                return bool(select.select([fd], [], [], timeout)[0])
+            except (InterruptedError, OSError, ValueError):
+                return False
+
+        def read_byte():
+            try:
+                return os.read(fd, 1)
+            except (InterruptedError, BlockingIOError):
+                return b""
+            except OSError:
+                return b""
+
+        try:
+            rdy = select.select([fd], [], [], 0.25)[0]
+        except (InterruptedError, OSError, ValueError):
+            return ("noop", None)
+        if not rdy:
+            return ("noop", None)
+        try:
+            ch = os.read(fd, 1)
+        except (InterruptedError, BlockingIOError):
+            return ("noop", None)
+        except OSError:
+            return ("eof", None)
+        if not ch:
+            return ("eof", None)
+        if ch == b"\x1b":
+            return _parse_popup_escape(read_byte, has_more)
+        if ch in (b"\r", b"\n", b" "):
+            return ("enter", None)
+        if ch in (b"\x7f", b"\x08"):
+            return ("back", None)
+        if ch == b"\x03":
+            return ("done", None)
+        return ("char", ch.decode("utf-8", "ignore"))
+
+    fd = sys.stdin.fileno()
+    old = None
+    try:
+        old = termios.tcgetattr(fd)
+        tty.setraw(fd)
+        sys.stdout.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h")
+        sys.stdout.flush()
+
+        while True:
+            scr = stack[-1]
+            _title, crumb, rows = _settings_screen_items(scr, conf, meeting, accts, hmap)
+            items = selectable_idxs(rows)
+            cur = cursors.get(scr, items[0] if items else 0)
+            if items and cur not in items:
+                cur = items[0]
+            cursors[scr] = cur
+
+            sz = shutil.get_terminal_size((84, 28))
+            W, H = max(40, sz.columns), max(14, sz.lines)
+            body_top = 3
+            body_h = max(4, H - 5)   # 2 header rows + body + 2 footer rows + 1 status row
+            sc = scrolls.get(scr, 0)
+            if cur < sc:
+                sc = cur
+            elif cur >= sc + body_h:
+                sc = cur - body_h + 1
+            sc = max(0, min(sc, max(0, len(rows) - body_h)))
+            scrolls[scr] = sc
+
+            # Draw full frame cleanly without flicker
+            buf = ["\033[H"]
+            # Row 1: Breadcrumb header + Back/Done pill indicators
+            back_pill = " [← Back] " if len(stack) > 1 else ""
+            done_pill = " [✓ Done] "
+            pills = back_pill + done_pill
+            left_hdr = " " + fit(crumb, max(10, W - len(pills) - 2))
+            pad_hdr = " " * max(1, W - cells(left_hdr) - cells(pills))
+            buf.append(f"{C['hdr']}{C['bold']}{C['purple']}{left_hdr}{pad_hdr}"
+                       f"{C['amber']}{back_pill}{C['green']}{done_pill}{C['rst']}\r\n")
+            # Row 2: Thin separator
+            buf.append(f"{C['bg']}{C['muted']}{'─' * W}{C['rst']}\r\n")
+
+            row_map = {}   # terminal 1-based Y -> row index in rows
+            for vy in range(body_h):
+                ri = sc + vy
+                term_y = body_top + vy
+                if ri >= len(rows):
+                    buf.append(f"{C['bg']}{' ' * W}{C['rst']}\r\n")
+                    continue
+                r = rows[ri]
+                if r["kind"] == "sep":
+                    buf.append(f"{C['bg']}{C['muted']}{'─' * W}{C['rst']}\r\n")
+                elif r["kind"] == "hdr":
+                    txt = " " + fit(r["label"], W - 2)
+                    buf.append(f"{C['bg']}{C['bold']}{C['muted']}{txt}{' ' * max(0, W - cells(txt))}{C['rst']}\r\n")
+                else:
+                    row_map[term_y] = ri
+                    is_sel = (ri == cur)
+                    bg = C["sel"] if is_sel else C["bg"]
+                    col = C.get(r.get("colour") or "text", C["text"])
+                    key_s = f"[{r['key']}] " if r.get("key") else "    "
+                    ptr = "▸ " if is_sel else "  "
+                    right = r.get("right") or ""
+                    max_r = min(cells(right), max(12, W // 2))
+                    right_s = fit(right, max_r) if right else ""
+                    avail_l = max(10, W - len(ptr) - len(key_s) - (cells(right_s) + 2 if right_s else 1))
+                    left_s = fit(r["label"], avail_l)
+                    gap = max(1, W - len(ptr) - len(key_s) - cells(left_s) - cells(right_s) - 1)
+                    buf.append(f"{bg}{C['bold'] if is_sel else ''}{C['cyan']}{ptr}{C['amber']}{key_s}"
+                               f"{col}{left_s}{' ' * gap}{C['muted']}{right_s} {C['rst']}\r\n")
+
+            # Scroll indicator + status + footer buttons
+            scroll_info = f" ({sc + 1}–{min(len(rows), sc + body_h)}/{len(rows)})" if len(rows) > body_h else ""
+            buf.append(f"{C['bg']}{C['muted']}{'─' * W}{C['rst']}\r\n")
+            st = " " + fit(status_msg + scroll_info, W - 2)
+            buf.append(f"{C['bg']}{C['green']}{st}{' ' * max(0, W - cells(st))}{C['rst']}\r\n")
+            foot = ("  [ ← Back (b/Esc) ]   [ ↑/↓ Move ]   [ Enter Select ]   [ ✓ Done (d/q) ]"
+                    if len(stack) > 1 else
+                    "  [ ↑/↓ Move ]   [ Enter Select / Toggle ]   [ ✓ Done & Apply (d/q/Esc) ]")
+            foot = fit(foot, W - 1)
+            buf.append(f"{C['hdr']}{C['text']}{foot}{' ' * max(0, W - cells(foot))}{C['rst']}")
+            sys.stdout.write("".join(buf))
+            sys.stdout.flush()
+
+            ev, val = read_key(fd)
+            if ev == "noop":
+                continue
+            action = None
+            if ev in ("eof", "done"):
+                break
+            elif ev == "up" and items:
+                pos = items.index(cur)
+                cursors[scr] = items[(pos - 1) % len(items)]
+            elif ev == "down" and items:
+                pos = items.index(cur)
+                cursors[scr] = items[(pos + 1) % len(items)]
+            elif ev == "pgup" and items:
+                pos = max(0, items.index(cur) - max(1, body_h - 2))
+                cursors[scr] = items[pos]
+            elif ev == "pgdn" and items:
+                pos = min(len(items) - 1, items.index(cur) + max(1, body_h - 2))
+                cursors[scr] = items[pos]
+            elif ev in ("back", "left", "esc"):
+                action = ("back",)
+            elif ev == "enter" or ev == "right":
+                if items and cur in items:
+                    action = rows[cur].get("action")
+            elif ev == "mouse":
+                btn, mx, my, mtype = val
+                if btn == 64 and items:      # wheel up
+                    pos = max(0, items.index(cur) - 2)
+                    cursors[scr] = items[pos]
+                elif btn == 65 and items:    # wheel down
+                    pos = min(len(items) - 1, items.index(cur) + 2)
+                    cursors[scr] = items[pos]
+                elif btn == 0 and mtype == "M":
+                    if my == 1:
+                        # Top right pills: [← Back] [✓ Done]
+                        if mx >= W - len(done_pill) + 1:
+                            action = ("done",)
+                        elif len(stack) > 1 and mx >= W - len(pills) + 1:
+                            action = ("back",)
+                    elif my == H:
+                        if len(stack) > 1 and mx <= 22:
+                            action = ("back",)
+                        elif mx >= W - 26:
+                            action = ("done",)
+                    elif my in row_map:
+                        ri = row_map[my]
+                        cursors[scr] = ri
+                        action = rows[ri].get("action")
+            elif ev == "char":
+                ch = val.lower()
+                if ch == "k" and items:
+                    cursors[scr] = items[(items.index(cur) - 1) % len(items)]
+                elif ch == "j" and items:
+                    cursors[scr] = items[(items.index(cur) + 1) % len(items)]
+                elif ch == "q":
+                    action = ("done",)
+                else:
+                    hit = next((ri for ri in items if (rows[ri].get("key") or "").lower() == ch), None)
+                    if hit is not None:
+                        cursors[scr] = hit
+                        action = rows[hit].get("action")
+
+            if not action:
+                continue
+            op = action[0]
+            if op == "done":
+                break
+            elif op == "back":
+                if len(stack) > 1:
+                    stack.pop()
+                else:
+                    break
+            elif op == "push":
+                stack.append(action[1])
+            elif op == "set_format":
+                want = action[1]
+                conf["format"] = want
+                save_conf(conf)
+                changed = True
+                status_msg = f"✓ Format set to {FORMAT_SHOWN[want]}"
+                if want == "bp":
+                    stack = [("settings",), ("bp",)]
+                elif want == "stake":
+                    stack = [("settings",), ("rounds",)]
+                else:
+                    stack = [("settings",)]
+            elif op == "toggle_mode":
+                meeting.mode = "roast" if meeting.mode == "order" else "order"
+                conf["mode"] = meeting.mode
+                save_conf(conf)
+                changed = True
+                status_msg = f"✓ Mode: {meeting.mode.upper()}"
+            elif op == "set_rounds":
+                v = action[1]
+                if meeting.format() == "stake":
+                    conf["stake_rounds"] = max(1, min(12, int(v)))
+                    status_msg = f"✓ Win Stake rounds: {conf['stake_rounds']}"
+                elif meeting.mode == "roast":
+                    meeting.roasts = max(0, min(50, int(v)))
+                    conf["roasts"] = meeting.roasts
+                    status_msg = f"✓ Roast rounds: {'until Ctrl+C' if not meeting.roasts else meeting.roasts}"
+                else:
+                    meeting.rounds = int(v)
+                    conf["rounds"] = meeting.rounds
+                    status_msg = f"✓ Order rounds: {'none' if v < 0 else ('until Ctrl+C' if v == 0 else v)}"
+                save_conf(conf)
+                changed = True
+            elif op == "cycle_perm":
+                nxt = {"plan": "edit", "edit": "bypass", "bypass": "plan"}.get(conf.get("perm") or "plan", "plan")
+                conf["perm"] = nxt
+                save_conf(conf)
+                changed = True
+                status_msg = f"✓ Permission: {nxt.upper()}"
+            elif op == "cycle_words":
+                opts_w = [40, 60, 100, 150, 250]
+                cw = meeting.words()
+                nxt = next((x for x in opts_w if x > cw), opts_w[0])
+                conf["words"] = nxt
+                save_conf(conf)
+                changed = True
+                status_msg = f"✓ Answer length: {nxt} words"
+            elif op == "toggle_names":
+                nxt = "llm" if (conf.get("names") or "model") == "model" else "model"
+                conf["names"] = nxt
+                NAMES["by"] = nxt
+                save_conf(conf)
+                changed = True
+                status_msg = f"✓ Display names: by {nxt}"
+            elif op == "bp_auto_all":
+                conf.pop("bp_cast", None)
+                save_conf(conf)
+                changed = True
+                status_msg = "✓ All 8 BP positions reset to auto (by seat)"
+            elif op == "bp_reset_role":
+                abbr = action[1]
+                cast = dict(conf.get("bp_cast") or {})
+                cast.pop(abbr, None)
+                if cast:
+                    conf["bp_cast"] = cast
+                else:
+                    conf.pop("bp_cast", None)
+                save_conf(conf)
+                changed = True
+                status_msg = f"✓ {abbr} reset to auto (by seat)"
+                if len(stack) > 1:
+                    stack.pop()
+            elif op == "bp_set_member":
+                abbr, handle = action[1], action[2]
+                cast = dict(conf.get("bp_cast") or {})
+                cast[abbr] = handle
+                conf["bp_cast"] = cast
+                save_conf(conf)
+                changed = True
+                status_msg = f"✓ {abbr} → @{handle}"
+                stack = [("settings",), ("bp",)]
+            elif op == "bp_set_model":
+                abbr, tool, mod = action[1], action[2], action[3]
+                cast = dict(conf.get("bp_cast") or {})
+                cast[abbr] = f"{tool}:{mod}"
+                conf["bp_cast"] = cast
+                save_conf(conf)
+                changed = True
+                status_msg = f"✓ {abbr} → {TOOLS[tool]} · {mod or 'default'}"
+                stack = [("settings",), ("bp",)]
+            elif op == "bp_custom_model":
+                abbr, tool = action[1], action[2]
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                sys.stdout.write("\033[?1006l\033[?1000l\033[?25h")
+                sys.stdout.write(f"\033[{H};1H\033[K{C['hdr']}{C['cyan']} {abbr} {TOOLS[tool]} model ID (blank=cancel): {C['white']}")
+                sys.stdout.flush()
+                try:
+                    typed = sys.stdin.readline().strip()
+                except (EOFError, KeyboardInterrupt):
+                    typed = ""
+                tty.setraw(fd)
+                sys.stdout.write("\033[?25l\033[?1000h\033[?1006h")
+                sys.stdout.flush()
+                if typed:
+                    cast = dict(conf.get("bp_cast") or {})
+                    cast[abbr] = f"{tool}:{typed}"
+                    conf["bp_cast"] = cast
+                    save_conf(conf)
+                    changed = True
+                    status_msg = f"✓ {abbr} → {TOOLS[tool]} · {typed}"
+                    stack = [("settings",), ("bp",)]
+                else:
+                    status_msg = "Cancelled custom model entry"
+    except Exception:  # noqa: BLE001
+        errlog("settings_popup")
+    finally:
+        if old is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[?1006l\033[?1000l\033[?25h\033[?1049l")
+        sys.stdout.flush()
+    if changed and chair:
+        send_cmd_now(chair, "/sync")
+    return 0
 
 
 def send_cmd_now(chair, text):
@@ -1184,6 +1730,8 @@ class Member:
 
     def shown(self):
         """The name it goes by at the table (what the panes show, what the others call it, what you tag)."""
+        if getattr(self, "_shown", None):
+            return self._shown
         t = TABLE[0]
         return table_names(list(t.members) if t else [self]).get(self.handle, self.handle)
 
@@ -2105,19 +2653,22 @@ class Meeting:
             return gen is None or gen == GEN[0]
         adj = self.adjudicators()
         players = [m for m in targets if m not in adj] or [m for m in self.seated() if m not in adj]
-        if len(players) < 2:
-            note("This format needs at least two members besides the judge: + add someone.")
-            return
         if self.format() == "bp":
             cast = self.bp_cast(players)
+            if len(cast) < 2:
+                note("BP debate needs at least two speakers besides the judge: /settings or /bp to assign models.")
+                return
             if len(cast) < 8:
-                note(f"A BP debate has 8 speakers; {len(cast)} are at the table besides the judge, so "
-                     f"{', '.join(r[0] for r in BP_ROLES[len(cast):])} stay empty. + add more for a full debate.")
+                note(f"A BP debate has 8 speakers; {len(cast)} are assigned besides the judge, so "
+                     f"{', '.join(r[0] for r in BP_ROLES[len(cast):])} stay empty. /settings to assign all 8.")
             task = self.bp_debate(cast, live)
             rest = [m for m in players if m not in [x for _r, x in cast]]
             if rest:
                 note("Only 8 speak in a BP debate: " + " ".join("@" + m.shown() for m in rest) + " listened.")
         else:
+            if len(players) < 2:
+                note("This format needs at least two members besides the judge: + add someone.")
+                return
             task = self.win_stake(players, live)
         if not task or STOP.is_set() or not live():
             set_status([])
@@ -2135,17 +2686,66 @@ class Meeting:
         self.save()
 
     def bp_cast(self, players=None):
-        """[(role, member)] in speaking order: the roles set with /bp (or its menu) first, the rest filled
-        by seat order from those not judging. At most 8."""
+        """[(role, member)] in speaking order: roles set with /bp or /settings first (either an existing
+        member handle OR a direct provider:model spec across any provider: claude, codex, gemini, agy,
+        copilot, opencode), the rest filled by seat order from those not judging. At most 8."""
         adj = self.adjudicators()
         players = players if players is not None else [m for m in self.seated() if m not in adj]
         chosen = self.conf.get("bp_cast") or {}
-        taken, cast = set(), {}
+        taken, cast, used_shown = set(), {}, set()
+        accts_cache = [None]
+
+        def resolve_spec(spec, abbr):
+            tool_raw, model_raw = spec.split(":", 1)
+            tool = ALIAS.get(tool_raw.strip().lower(), tool_raw.strip().lower())
+            if tool not in TOOLS:
+                return None
+            model = model_raw.strip() or None
+            # Reuse an existing untaken player only if it already explicitly runs this exact provider + model
+            for p in players:
+                if p.handle not in taken and p.tool == tool and not (p.made and p.persona):
+                    if (not model and not p.model) or (model and p.model and canon(p.model) == canon(model)):
+                        taken.add(p.handle)
+                        used_shown.add(p.shown())
+                        return p
+            # Otherwise build a dedicated BP speaker slot on that provider + model
+            base = next((x for x in self.members if x.tool == tool and x.account), None)
+            acct = base.account if base else None
+            home = base.home if base else None
+            if not acct:
+                if accts_cache[0] is None:
+                    accts_cache[0] = accounts()
+                a_info = accts_cache[0].get(tool)
+                if a_info:
+                    acct, _, home = a_info
+            if not acct and tool == "opencode":
+                acct = "main"
+            if not acct:
+                return None
+            m = Member(f"{TOOLS[tool]} {abbr}", tool, account=acct, model=model,
+                       effort=(base.effort if base else None), folder=home)
+            m.handle = f"bp_{abbr.lower()}"
+            m.seated = True
+            m.signed = True
+            slug = m.model_slug() or tool
+            m._shown = slug if slug not in used_shown else f"{slug}-{abbr.lower()}"
+            used_shown.add(m._shown)
+            return m
+
         for abbr, *_x in BP_ROLES:
-            m = self.find(chosen.get(abbr, "")) if chosen.get(abbr) else None
-            if m and m in players and m.handle not in taken:
-                cast[abbr] = m
-                taken.add(m.handle)
+            val = chosen.get(abbr, "")
+            if not val:
+                continue
+            if ":" in val:
+                m = resolve_spec(val, abbr)
+                if m:
+                    cast[abbr] = m
+            else:
+                m = self.find(val)
+                if m and m in players and m.handle not in taken:
+                    cast[abbr] = m
+                    taken.add(m.handle)
+                    used_shown.add(m.shown())
         free = [m for m in players if m.handle not in taken]
         out = []
         for role in BP_ROLES:
@@ -3300,6 +3900,8 @@ class Grid:
         # + add's Bring back: agents with a character only (an LLM's seat comes back by Another … seat)
         out = [m for m in meeting.members if not m.seated and m.made and m.persona]
         tmx("set-option", "-w", "-t", self.me, "@council_chair", self.me)
+        tmx("set-option", "-w", "-t", self.me, "@council_home", meeting.conf.get("_home") or "")
+        tmx("set-option", "-w", "-t", self.me, "@council_folder", meeting.owner or "")
         tmx("set-option", "-w", "-t", self.me, "@council_used",        # for the model menus: no model twice
             ";".join(f"{canon(m.runs_on()[0])}={m.shown()}" for m in meeting.seated()
                      if not (m.made and m.persona) and canon(m.runs_on()[0])))
@@ -3331,8 +3933,8 @@ class Grid:
                   if r.endswith(" c") and r.split()[0] != self.me]
         if others:
             return
-        for opt in ("@council", "@council_chair", "@council_used", "@council_homes",
-                    "@council_seated", "@council_full", "@council_out"):
+        for opt in ("@council", "@council_chair", "@council_home", "@council_folder", "@council_used",
+                    "@council_homes", "@council_seated", "@council_full", "@council_out"):
             tmx("set-option", "-wu", "-t", win, opt)
 
 
@@ -3496,7 +4098,8 @@ def add_menu(client, win):
     # a form in the middle of the screen (tmux's own prompt sits on the bottom line)
     pop_cmd = " ".join(shlex.quote(str(x)) for x in (ME, "--new-agent", chair, win))
     items += ["", f"{grey}New agent…", "" if full else "n",
-              "" if full else f"display-popup -E -x C -y C -w 84 -h 32 -T ' New agent ' {tmx_quote(pop_cmd)}"]
+              "" if full else f"display-popup -E -x C -y C -w 84 -h 32 -T ' New agent ' {tmx_quote(pop_cmd)}",
+              "Council settings & BP setup…", "s", tmx_run(ME, "--open-settings", client, win, "settings")]
     tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-T", "#[align=centre] Add to the council ",
         "-x", "C", "-y", "C", "--", *items)
     return 0
@@ -3893,6 +4496,35 @@ def command_line(line, meeting, conf, accts):
         print(__doc__.split("\n\n", 1)[1].split("\nMembers only read")[0])
     elif cmd == "new":
         pass                      # the meeting itself is swapped by the caller
+    elif cmd in ("settings", "menu"):
+        start = args[0].lower() if args and args[0].lower() in ("settings", "format", "rounds", "bp") else "settings"
+        if os.environ.get("TMUX") and os.environ.get("TMUX_PANE") and TTY:
+            open_settings_popup(os.environ.get("TMUX_PANE", ""), start=start, delay=0.08)
+        else:
+            note(f"Format: {FORMAT_SHOWN[meeting.format()]} · mode: {meeting.mode} · perm: {(conf.get('perm') or 'plan').upper()} · /format, /mode, /rounds, /bp, /perm")
+    elif cmd == "sync":
+        # Reload persisted settings after the persistent interactive settings popup closes
+        fresh = load_conf(conf.get("_home"), meeting.owner)
+        conf.clear()
+        conf.update(fresh)
+        meeting.mode = conf.get("mode", "order")
+        if "rounds" in conf:
+            try:
+                meeting.rounds = max(-1, min(50, int(conf["rounds"])))
+            except (TypeError, ValueError):
+                pass
+        if "roasts" in conf:
+            try:
+                meeting.roasts = max(0, min(50, int(conf["roasts"])))
+            except (TypeError, ValueError):
+                pass
+        NAMES["by"] = conf.get("names") or "model"
+        fmt = meeting.format()
+        rdesc = (f"{len(meeting.bp_cast())}/8 BP speakers" if fmt == "bp" else
+                 f"{meeting.stake_rounds()} rounds" if fmt == "stake" else
+                 f"{meeting.mode} (" + (("until Ctrl+C" if not meeting.roasts else f"{meeting.roasts}×") if meeting.mode == "roast" else
+                                       ("until Ctrl+C" if meeting.rounds == 0 else "answers only" if meeting.rounds < 0 else f"{meeting.rounds}×")) + ")")
+        note(f"Settings applied: {FORMAT_SHOWN[fmt]} · {rdesc} · perm {(conf.get('perm') or 'plan').upper()} · {meeting.words()}w.")
     elif cmd == "bp":
         roles = [r[0] for r in BP_ROLES]
         if args and args[0].lower() == "auto":
@@ -3903,33 +4535,60 @@ def command_line(line, meeting, conf, accts):
         elif args and args[0].lower() == "pick" and len(args) > 1 and args[1].upper() in roles:
             bp_pick_menu(meeting, os.environ.get("TMUX_PANE", ""), args[1].upper())
         elif len(args) >= 2 and args[0].upper() in roles:
-            m = meeting.find(args[1].lstrip("@").rstrip(".,"))
-            adj = meeting.adjudicators()
-            if not m or not m.seated or m in adj:
-                note(f"{args[1]} is not at the table to speak (the judge does not speak).")
-                return True
-            now = {r: m2.handle for (r, *_x), m2 in meeting.bp_cast()}
-            cast = dict(conf.get("bp_cast") or now)
-            role, before = args[0].upper(), cast.get(args[0].upper()) or now.get(args[0].upper())
-            for r, h in list(cast.items()):          # it held another role: the two swap
-                if h == m.handle and r != role:
-                    cast[r] = before
-            cast[role] = m.handle
-            conf["bp_cast"] = {r: h for r, h in cast.items() if h}
-            save_conf(conf)
-            note(f"BP: @{m.shown()} speaks as {role}.")
+            role = args[0].upper()
+            spec_arg = args[1].strip()
+            if spec_arg.lower() == "auto":
+                cast = dict(conf.get("bp_cast") or {})
+                cast.pop(role, None)
+                if cast:
+                    conf["bp_cast"] = cast
+                else:
+                    conf.pop("bp_cast", None)
+                save_conf(conf)
+                note(f"BP: {role} reset to auto (by seat).")
+            elif ":" in spec_arg:
+                t_raw, m_raw = spec_arg.split(":", 1)
+                tool = ALIAS.get(t_raw.strip().lower(), t_raw.strip().lower())
+                if tool not in TOOLS:
+                    note(f"Unknown provider {t_raw!r}. Use: {', '.join(TOOLS)}.")
+                    return True
+                mod = m_raw.strip()
+                cast = dict(conf.get("bp_cast") or {})
+                cast[role] = f"{tool}:{mod}"
+                conf["bp_cast"] = cast
+                save_conf(conf)
+                note(f"BP: {role} speaks on {TOOLS[tool]} ({mod or 'default'}).")
+            else:
+                m = meeting.find(spec_arg.lstrip("@").rstrip(".,"))
+                adj = meeting.adjudicators()
+                if not m or not m.seated or m in adj:
+                    note(f"{args[1]} is not at the table to speak (or assign any provider: /bp {role} gemini:gemini-4-neon).")
+                    return True
+                now = {r: m2.handle for (r, *_x), m2 in meeting.bp_cast()}
+                cast = dict(conf.get("bp_cast") or now)
+                before = cast.get(role) or now.get(role)
+                for r, h in list(cast.items()):          # it held another role: the two swap
+                    if h == m.handle and r != role:
+                        cast[r] = before
+                cast[role] = m.handle
+                conf["bp_cast"] = {r: h for r, h in cast.items() if h}
+                save_conf(conf)
+                note(f"BP: @{m.shown()} speaks as {role}.")
             bp_menu(meeting, os.environ.get("TMUX_PANE", ""))
         else:
             note("BP debate · " + " · ".join(f"{r[0]} @{m.shown()} ({m.runs_on()[0]})" for r, m in meeting.bp_cast())
-                 + " · /bp ROLE @name to change one, /bp auto to set them by seat")
+                 + " · /bp ROLE provider:model or @name, /bp auto, or /settings")
             bp_menu(meeting, os.environ.get("TMUX_PANE", ""))
     elif cmd == "format":
+        if not args and os.environ.get("TMUX") and os.environ.get("TMUX_PANE") and TTY and not os.environ.get("AFC_COUNCIL_NO_FORMAT_MENU"):
+            open_settings_popup(os.environ.get("TMUX_PANE", ""), start="format", delay=0.08)
+            return True
         names = {"forum": "forum", "open": "forum", "1": "forum", "bp": "bp", "debate": "bp", "british": "bp",
                  "2": "bp", "stake": "stake", "win": "stake", "winstake": "stake", "3": "stake"}
         cur = meeting.format()
         want = names.get(args[0].lower().replace("-", "")) if args else FORMATS[(FORMATS.index(cur) + 1) % len(FORMATS)]
         if not want:
-            note("Formats: forum (Open Forum), bp (British Parliamentary debate), stake (Win Stake). /format NAME")
+            note("Formats: forum (Open Forum), bp (British Parliamentary debate), stake (Win Stake). /format NAME or /settings")
             return True
         conf["format"] = want
         save_conf(conf)
@@ -4506,6 +5165,18 @@ def main(argv):
         return one_menu(argv[1], argv[2])
     if argv[:1] == ["--add-menu"] and len(argv) >= 3:
         return add_menu(argv[1], argv[2])
+    if argv[:1] == ["--open-settings"] and len(argv) >= 3:
+        cl, target = argv[1], argv[2]
+        start = argv[3] if len(argv) > 3 else "settings"
+        win = tmx("display-message", "-p", "-t", target, "#{window_id}") or target
+        chair = tmx("show-options", "-wqv", "-t", win, "@council_chair") or target
+        pop_cmd = " ".join(shlex.quote(str(x)) for x in (ME, "--settings-popup", chair, win, start))
+        tmx("display-popup", "-E", *(["-c", cl] if cl else []), "-x", "C", "-y", "C",
+            "-w", "84", "-h", "28", "-b", "rounded", "-S", "fg=#bb9af7",
+            "-T", " Council Settings ", pop_cmd)
+        return 0
+    if argv[:1] == ["--settings-popup"] and len(argv) >= 3:
+        return settings_popup(argv[1], argv[2], argv[3] if len(argv) > 3 else "settings")
     folder = os.getcwd()
     if "--from-pid" in argv:
         try:   # the pane's own folder, read from the process: tmux formats spoil "$$" in paths

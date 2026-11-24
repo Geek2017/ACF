@@ -959,6 +959,48 @@ assert bp1["side"] == "Government" and bp1["bench"] == "OG" and bp2["side"] == "
 sm_bp = mt.format_sim_summary("bp", 2, "Motion", [bp1, bp2])
 assert "Sides: Government 1/2 (50%) · Opposition 1/2 (50%)" in sm_bp and "Benches: OG 1 · OO 1" in sm_bp, f"bp summary failed: {sm_bp}"
 
+# 17. BP direct provider:model assignment across all 6 providers + persistent settings popup screens & Back buttons
+m_agy = M("Agy", "agy", account="a1"); m_cop = M("Copilot", "copilot", account="p1"); m_oc = M("OpenCode", "opencode", account="o1")
+bp_conf = {"format": "bp", "bp_cast": {
+    "PM": "claude:claude-opus-5-5", "DPM": "claude:claude-sonnet-5-5",
+    "LO": "gemini:gemini-4-neon", "DLO": "codex:gpt-6-astra",
+    "MG": "agy:gemini-4-neon-high", "GW": "copilot:gpt-6.1-sol",
+    "MO": "opencode:opencode/deepseek-v4.1-flash-free", "OW": "gemini:gemini-4-argon",
+}}
+mt_bp = g["Meeting"](T, [m1, m2, m3, m_agy, m_cop, m_oc], bp_conf)
+cast8 = mt_bp.bp_cast()
+assert len(cast8) == 8, f"expected 8 BP speakers across all 6 providers, got {len(cast8)}"
+by_role = {r[0]: (m.tool, m.runs_on()[0]) for r, m in cast8}
+assert by_role["PM"] == ("claude", "claude-opus-5-5") and by_role["DPM"] == ("claude", "claude-sonnet-5-5")
+assert by_role["LO"] == ("gemini", "gemini-4-neon") and by_role["DLO"] == ("codex", "gpt-6-astra")
+assert by_role["MG"] == ("agy", "gemini-4-neon-high") and by_role["GW"] == ("copilot", "gpt-6.1-sol")
+assert by_role["MO"] == ("opencode", "opencode/deepseek-v4.1-flash-free") and by_role["OW"] == ("gemini", "gemini-4-argon")
+fake_accts = {t: ("main", True, T) for t in ("claude", "codex", "gemini", "agy", "copilot", "opencode")}
+for scr in (("settings",), ("format",), ("rounds",), ("bp",), ("bp_role", "PM"),
+            ("bp_models", "PM", "claude"), ("bp_models", "LO", "gemini"), ("bp_models", "DLO", "codex"),
+            ("bp_models", "MG", "agy"), ("bp_models", "GW", "copilot"), ("bp_models", "MO", "opencode")):
+    _t, _c, rws = g["_settings_screen_items"](scr, bp_conf, mt_bp, fake_accts, {})
+    acts = [r.get("action") for r in rws if r["kind"] == "item"]
+    if scr != ("settings",):
+        assert ("back",) in acts, f"screen {scr} missing Back button: {acts}"
+    if scr == ("bp_role", "PM"):
+        provs = [a[1][2] for a in acts if a and a[0] == "push" and a[1][0] == "bp_models"]
+        assert provs == ["claude", "codex", "gemini", "agy", "copilot", "opencode"], f"missing providers: {provs}"
+
+# 18. Popup escape parser ignores focus events (\x1b[I/\x1b[O), X10 mouse, SS3, unknown CSI (never false-closes)
+def feed_esc(seq):
+    it = iter(seq)
+    buf = list(seq)
+    pos = [0]
+    def has_more(_t): return pos[0] < len(buf)
+    def read_byte():
+        b = bytes([buf[pos[0]]]); pos[0] += 1; return b
+    return g["_parse_popup_escape"](read_byte, has_more)
+assert feed_esc(b"") == ("esc", None)
+assert feed_esc(b"[I") == ("noop", None) and feed_esc(b"[O") == ("noop", None)
+assert feed_esc(b"[Mabc") == ("noop", None) and feed_esc(b"OH") == ("noop", None)
+assert feed_esc(b"[A") == ("up", None) and feed_esc(b"[<0;12;5M") == ("mouse", (0, 12, 5, "M"))
+
 print("REGRESSIONS_OK")
 EOF
 )
@@ -1009,7 +1051,19 @@ for p in ps:
 print(f"{len(ps)}:{leaked}")
 ' "$T/log")
 is "... each Monte Carlo trial runs isolated (no cross-trial leakage)" "$sim_check" "6:0"
-run "/format forum" "/rounds 1" > /dev/null
+# /bp ROLE provider:model assigns models directly across providers, /bp ROLE auto resets one, /sync reloads settings
+mark
+out=$(run "/new" "/format bp" "/bp PM gemini:gemini-4-neon" "/bp LO codex:gpt-6-astra" "/bp DPM claude:claude-sonnet-5-5" "/bp" "This house would ship tests first")
+has "/bp ROLE provider:model assigns Gemini model to PM" "$out" 'BP: PM speaks on Gemini \(gemini-4-neon\)'
+has "... and Codex model to LO" "$out" 'BP: LO speaks on Codex \(gpt-6-astra\)'
+has "... and Claude model to DPM" "$out" 'BP: DPM speaks on Claude \(claude-sonnet-5-5\)'
+has "... and runs the BP debate with the assigned models" "$(cat "$T/log/argv")" 'gemini-4-neon'
+has "... including Codex's assigned model" "$(cat "$T/log/argv")" 'gpt-6-astra'
+has "... including Claude's assigned model" "$(cat "$T/log/argv")" 'claude-sonnet-5-5'
+out=$(run "/bp PM auto" "/sync")
+has "/bp ROLE auto resets a single position" "$out" 'BP: PM reset to auto'
+has "/sync reloads settings cleanly" "$out" 'Settings applied: BP debate'
+run "/bp auto" "/format forum" "/rounds 1" > /dev/null
 
 # ---- the typing line ------------------------------------------------------------------------------------------
 # A long message typed letter by letter past the pane's edge, and backspaced back across the wrap: the
