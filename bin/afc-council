@@ -130,8 +130,46 @@ CONF = os.environ.get("AFC_COUNCIL_CONF") or os.path.join(HOME, ".config/agents/
 GENERAL = os.environ.get("AFC_COUNCIL_GENERAL") or os.path.join(HOME, "Council")   # Alt+Shift+K: about no project
 # Kept per project (in its council folder), not in CONF: what one project's council is set to never
 # reaches another's (a Bypass in one leaves every other at Plan).
-LOCAL = ("mode", "perm", "words", "llm", "seats", "agent_perm", "names", "view", "strikes", "format", "bp_cast", "rounds", "roasts", "stake_rounds")
+LOCAL = ("mode", "perm", "words", "llm", "seats", "agent_perm", "names", "view", "strikes", "format", "bp_cast", "judge", "rounds", "roasts", "stake_rounds")
 STRIKES = 3         # strikes from an agent with the remove power before the member is removed
+SUPRA_HANDLE = "supra-omnia"
+SUPRA_DEFAULTS = {
+    "name": "supra-omnia",
+    "persona": (
+        "The final judge of the council. Speaks last, calm and grave, like a verdict read from above. "
+        "Weighs each member's argument by @name: who was right, who was wrong, and the one point that "
+        "decided it. Always serves the chairman, justifies its decision, and serves at its pleasure."
+    ),
+    "soul": (
+        "Truth over comfort. Fair to every voice, favouring none. Evidence outranks eloquence: "
+        "a modest claim that holds beats a bold one with no proof."
+    ),
+    "rules": (
+        "Hear every member before judging. Judge the arguments, never the members. Name the exact point "
+        "that decided it. Say \"not proven\" when the evidence is thin; never guess. Never repeat what "
+        "others said, only weigh it. End every turn with \"Verdict:\" and one sentence.\n\n"
+        "How to judge (Delphi + Monte Carlo):\n"
+        "- Delphi: treat each round as a Delphi round. Track every member's position round by round. "
+        "Say where the table is converging, who moved and why, and who still dissents.\n"
+        "- Monte Carlo: before the verdict, run the outcome forward across plausible cases (best, worst, likely) "
+        "with rough chances of success in % and the main risk.\n"
+        "- End with \"Verdict:\" in one sentence, then \"Confidence: N%\" and \"Consensus: yes/partial/no\"."
+    ),
+}
+
+
+def supra_permanent():
+    """Supra Omnia is always seated as the permanent final judge in every real council (and when
+    explicitly enabled in tests via AFC_COUNCIL_FORCE_SUPRA=1)."""
+    return (not os.environ.get("COUNCIL_TEST_DIR")) or os.environ.get("AFC_COUNCIL_FORCE_SUPRA") == "1"
+
+
+def is_supra(m):
+    return bool(m and getattr(m, "handle", "") == SUPRA_HANDLE)
+
+
+def is_permanent_supra(m):
+    return supra_permanent() and is_supra(m)
 STAMP = re.compile(r"\d{4}-\d\d-\d\d_\d{4}(-\d+)?")      # a session folder not named by its topic yet
 TOOLS = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "agy": "Antigravity",
          "copilot": "Copilot", "opencode": "OpenCode"}
@@ -558,7 +596,10 @@ def matches(text, first):
         return [c for c in COMMANDS if c.startswith(text.lower())]
     if text.startswith("@") and TABLE[0]:
         m = TABLE[0]
-        names = ["@" + x.shown() for x in m.seated()] + ["@all"] + ["@" + x.shown() for x in m.members if not x.seated]
+        active = m.active_members()
+        seen = {x.shown() for x in active}
+        names = ["@" + x.shown() for x in active] + ["@all"] + [
+            "@" + x.shown() for x in m.members if not x.seated and x.shown() not in seen]
         return [n for n in names if n.startswith(text.lower())]
     return []
 
@@ -738,6 +779,20 @@ def _popup_is_open(win):
         return False
 
 
+def _launch_settings_popup_sync(cl, target, start="settings"):
+    """Synchronously open the persistent Council Settings popup on client/target (guards against double popups)."""
+    win = tmx("display-message", "-p", "-t", target, "#{window_id}") or target
+    if _popup_is_open(win):
+        return 0
+    chair = tmx("show-options", "-wqv", "-t", win, "@council_chair") or target
+    cl = cl or tmx("display-message", "-p", "-t", target, "#{client_name}")
+    pop_cmd = " ".join(shlex.quote(str(x)) for x in (ME, "--settings-popup", chair, win, start))
+    tmx("display-popup", "-E", *(["-c", cl] if cl else []), "-x", "C", "-y", "C",
+        "-w", "84", "-h", "28", "-b", "rounded", "-S", "fg=#bb9af7",
+        "-T", " Council Settings ", pop_cmd)
+    return 0
+
+
 def open_settings_popup(pane_or_win, start="settings", client="", delay=0.0, auto=False):
     """Open the persistent interactive Council Settings & BP Assignment popup centred on screen.
     Unlike tmux display-menu, it NEVER vanishes when you pick an option and has ← Back on every screen."""
@@ -757,15 +812,7 @@ def open_settings_popup(pane_or_win, start="settings", client="", delay=0.0, aut
                         return
                 except Exception:  # noqa: BLE001
                     pass
-        win = tmx("display-message", "-p", "-t", pane_or_win, "#{window_id}") or pane_or_win
-        if _popup_is_open(win):
-            return
-        chair = tmx("show-options", "-wqv", "-t", win, "@council_chair") or pane_or_win
-        cl = client or tmx("display-message", "-p", "-t", pane_or_win, "#{client_name}")
-        pop_cmd = " ".join(shlex.quote(str(x)) for x in (ME, "--settings-popup", chair, win, start))
-        tmx("display-popup", "-E", *(["-c", cl] if cl else []), "-x", "C", "-y", "C",
-            "-w", "84", "-h", "28", "-b", "rounded", "-S", "fg=#bb9af7",
-            "-T", " Council Settings ", pop_cmd)
+        _launch_settings_popup_sync(client, pane_or_win, start)
 
     threading.Thread(target=go, daemon=True).start()
 
@@ -821,6 +868,7 @@ def _settings_screen_items(screen, conf, meeting, accts, hmap):
             {"kind": "item", "key": "3", "label": "Rounds", "right": f"{rounds_val}  ›", "colour": "blue", "action": ("push", ("rounds",))},
             {"kind": "item", "key": "4", "label": "BP Debate Positions (8 speakers, all providers)", "right": f"{bp_summary}  ›", "colour": "amber", "action": ("push", ("bp",))},
             {"kind": "item", "key": "5", "label": "Table Seats (Open Forum / Win Stake)", "right": f"{seated_n}/{len(meeting.members)} seated  ›", "colour": "green", "action": ("push", ("seats",))},
+            {"kind": "item", "key": "9", "label": "Judge (Final Adjudicator · all providers)", "right": f"{judge_str}  ›", "colour": "agent", "action": ("push", ("bp_role", "JUDGE"))},
             {"kind": "sep"},
             {"kind": "item", "key": "6", "label": "Permission", "right": f"{perm}  (cycle)", "colour": "green" if perm == "PLAN" else ("amber" if perm == "EDIT" else "red"), "action": ("cycle_perm",)},
             {"kind": "item", "key": "7", "label": "Answer length", "right": f"{meeting.words()} words  (cycle)", "colour": "cyan", "action": ("cycle_words",)},
@@ -844,6 +892,7 @@ def _settings_screen_items(screen, conf, meeting, accts, hmap):
         rows += [
             {"kind": "sep"},
             {"kind": "item", "key": "a", "label": "Seat all signed-in members", "right": "", "colour": "green", "action": ("seat_all",)},
+            {"kind": "item", "key": "r", "label": "Remove / bench everyone", "right": "clears seats & BP", "colour": "red", "action": ("unseat_all",)},
             {"kind": "item", "key": "b", "label": "← Back to Council Settings", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
             {"kind": "item", "key": "d", "label": "✓ Done & Apply", "right": "q", "colour": "green", "action": ("done",)},
         ]
@@ -918,9 +967,21 @@ def _settings_screen_items(screen, conf, meeting, accts, hmap):
                     col = "muted"
                 rows.append({"kind": "item", "key": k, "label": lbl, "right": right, "colour": col,
                              "action": ("push", ("bp_role", abbr))})
+        rows.append({"kind": "hdr", "label": "  Adjudicator (speaks last & delivers verdict)"})
+        j_last = adj[-1] if adj else None
+        if j_last:
+            j_lbl = f"  JUDGE @{j_last.shown()}"
+            j_right = f"{TOOLS.get(j_last.tool, j_last.tool)} · {j_last.runs_on()[0]}  ›"
+            j_col = j_last.tool
+        else:
+            j_lbl = "  JUDGE (unassigned)"
+            j_right = "Pick provider & model ›"
+            j_col = "muted"
+        rows.append({"kind": "item", "key": "9", "label": j_lbl, "right": j_right, "colour": j_col,
+                     "action": ("push", ("bp_role", "JUDGE"))})
         rows += [
             {"kind": "sep"},
-            {"kind": "item", "key": "a", "label": "Auto-fill all 8 positions by seat", "right": "clears overrides", "colour": "amber", "action": ("bp_auto_all",)},
+            {"kind": "item", "key": "a", "label": "Auto-fill / clear custom BP overrides", "right": "clears bp_cast", "colour": "amber", "action": ("bp_auto_all",)},
             {"kind": "item", "key": "b", "label": "← Back to Council Settings", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
             {"kind": "item", "key": "d", "label": "✓ Done & Apply", "right": "q", "colour": "green", "action": ("done",)},
         ]
@@ -928,8 +989,14 @@ def _settings_screen_items(screen, conf, meeting, accts, hmap):
 
     if kind == "bp_role":
         abbr = screen[1]
-        rname, bench = next(((r[1], r[2]) for r in BP_ROLES if r[0] == abbr), (abbr, ""))
-        rows = [{"kind": "hdr", "label": f"Assign {abbr} — {rname} ({bench}): Pick Provider or Agent"}]
+        is_judge_slot = (abbr == "JUDGE")
+        if is_judge_slot:
+            supra = next((x for x in meeting.members if is_supra(x)), None)
+            who_j = f"@{supra.shown()}" if supra else "Final Judge"
+            rows = [{"kind": "hdr", "label": f"Assign Judge ({who_j}) — speaks last: Pick Provider (all 6)"}]
+        else:
+            rname, bench = next(((r[1], r[2]) for r in BP_ROLES if r[0] == abbr), (abbr, ""))
+            rows = [{"kind": "hdr", "label": f"Assign {abbr} — {rname} ({bench}): Pick Provider or Agent"}]
         for idx, tool in enumerate(("claude", "codex", "gemini", "agy", "copilot", "opencode"), 1):
             acct, signed, folder = accts.get(tool, (None, False, None))
             home = hmap.get(tool) or folder
@@ -939,29 +1006,37 @@ def _settings_screen_items(screen, conf, meeting, accts, hmap):
                          "right": f"{len(mlist)} models · {status}  ›",
                          "colour": tool if (signed or tool == "opencode" or acct) else "muted",
                          "action": ("push", ("bp_models", abbr, tool))})
-        # Custom persona agents & seated members
-        adj_set = set(adj)
-        extras = [m for m in meeting.members if m not in adj_set and m.made and m.persona]
-        if extras:
-            rows.append({"kind": "hdr", "label": "  Custom Agents (with persona / soul)"})
-            for m in extras:
-                rows.append({"kind": "item", "key": "", "label": f"  @{m.shown()} ({TOOLS.get(m.tool, m.tool)})",
-                             "right": m.runs_on()[0], "colour": "agent",
-                             "action": ("bp_set_member", abbr, m.handle)})
+        # Custom persona agents & seated members (for speaking positions)
+        if not is_judge_slot:
+            adj_set = set(adj)
+            extras = [m for m in meeting.members if m not in adj_set and m.made and m.persona]
+            if extras:
+                rows.append({"kind": "hdr", "label": "  Custom Agents (with persona / soul)"})
+                for m in extras:
+                    rows.append({"kind": "item", "key": "", "label": f"  @{m.shown()} ({TOOLS.get(m.tool, m.tool)})",
+                                 "right": m.runs_on()[0], "colour": "agent",
+                                 "action": ("bp_set_member", abbr, m.handle)})
         rows += [
             {"kind": "sep"},
-            {"kind": "item", "key": "0", "label": f"Reset {abbr} to auto (by seat)", "right": "", "colour": "amber", "action": ("bp_reset_role", abbr)},
-            {"kind": "item", "key": "b", "label": "← Back to BP Positions", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
+            {"kind": "item", "key": "0",
+             "label": "Reset Judge to default model" if is_judge_slot else f"Reset {abbr} to auto (by seat)",
+             "right": "", "colour": "amber", "action": ("bp_reset_role", abbr)},
+            {"kind": "item", "key": "b", "label": "← Back", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
         ]
-        return f"Assign {abbr}", f"Council Settings › BP › {abbr}", rows
+        return (f"Assign {abbr}", f"Council Settings › Judge" if is_judge_slot else f"Council Settings › BP › {abbr}", rows)
 
     if kind == "bp_models":
         abbr, tool = screen[1], screen[2]
+        is_judge_slot = (abbr == "JUDGE")
         acct, signed, folder = accts.get(tool, (None, False, None))
         home = hmap.get(tool) or folder
         mlist = models_for(tool, home)
         chosen = conf.get("bp_cast") or {}
-        cur_spec = chosen.get(abbr, "")
+        if is_judge_slot:
+            supra = next((x for x in meeting.members if is_supra(x)), None)
+            cur_spec = f"{supra.tool}:{supra.model or ''}" if supra else (conf.get("judge") or "")
+        else:
+            cur_spec = chosen.get(abbr, "")
         other_uses = {}
         for r_k, sp in chosen.items():
             if r_k != abbr and isinstance(sp, str) and ":" in sp:
@@ -988,7 +1063,8 @@ def _settings_screen_items(screen, conf, meeting, accts, hmap):
             {"kind": "item", "key": "b", "label": f"← Back to Providers ({abbr})", "right": "Esc / Backspace", "colour": "muted", "action": ("back",)},
             {"kind": "item", "key": "d", "label": "✓ Done & Apply", "right": "q", "colour": "green", "action": ("done",)},
         ]
-        return f"{abbr} · {TOOLS[tool]}", f"Council Settings › BP › {abbr} › {TOOLS[tool]}", rows
+        crumb_p = f"Council Settings › Judge › {TOOLS[tool]}" if is_judge_slot else f"Council Settings › BP › {abbr} › {TOOLS[tool]}"
+        return f"{abbr} · {TOOLS[tool]}", crumb_p, rows
 
     return "Council Settings", "Council Settings", []
 
@@ -1069,8 +1145,9 @@ def settings_popup(chair, win, start="settings"):
     TABLE[0] = meeting
 
     if start.startswith("bp_role:") and start.split(":", 1)[1]:
-        stack = [("settings",), ("bp",), ("bp_role", start.split(":", 1)[1].upper())]
-    elif start in ("format", "rounds", "bp"):
+        role_arg = start.split(":", 1)[1].upper()
+        stack = [("settings",), ("bp_role", role_arg)] if role_arg == "JUDGE" else [("settings",), ("bp",), ("bp_role", role_arg)]
+    elif start in ("format", "rounds", "bp", "seats"):
         stack = [("settings",), (start,)]
     else:
         stack = [("settings",)]
@@ -1312,7 +1389,9 @@ def settings_popup(chair, win, start="settings"):
                 h = action[1]
                 m_hit = next((x for x in meeting.members if x.handle == h), None)
                 if m_hit:
-                    if not m_hit.seated and len(meeting.seated()) >= MAX_SEATS:
+                    if is_permanent_supra(m_hit) and m_hit.seated:
+                        status_msg = f"🔒 @{m_hit.shown()} is the permanent final judge (always seated)"
+                    elif not m_hit.seated and len(meeting.seated()) >= MAX_SEATS:
                         status_msg = f"⚠ Table full ({MAX_SEATS} max): unseat someone first"
                     else:
                         m_hit.seated = not m_hit.seated
@@ -1330,6 +1409,19 @@ def settings_popup(chair, win, start="settings"):
                 save_conf(conf)
                 changed = True
                 status_msg = f"✓ Seated {seated_now} signed-in member(s)"
+            elif op == "unseat_all":
+                for m_hit in meeting.members:
+                    if is_permanent_supra(m_hit):
+                        m_hit.seated = True
+                        conf.setdefault("seats", {})[m_hit.handle] = True
+                        continue
+                    m_hit.seated = False
+                    conf.setdefault("seats", {})[m_hit.handle] = False
+                conf.pop("bp_cast", None)
+                conf.pop("judge", None)
+                save_conf(conf)
+                changed = True
+                status_msg = "✓ Unseated speakers (BP cast cleared; permanent judge stays seated)"
             elif op == "set_format":
                 want = action[1]
                 conf["format"] = want
@@ -1391,15 +1483,27 @@ def settings_popup(chair, win, start="settings"):
                 status_msg = "✓ All 8 BP positions reset to auto (by seat)"
             elif op == "bp_reset_role":
                 abbr = action[1]
-                cast = dict(conf.get("bp_cast") or {})
-                cast.pop(abbr, None)
-                if cast:
-                    conf["bp_cast"] = cast
+                if abbr == "JUDGE":
+                    supra = next((x for x in meeting.members if is_supra(x)), None)
+                    if supra is not None:
+                        supra.model = None
+                        for a in conf.get("agents") or []:
+                            if a.get("name") == supra.name:
+                                a["model"] = None
+                    conf.pop("judge", None)
+                    save_conf(conf)
+                    changed = True
+                    status_msg = "✓ Judge reset to default model"
                 else:
-                    conf.pop("bp_cast", None)
-                save_conf(conf)
-                changed = True
-                status_msg = f"✓ {abbr} reset to auto (by seat)"
+                    cast = dict(conf.get("bp_cast") or {})
+                    cast.pop(abbr, None)
+                    if cast:
+                        conf["bp_cast"] = cast
+                    else:
+                        conf.pop("bp_cast", None)
+                    save_conf(conf)
+                    changed = True
+                    status_msg = f"✓ {abbr} reset to auto (by seat)"
                 if len(stack) > 1:
                     stack.pop()
             elif op == "bp_set_member":
@@ -1410,16 +1514,45 @@ def settings_popup(chair, win, start="settings"):
                 save_conf(conf)
                 changed = True
                 status_msg = f"✓ {abbr} → @{handle}"
-                stack = [("settings",), ("bp",)]
+                while len(stack) > 1 and stack[-1][0] in ("bp_models", "bp_role"):
+                    stack.pop()
             elif op == "bp_set_model":
                 abbr, tool, mod = action[1], action[2], action[3]
-                cast = dict(conf.get("bp_cast") or {})
-                cast[abbr] = f"{tool}:{mod}"
-                conf["bp_cast"] = cast
-                save_conf(conf)
-                changed = True
-                status_msg = f"✓ {abbr} → {TOOLS[tool]} · {mod or 'default'}"
-                stack = [("settings",), ("bp",)]
+                if abbr == "JUDGE":
+                    supra = next((x for x in meeting.members if is_supra(x)), None)
+                    if supra is not None:
+                        a_info = accts.get(tool)
+                        supra.tool = tool
+                        supra.model = mod or None
+                        if a_info:
+                            supra.account, supra.home = a_info[0], a_info[2]
+                        elif tool == "opencode":
+                            supra.account, supra.home = "main", None
+                        supra.default_model, supra.default_effort = defaults(tool, supra.home)
+                        hit = next((a for a in conf["agents"] if a["name"] == supra.name), None)
+                        if hit is None:
+                            hit = {"name": supra.name, "tool": supra.tool, "account": supra.account,
+                                   "model": supra.model, "effort": supra.effort, "persona": supra.persona,
+                                   "soul": supra.soul, "rules": supra.rules, "lean": getattr(supra, "lean", "free"),
+                                   "powers": list(getattr(supra, "powers", []))}
+                            conf["agents"].append(hit)
+                        else:
+                            hit["tool"], hit["account"], hit["model"] = supra.tool, supra.account, supra.model
+                        conf.pop("judge", None)
+                    else:
+                        conf["judge"] = f"{tool}:{mod}"
+                    save_conf(conf)
+                    changed = True
+                    status_msg = f"✓ Judge → {TOOLS[tool]} · {mod or 'default'}"
+                else:
+                    cast = dict(conf.get("bp_cast") or {})
+                    cast[abbr] = f"{tool}:{mod}"
+                    conf["bp_cast"] = cast
+                    save_conf(conf)
+                    changed = True
+                    status_msg = f"✓ {abbr} → {TOOLS[tool]} · {mod or 'default'}"
+                while len(stack) > 1 and stack[-1][0] in ("bp_models", "bp_role"):
+                    stack.pop()
             elif op == "bp_custom_model":
                 abbr, tool = action[1], action[2]
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -1434,13 +1567,41 @@ def settings_popup(chair, win, start="settings"):
                 sys.stdout.write("\033[?25l\033[?1000h\033[?1006h")
                 sys.stdout.flush()
                 if typed:
-                    cast = dict(conf.get("bp_cast") or {})
-                    cast[abbr] = f"{tool}:{typed}"
-                    conf["bp_cast"] = cast
-                    save_conf(conf)
-                    changed = True
-                    status_msg = f"✓ {abbr} → {TOOLS[tool]} · {typed}"
-                    stack = [("settings",), ("bp",)]
+                    if abbr == "JUDGE":
+                        supra = next((x for x in meeting.members if is_supra(x)), None)
+                        if supra is not None:
+                            a_info = accts.get(tool)
+                            supra.tool = tool
+                            supra.model = typed
+                            if a_info:
+                                supra.account, supra.home = a_info[0], a_info[2]
+                            elif tool == "opencode":
+                                supra.account, supra.home = "main", None
+                            supra.default_model, supra.default_effort = defaults(tool, supra.home)
+                            hit = next((a for a in conf["agents"] if a["name"] == supra.name), None)
+                            if hit is None:
+                                hit = {"name": supra.name, "tool": supra.tool, "account": supra.account,
+                                       "model": supra.model, "effort": supra.effort, "persona": supra.persona,
+                                       "soul": supra.soul, "rules": supra.rules, "lean": getattr(supra, "lean", "free"),
+                                       "powers": list(getattr(supra, "powers", []))}
+                                conf["agents"].append(hit)
+                            else:
+                                hit["tool"], hit["account"], hit["model"] = supra.tool, supra.account, supra.model
+                            conf.pop("judge", None)
+                        else:
+                            conf["judge"] = f"{tool}:{typed}"
+                        save_conf(conf)
+                        changed = True
+                        status_msg = f"✓ Judge → {TOOLS[tool]} · {typed}"
+                    else:
+                        cast = dict(conf.get("bp_cast") or {})
+                        cast[abbr] = f"{tool}:{typed}"
+                        conf["bp_cast"] = cast
+                        save_conf(conf)
+                        changed = True
+                        status_msg = f"✓ {abbr} → {TOOLS[tool]} · {typed}"
+                    while len(stack) > 1 and stack[-1][0] in ("bp_models", "bp_role"):
+                        stack.pop()
                 else:
                     status_msg = "Cancelled custom model entry"
     except Exception:  # noqa: BLE001
@@ -1913,9 +2074,19 @@ def ensure_agent(owner, name, character="", soul="", rules=""):
             "MEMORY.md": (f"# Memory of {name} in {os.path.basename(owner) or owner}\n\n<!-- What {name} asked to keep "
                           "(its 'Remember:' lines), newest last. Edit or clear freely. -->\n"),
         }
+        # Seed Supra Omnia from ~/Council/agents/supra-omnia when available so every project inherits its canonical files
+        seed_dir = agent_dir(GENERAL, name) if handle_of(name) == SUPRA_HANDLE and os.path.abspath(owner) != os.path.abspath(GENERAL) else ""
         for f, text in files.items():
-            if not os.path.exists(os.path.join(d, f)):
-                with open(os.path.join(d, f), "w") as fh:
+            dst = os.path.join(d, f)
+            if not os.path.exists(dst):
+                src = os.path.join(seed_dir, f) if (seed_dir and f != "MEMORY.md") else ""
+                if src and os.path.isfile(src):
+                    try:
+                        with open(src) as sf:
+                            text = sf.read()
+                    except OSError:
+                        pass
+                with open(dst, "w") as fh:
                     fh.write(text)
     except OSError:
         pass
@@ -2527,7 +2698,7 @@ class Meeting:
                            (f" [{LEAN_SHOWN[getattr(x, 'lean', 'free')]}]"
                             if (x.made and x.persona) or getattr(x, "lean", "free") != "free" else "") +
                            (" - " + x.persona.split(".")[0][:60] if x.made and x.persona else "")
-                           for x in self.seated())
+                           for x in self.active_members())
         who = f"You are @{m.shown()}"
         if m.made:
             who += f", an agent named {m.name}, running on {TOOLS[m.tool]}"
@@ -2630,10 +2801,10 @@ class Meeting:
     def strike(self, by, word, why):
         """A strike from an agent with the remove power; at STRIKES the member is removed (judge_remove).
         Kept per project, so strikes carry from one meeting to the next. Never itself, never someone not
-        at the table."""
+        at the table, never the permanent final judge."""
         with LOCK:
             m = self.find(word)
-            if not m or m is by or not m.seated:
+            if not m or m is by or not m.seated or is_permanent_supra(m):
                 return
             got = self.conf.setdefault("strikes", {})
             got[m.handle] = got.get(m.handle, 0) + 1
@@ -2650,8 +2821,10 @@ class Meeting:
                  f". {STRIKES - n} more and it is removed.")
 
     def judges(self):
-        """Members with the judge power: they sit out the round and give their verdict when it ends."""
-        return [m for m in self.seated() if "judge" in getattr(m, "powers", [])]
+        """Members with the judge power: they sit out the round and give their verdict when it ends.
+        Supra Omnia always speaks last."""
+        return sorted([m for m in self.seated() if "judge" in getattr(m, "powers", [])],
+                      key=lambda m: (1 if is_supra(m) else 0))
 
     def judge_round(self, judges, live):
         """After a round: each judge, last, weighs what was said and gives its verdict (and strikes)."""
@@ -2671,10 +2844,10 @@ class Meeting:
         dealt again without it. An agent you made is deleted for good and its memory wiped: gone from the
         agents list, its folder here (soul, character, rules, memory) erased, not moved aside. An LLM's own
         seat (your account, nothing of it to delete) leaves the table; + add brings it back. Never itself,
-        never someone not at the table."""
+        never someone not at the table, never the permanent final judge."""
         with LOCK:
             m = self.find(word)
-            if not m or m is by or not m.seated:
+            if not m or m is by or not m.seated or is_permanent_supra(m):
                 return
             name = m.shown()
             m.seated = False
@@ -2738,10 +2911,83 @@ class Meeting:
         except (TypeError, ValueError):
             return 3
 
+    def _resolve_slot(self, spec, abbr, players=(), taken=None, used_shown=None, accts_cache=None):
+        """Resolve a direct 'provider:model' spec across all 6 providers into a Member slot."""
+        if not spec or ":" not in spec:
+            return None
+        taken = taken if taken is not None else set()
+        used_shown = used_shown if used_shown is not None else set()
+        accts_cache = accts_cache if accts_cache is not None else [None]
+        tool_raw, model_raw = spec.split(":", 1)
+        tool = ALIAS.get(tool_raw.strip().lower(), tool_raw.strip().lower())
+        if tool not in TOOLS:
+            return None
+        model = model_raw.strip() or None
+        for p in players:
+            if p.handle not in taken and p.tool == tool and not (p.made and p.persona):
+                if (not model and not p.model) or (model and p.model and canon(p.model) == canon(model)):
+                    taken.add(p.handle)
+                    used_shown.add(p.shown())
+                    return p
+        base = next((x for x in self.members if x.tool == tool and x.account), None)
+        acct = base.account if base else None
+        home = base.home if base else None
+        if not acct:
+            if accts_cache[0] is None:
+                accts_cache[0] = accounts()
+            a_info = accts_cache[0].get(tool)
+            if a_info:
+                acct, _, home = a_info
+        if not acct and tool == "opencode":
+            acct = "main"
+        if not acct:
+            return None
+        m = Member(f"{TOOLS[tool]} {abbr}", tool, account=acct, model=model,
+                   effort=(base.effort if base else None), folder=home)
+        m.handle = f"bp_{abbr.lower()}"
+        m.seated = True
+        m.signed = True
+        slug = m.model_slug() or tool
+        m._shown = slug if slug not in used_shown else f"{slug}-{abbr.lower()}"
+        used_shown.add(m._shown)
+        return m
+
+    def _conf_judge(self):
+        """Fallback judge from conf['judge'] ('provider:model') when no seated member holds judge/remove power."""
+        spec = (self.conf.get("judge") or "").strip()
+        if not spec:
+            return None
+        if ":" in spec:
+            j = self._resolve_slot(spec, "JUDGE")
+            if j:
+                j.powers = ["judge"]
+            return j
+        m = self.find(spec)
+        return m if (m and m.seated) else None
+
     def adjudicators(self):
         """Who judges a BP debate or a Win Stake: members with the judge power, else those with the
-        remove power (Supra Omnia, the council's final judge)."""
-        return self.judges() or [m for m in self.seated() if "remove" in getattr(m, "powers", [])]
+        remove power (Supra Omnia, the council's final judge), else conf['judge']. Supra Omnia always speaks last."""
+        found = self.judges() or [m for m in self.seated() if "remove" in getattr(m, "powers", [])]
+        if not found:
+            cj = self._conf_judge()
+            if cj:
+                found = [cj]
+        return sorted(found, key=lambda m: (1 if is_supra(m) else 0))
+
+    def active_members(self):
+        """Active roster for grid panes, prompts, replay & @-completion: in BP debate with assigned
+        speakers, show BP cast + adjudicators (Supra Omnia last); otherwise all seated members."""
+        if self.format() == "bp":
+            bp_members = [x for _r, x in self.bp_cast()]
+            if bp_members:
+                seen, out = set(), []
+                for m in bp_members + self.adjudicators():
+                    if m.handle not in seen:
+                        seen.add(m.handle)
+                        out.append(m)
+                return out
+        return self.seated()
 
     def format_round(self, targets, gen):
         def live():
@@ -2790,49 +3036,13 @@ class Meeting:
         taken, cast, used_shown = set(), {}, set()
         accts_cache = [None]
 
-        def resolve_spec(spec, abbr):
-            tool_raw, model_raw = spec.split(":", 1)
-            tool = ALIAS.get(tool_raw.strip().lower(), tool_raw.strip().lower())
-            if tool not in TOOLS:
-                return None
-            model = model_raw.strip() or None
-            # Reuse an existing untaken player only if it already explicitly runs this exact provider + model
-            for p in players:
-                if p.handle not in taken and p.tool == tool and not (p.made and p.persona):
-                    if (not model and not p.model) or (model and p.model and canon(p.model) == canon(model)):
-                        taken.add(p.handle)
-                        used_shown.add(p.shown())
-                        return p
-            # Otherwise build a dedicated BP speaker slot on that provider + model
-            base = next((x for x in self.members if x.tool == tool and x.account), None)
-            acct = base.account if base else None
-            home = base.home if base else None
-            if not acct:
-                if accts_cache[0] is None:
-                    accts_cache[0] = accounts()
-                a_info = accts_cache[0].get(tool)
-                if a_info:
-                    acct, _, home = a_info
-            if not acct and tool == "opencode":
-                acct = "main"
-            if not acct:
-                return None
-            m = Member(f"{TOOLS[tool]} {abbr}", tool, account=acct, model=model,
-                       effort=(base.effort if base else None), folder=home)
-            m.handle = f"bp_{abbr.lower()}"
-            m.seated = True
-            m.signed = True
-            slug = m.model_slug() or tool
-            m._shown = slug if slug not in used_shown else f"{slug}-{abbr.lower()}"
-            used_shown.add(m._shown)
-            return m
-
         for abbr, *_x in BP_ROLES:
             val = chosen.get(abbr, "")
             if not val:
                 continue
             if ":" in val:
-                m = resolve_spec(val, abbr)
+                m = self._resolve_slot(val, abbr, players=players, taken=taken, used_shown=used_shown,
+                                       accts_cache=accts_cache)
                 if m:
                     cast[abbr] = m
             else:
@@ -3030,13 +3240,17 @@ class Meeting:
         anchoring, then append and save the aggregated distribution."""
         def live():
             return gen is None or gen == GEN[0]
-        if not targets:
-            note("Nobody at the table to simulate. /agents shows who is benched; /seat NAME brings one back.")
-            return ""
         fmt = self.format()
         adj = self.adjudicators()
         players = [m for m in targets if m not in adj] or [m for m in self.seated() if m not in adj]
-        if fmt in ("bp", "stake") and len(players) < 2:
+        if fmt == "bp":
+            if len(self.bp_cast(players)) < 2:
+                note("BP debate needs at least two speakers besides the judge: /settings or /bp to assign models.")
+                return ""
+        elif not targets:
+            note("Nobody at the table to simulate. /agents shows who is benched; /seat NAME brings one back.")
+            return ""
+        elif fmt == "stake" and len(players) < 2:
             note("This format needs at least two members besides the judge: + add someone.")
             return ""
         base = list(base_thread) if base_thread is not None else list(self.thread)
@@ -3092,17 +3306,23 @@ class Meeting:
                 if not ROUNDS[0]:
                     BUSY.clear()
 
-    def round(self, targets, fresh, gen=None):
+    def round(self, targets, fresh, gen=None, directed=False):
         with LOCK:
             ROUNDS[0] += 1
             BUSY.set()
         try:
             # A judge (the judge power) sits the round out and gives its verdict when the round ends;
-            # a message the chair sends to the judges alone (or one single member) is answered directly
+            # a message the chair explicitly sends to the judges alone (or one single member) is answered
+            # directly. In BP debate, an untagged motion always runs format_round() even when all base
+            # seats are benched and only the judge is seated (bp_cast provides the speakers).
             judges = self.judges()
             if self.format() in ("bp", "stake"):
                 adj = self.adjudicators()
-                if (adj and all(m in adj for m in targets)) or len(targets) == 1:
+                has_bp_cast = self.format() == "bp" and len(self.bp_cast()) >= 2
+                if directed and ((adj and all(m in adj for m in targets)) or len(targets) == 1):
+                    self.round_(targets, fresh, gen)
+                    return
+                if not directed and not has_bp_cast and ((adj and all(m in adj for m in targets)) or len(targets) == 1):
                     self.round_(targets, fresh, gen)
                     return
                 self.format_round(targets, gen)
@@ -3580,7 +3800,7 @@ def resume_menu(past):
 def replay(meeting):
     """Put the meeting's thread back into the members' panes (they read the feed from its start)."""
     with LOCK:
-        kinds = {m.handle: m.colour() for m in list(meeting.members)}
+        kinds = {m.handle: m.colour() for m in list(meeting.members) + meeting.active_members()}
         thread = list(meeting.thread)
         emit({"t": "reset"})
         for e in thread:
@@ -3623,7 +3843,7 @@ ROAST = {"meeting": None, "directed": set()}   # the roast going on (a new messa
 
 
 def _status_names():
-    """Handle -> display name for active speakers, including dedicated BP position speakers."""
+    """Handle -> display name for active speakers, including dedicated BP position speakers & judges."""
     t = TABLE[0]
     if not t:
         return {}
@@ -3631,6 +3851,8 @@ def _status_names():
     if t.format() == "bp":
         for role, m in t.bp_cast():
             names.setdefault(m.handle, f"{m.shown()} ({role[0]})")
+    for j in t.adjudicators():
+        names.setdefault(j.handle, f"{j.shown()} (Judge)")
     return names
 
 
@@ -3785,18 +4007,9 @@ class Grid:
         return all(r.endswith(" c") or r.split()[0] == self.me for r in rows if r.strip())
 
     def active_roster(self, meeting):
-        """Members to show panes for: seated members, or BP cast + judge when BP uses direct provider:model slots."""
-        seated = meeting.seated()
-        if seated:
-            return seated
-        if meeting.format() == "bp":
-            seen, out = set(), []
-            for m in [x for _r, x in meeting.bp_cast()] + meeting.adjudicators():
-                if m.handle not in seen:
-                    seen.add(m.handle)
-                    out.append(m)
-            return out
-        return []
+        """Members to show panes for: in BP debate with assigned speakers, show BP cast + adjudicators
+        (Supra Omnia last); otherwise show all seated members."""
+        return meeting.active_members()
 
     def open(self, meeting):
         with GRID_LOCK:
@@ -3979,13 +4192,15 @@ class Grid:
         """Each pane's header: who, the model and effort it runs on, and how to change them. When a
         name or colour changed (a new model, /names, someone joined), the panes are drawn again, so
         every message shows the name and colour its member has now."""
-        sig = (table_names(meeting.members), table_colours(meeting.members))
+        active = self.active_roster(meeting)
+        sig = (table_names(meeting.members), table_colours(meeting.members),
+               [(m.handle, m.shown(), m.colour(), m.runs_on()[0]) for m in active])
         if getattr(self, "sig", None) not in (None, sig) and FEED["grid"]:
             replay(meeting)
         self.sig = sig
         roster = list(meeting.members)
         known = {m.handle for m in roster}
-        for m in self.active_roster(meeting):
+        for m in active:
             if m.handle not in known:
                 roster.append(m)
                 known.add(m.handle)
@@ -3995,7 +4210,9 @@ class Grid:
                 continue
             model, effort = m.runs_on()
             named = m.by_model()          # it goes by its model: the name says the model, the LLM in brackets
-            who = f"@{m.shown()}" + (f" ({TOOLS[m.tool]})" if m.made and not named else "")
+            badge = (f"[{m.handle[3:].upper()}] " if m.handle.startswith("bp_") else
+                     ("[JUDGE] " if (is_supra(m) or "judge" in getattr(m, "powers", [])) else ""))
+            who = badge + f"@{m.shown()}" + (f" ({TOOLS[m.tool]})" if m.made and not named else "")
             perm = meeting.perm_of(m)
             runs = model + (f" · effort {effort}" if effort else "") + ({"edit": " · EDIT", "bypass": " · BYPASS"}
                                                                        .get(perm, ""))
@@ -4003,10 +4220,12 @@ class Grid:
                 if named else runs
             if (m.made and m.persona) or getattr(m, "lean", "free") != "free":
                 says += " · " + LEAN_SHOWN[getattr(m, "lean", "free")]
+            tmx("set-option", "-p", "-t", p, "@council_tool", m.tool)
             tmx("set-option", "-p", "-t", p, "@council_lean", getattr(m, "lean", "free"))
             tmx("set-option", "-p", "-t", p, "@council_perm", perm)
             tmx("set-option", "-p", "-t", p, "@council_name", m.shown())       # what ✕ asks about
-            tmx("set-option", "-p", "-t", p, "@council_what", "Delete agent" if m.made else "Remove")
+            tmx("set-option", "-p", "-t", p, "@council_what",
+                "Keep judge" if is_permanent_supra(m) else ("Delete agent" if m.made else "Remove"))
             tmx("set-option", "-p", "-t", p, "@council_model", m.model or "")
             tmx("set-option", "-p", "-t", p, "@council_effort",
                 (gemini_effort(m.home) or "") if m.tool == "gemini" else (m.effort or ""))
@@ -4019,7 +4238,7 @@ class Grid:
         one = self.panes.get(ALL)
         if one:       # the one view's header: everyone at the table, each in the colour of its answers
             names = " ".join(f"#[fg={TMUX_COLOUR.get(m.colour(), 'colour221')},bold]@{m.shown()}#[default]"
-                             for m in self.active_roster(meeting))
+                             for m in active)
             tmx("set-option", "-p", "-t", one, "pane-border-format",
                 f" #[fg=colour252,bold]everyone#[default] {names} #[fg=colour244]· one view (Alt+O in the chat "
                 "box: one pane each)#[default]#[align=right]#[fg=colour244] ✕ #[default]")
@@ -4034,8 +4253,8 @@ class Grid:
                      if not (m.made and m.persona) and canon(m.runs_on()[0])))
         tmx("set-option", "-w", "-t", self.me, "@council_homes",
             ";".join(f"{t}={h}" for t, h in {m.tool: m.home for m in reversed(meeting.members) if m.home}.items()))
-        tmx("set-option", "-w", "-t", self.me, "@council_seated",      # for ✕ on the one view: who to take off
-            ";".join(f"{m.handle}={m.shown()}={'1' if m.made else '0'}" for m in meeting.seated()))
+        tmx("set-option", "-w", "-t", self.me, "@council_seated",      # for ✕ on the one view & Remove everyone
+            ";".join(f"{m.handle}={m.shown()}={'1' if m.made else '0'}" for m in active))
         tmx("set-option", "-w", "-t", self.me, "@council_full", "1" if len(meeting.seated()) >= MAX_SEATS else "0")
         tmx("set-option", "-w", "-t", self.me, "@council_out",
             ";".join(f"{m.handle}={m.label()}" for m in out).replace("#", "##"))
@@ -4073,6 +4292,8 @@ def menu(client, pane):
     handle, tool, chair = opt("@council_member"), opt("@council_tool"), opt("@council_chair")
     if handle == ALL:
         return one_menu(client, pane)
+    if handle and handle.startswith("bp_"):
+        return _launch_settings_popup_sync(client, pane, f"bp_role:{handle[3:].upper()}")
     if not handle or tool not in TOOLS or not chair:
         return 0
     model, effort, default = opt("@council_model"), opt("@council_effort"), opt("@council_default")
@@ -4090,6 +4311,9 @@ def menu(client, pane):
     used = used_models(win)
     me = opt("@council_name")
     items = []
+    if handle == SUPRA_HANDLE:
+        items += ["Switch Judge provider & model (all 6 providers)…", "j",
+                  tmx_run(ME, "--open-settings", client, win, "bp_role:JUDGE"), ""]
     for key, name in zip(MODEL_KEYS, names):
         who = used.get(canon(name))
         if who and who != me:            # another member runs it: no model twice at the table
@@ -4180,9 +4404,11 @@ def remove(pane):
         send_cmd_now(chair, "/view grid")
         return 0
     if handle and chair:
-        # what every council understands, one opened before /remove was there too: an agent you made
-        # (any name that is not an LLM's) is deleted, an LLM's own seat benched
-        send_cmd_now(chair, f"/bench {handle}" if handle in TOOLS else f"/agent del {handle}")
+        # BP speaker slots use /remove bp_<role>; made agents delete for good; LLMs bench
+        if handle.startswith("bp_"):
+            send_cmd_now(chair, f"/remove {handle}")
+        else:
+            send_cmd_now(chair, f"/bench {handle}" if handle in TOOLS else f"/agent del {handle}")
     return 0
 
 
@@ -4375,8 +4601,14 @@ def clear_menu(client, target):
     seated = [x.split("=") for x in tmx("show-options", "-wqv", "-t", target, "@council_seated").split(";") if x]
     if not chair or not seated:
         return 0
-    made = sum(1 for x in seated if len(x) == 3 and x[2] == "1")
-    title = f"#[align=centre] Take all {len(seated)} off the table? " + (
+    removable = [x for x in seated if not (supra_permanent() and x[0] == SUPRA_HANDLE)]
+    if not removable:
+        tmx("display-menu", "-O", "-M", *(["-c", client] if client else []),
+            "-T", "#[align=centre] Only @supra-omnia (permanent final judge) is seated ",
+            "-x", "C", "-y", "C", "--", "-Use ⚙ settings or Alt+M to change its model", "", "", "", "Close", "n", "")
+        return 0
+    made = sum(1 for x in removable if len(x) == 3 and x[2] == "1")
+    title = f"#[align=centre] Take all {len(removable)} off the table? " + (
         f"({made} you made: deleted, folders kept) " if made else "")
     tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-T", title, "-x", "C", "-y", "C", "--",
         "Yes, remove everyone", "y", send_cmd(chair, "/remove all"),
@@ -4396,12 +4628,23 @@ def one_menu(client, pane):
 
     seated = [x.split("=") for x in tmx("show-options", "-wqv", "-t", pane, "@council_seated").split(";") if x]
     items = []
+    removable_n = 0
     for key, (handle, name, made) in zip("1234567890bc", [x for x in seated if len(x) == 3]):   # a g q n taken
-        items += [f"Delete agent @{name} for good" if made == "1" else f"Remove @{name} (+ add brings it back)", key,
-                  send(f"/agent del {handle}" if made == "1" else f"/bench {handle}")]
+        if handle == SUPRA_HANDLE and supra_permanent():
+            items += [f"-🔒 @{name} (permanent final judge · Alt+M / ⚙ settings for model)", "", ""]
+        elif handle == "bp_judge":
+            removable_n += 1
+            items += [f"Clear Judge @{name}", key, send("/bp JUDGE auto")]
+        elif handle.startswith("bp_"):
+            removable_n += 1
+            items += [f"Remove BP speaker @{name} ({handle[3:].upper()})", key, send(f"/remove {handle}")]
+        else:
+            removable_n += 1
+            items += [f"Delete agent @{name} for good" if made == "1" else f"Remove @{name} (+ add brings it back)", key,
+                      send(f"/agent del {handle}" if made == "1" else f"/bench {handle}")]
     if not items:
         items += ["-Nobody at the table", "", ""]
-    if seated:
+    if removable_n:
         items += ["Remove everyone…", "a", tmx_run(ME, "--clear-menu", client, pane)]
     items += ["", "Back to one pane per member", "g", send("/view grid"),
               "Close the council", "q", send("/quit"), "", "Cancel", "n", ""]
@@ -4581,6 +4824,36 @@ def build_members(conf, accts, out=None):
         m.perm = (conf.get("agent_perm") or {}).get(a["name"])
         m.seated = seats.get(m.handle, True)
         members.append(m)
+    if supra_permanent():
+        supra = next((m for m in members if is_supra(m)), None)
+        if supra is not None:
+            for p in ("judge", "remove"):
+                if p not in supra.powers:
+                    supra.powers.append(p)
+            if not supra.account:
+                a_info = accts.get(supra.tool)
+                if a_info:
+                    supra.account, supra.home = a_info[0], a_info[2]
+            supra.seated = True
+        else:
+            tool = next((t for t in ("claude", "codex", "gemini", "agy", "copilot", "opencode")
+                         if accts.get(t) and accts[t][0] and accts[t][1]), None)
+            if not tool:
+                tool = next((t for t in TOOLS if accts.get(t) and accts[t][0]), None)
+            if tool:
+                acct, _signed, folder = accts[tool]
+                seed_dir = agent_dir(GENERAL, SUPRA_DEFAULTS["name"])
+                persona = agent_text(seed_dir, "CHARACTER.md") or SUPRA_DEFAULTS["persona"]
+                soul = agent_text(seed_dir, "SOUL.md") or SUPRA_DEFAULTS["soul"]
+                rules = agent_text(seed_dir, "RULES.md") or SUPRA_DEFAULTS["rules"]
+                m = Member(SUPRA_DEFAULTS["name"], tool, account=acct, persona=persona, made=True, folder=folder)
+                m.soul, m.rules = soul, rules
+                m.powers = ["judge", "remove"]
+                m.lean = "free"
+                m.perm = (conf.get("agent_perm") or {}).get(m.name)
+                m.signed = True
+                m.seated = True
+                members.append(m)
     return members
 
 
@@ -4647,15 +4920,37 @@ def command_line(line, meeting, conf, accts):
                 pass
         NAMES["by"] = conf.get("names") or "model"
         seats_map = conf.get("seats") or {}
+        agents_by_name = {a.get("name"): a for a in (conf.get("agents") or []) if isinstance(a, dict)}
         for m in meeting.members:
-            if m.handle in seats_map:
+            if m.made and m.name in agents_by_name:
+                a = agents_by_name[m.name]
+                if a.get("tool") in TOOLS and a["tool"] != m.tool:
+                    m.tool = a["tool"]
+                    a_info = accts.get(m.tool)
+                    m.account = a.get("account") or (a_info[0] if a_info else ("main" if m.tool == "opencode" else m.account))
+                    m.home = a_info[2] if (a_info and m.account == a_info[0]) else None
+                    m.default_model, m.default_effort = defaults(m.tool, m.home)
+                if "model" in a:
+                    m.model = a.get("model")
+                if "effort" in a:
+                    m.effort = a.get("effort")
+                if "lean" in a and a.get("lean"):
+                    m.lean = a.get("lean")
+                if "powers" in a and isinstance(a.get("powers"), list):
+                    m.powers = list(a.get("powers"))
+            if is_permanent_supra(m):
+                m.seated = True
+                for p in ("judge", "remove"):
+                    if p not in getattr(m, "powers", []):
+                        m.powers.append(p)
+            elif m.handle in seats_map:
                 m.seated = bool(seats_map[m.handle])
         fmt = meeting.format()
         rdesc = (f"{len(meeting.bp_cast())}/8 BP speakers" if fmt == "bp" else
                  f"{meeting.stake_rounds()} rounds" if fmt == "stake" else
                  f"{meeting.mode} (" + (("until Ctrl+C" if not meeting.roasts else f"{meeting.roasts}×") if meeting.mode == "roast" else
                                        ("until Ctrl+C" if meeting.rounds == 0 else "answers only" if meeting.rounds < 0 else f"{meeting.rounds}×")) + ")")
-        note(f"Settings applied: {FORMAT_SHOWN[fmt]} · {rdesc} · {len(meeting.seated())} seated · perm {(conf.get('perm') or 'plan').upper()} · {meeting.words()}w.")
+        note(f"Settings applied: {FORMAT_SHOWN[fmt]} · {rdesc} · {len(meeting.active_members())} active · perm {(conf.get('perm') or 'plan').upper()} · {meeting.words()}w.")
     elif cmd == "bp":
         roles = [r[0] for r in BP_ROLES]
         if args and args[0].lower() == "auto":
@@ -4663,8 +4958,56 @@ def command_line(line, meeting, conf, accts):
             save_conf(conf)
             note("BP speakers: set by seat again.")
             bp_menu(meeting, os.environ.get("TMUX_PANE", ""))
-        elif args and args[0].lower() == "pick" and len(args) > 1 and args[1].upper() in roles:
+        elif args and args[0].lower() == "pick" and len(args) > 1 and args[1].upper() in roles + ["JUDGE"]:
             bp_pick_menu(meeting, os.environ.get("TMUX_PANE", ""), args[1].upper())
+        elif len(args) >= 2 and args[0].upper() == "JUDGE":
+            spec_arg = args[1].strip()
+            supra = next((x for x in meeting.members if is_supra(x)), None)
+            if spec_arg.lower() in ("auto", "default", "none", "clear"):
+                if supra is not None:
+                    supra.model = None
+                    for a in conf.get("agents") or []:
+                        if a.get("name") == supra.name:
+                            a["model"] = None
+                conf.pop("judge", None)
+                save_conf(conf)
+                note("Judge reset to default.")
+            elif ":" in spec_arg:
+                t_raw, m_raw = spec_arg.split(":", 1)
+                tool = ALIAS.get(t_raw.strip().lower(), t_raw.strip().lower())
+                if tool not in TOOLS:
+                    note(f"Unknown provider {t_raw!r}. Use: {', '.join(TOOLS)}.")
+                    return True
+                mod = m_raw.strip()
+                if supra is not None:
+                    a_info = accts.get(tool)
+                    supra.tool = tool
+                    supra.model = mod or None
+                    if a_info:
+                        supra.account, supra.home = a_info[0], a_info[2]
+                    elif tool == "opencode":
+                        supra.account, supra.home = "main", None
+                    supra.default_model, supra.default_effort = defaults(tool, supra.home)
+                    hit = next((a for a in conf["agents"] if a["name"] == supra.name), None)
+                    if hit is None:
+                        hit = {"name": supra.name, "tool": supra.tool, "account": supra.account,
+                               "model": supra.model, "effort": supra.effort, "persona": supra.persona,
+                               "soul": supra.soul, "rules": supra.rules, "lean": getattr(supra, "lean", "free"),
+                               "powers": list(getattr(supra, "powers", []))}
+                        conf["agents"].append(hit)
+                    else:
+                        hit["tool"], hit["account"], hit["model"] = supra.tool, supra.account, supra.model
+                    conf.pop("judge", None)
+                    save_conf(conf)
+                    note(f"Judge @{supra.shown()} now runs on {TOOLS[tool]} ({mod or 'default'}).")
+                else:
+                    conf["judge"] = f"{tool}:{mod}"
+                    save_conf(conf)
+                    note(f"Judge assigned: {TOOLS[tool]} ({mod or 'default'}).")
+            else:
+                note("Judge syntax: /bp JUDGE provider:model (e.g. /bp JUDGE claude:claude-opus-5-5) or /bp JUDGE auto")
+            if GRID[0]:
+                GRID[0].relabel(meeting)
         elif len(args) >= 2 and args[0].upper() in roles:
             role = args[0].upper()
             spec_arg = args[1].strip()
@@ -4851,19 +5194,80 @@ def command_line(line, meeting, conf, accts):
                   paint(state, "note"))
     elif cmd in ("remove", "kick"):
         # ✕ on a member's header: an agent you made is deleted, not benched (gone from every council;
-        # + add makes a new one); an LLM's own seat (its account) can only leave this table
+        # + add makes a new one); an LLM's own seat (its account) can only leave this table;
+        # a BP provider:model slot (bp_pm / PM) is cleared from bp_cast.
+        bp_roles = {r[0] for r in BP_ROLES}
         if [w.lower().lstrip("@") for w in args] in (["all"], ["everyone"]):
-            gone = meeting.seated()
+            gone = [m for m in meeting.seated() if not is_permanent_supra(m)]
             for m in gone:
                 with contextlib.redirect_stdout(io.StringIO()):     # one note for all, not one each
                     command_line(f"/agent del {m.handle}" if m.made else f"/bench {m.handle}", meeting, conf, accts)
-            note(f"Everyone left the table ({len(gone)}). + add brings seats back." if gone else
-                 "Nobody is at the table.")
+            bp_cleared = len(conf.get("bp_cast") or {}) + (1 if conf.get("judge") else 0)
+            if bp_cleared:
+                conf.pop("bp_cast", None)
+                conf.pop("judge", None)
+                save_conf(conf)
+            total = len(gone) + (bp_cleared if not gone else 0)
+            kept = " (@supra-omnia stays seated as permanent judge)" if any(is_permanent_supra(m) for m in meeting.seated()) else ""
+            note(f"Everyone left the table ({total}){kept}. + add or /settings brings seats back." if (gone or bp_cleared) else
+                 ("Only @supra-omnia is at the table (permanent judge)." if kept else "Nobody is at the table."))
             return True
         for w in args:
-            m = meeting.find(w.lstrip("@"))
+            tok = w.lstrip("@").strip()
+            low = tok.lower()
+            if low == "bp_judge":
+                if conf.pop("judge", None):
+                    save_conf(conf)
+                    stop_member("bp_judge")
+                    note("Removed assigned Judge.")
+                else:
+                    note("No custom Judge assigned.")
+                continue
+            if low.startswith("bp_") and low[3:].upper() in bp_roles:
+                role = low[3:].upper()
+                cast = dict(conf.get("bp_cast") or {})
+                if role in cast:
+                    cast.pop(role, None)
+                    if cast:
+                        conf["bp_cast"] = cast
+                    else:
+                        conf.pop("bp_cast", None)
+                    save_conf(conf)
+                    stop_member(low)
+                    note(f"Removed BP speaker {role}.")
+                else:
+                    note(f"BP role {role} is not assigned.")
+                continue
+            if tok.upper() in bp_roles and (conf.get("bp_cast") or {}).get(tok.upper()):
+                role = tok.upper()
+                cast = dict(conf.get("bp_cast") or {})
+                cast.pop(role, None)
+                if cast:
+                    conf["bp_cast"] = cast
+                else:
+                    conf.pop("bp_cast", None)
+                save_conf(conf)
+                stop_member(f"bp_{role.lower()}")
+                note(f"Removed BP speaker {role}.")
+                continue
+            m = meeting.find(tok)
             if not m:
-                note(f"No member called {w}.")
+                # Also match a BP-assigned speaker by its shown slug (e.g. /remove @neon)
+                bp_hit = next(((r[0], bm) for r, bm in meeting.bp_cast()
+                               if bm.handle.startswith("bp_") and low in (bm.handle, bm.shown().lower())), None)
+                if bp_hit:
+                    role, bm = bp_hit
+                    cast = dict(conf.get("bp_cast") or {})
+                    cast.pop(role, None)
+                    if cast:
+                        conf["bp_cast"] = cast
+                    else:
+                        conf.pop("bp_cast", None)
+                    save_conf(conf)
+                    stop_member(bm.handle)
+                    note(f"Removed BP speaker @{bm.shown()} ({role}).")
+                else:
+                    note(f"No member called {w}.")
             else:
                 command_line(f"/agent del {m.handle}" if m.made else f"/bench {m.handle}", meeting, conf, accts)
     elif cmd in ("bench", "seat"):
@@ -4871,6 +5275,10 @@ def command_line(line, meeting, conf, accts):
             m = meeting.find(w.lstrip("@"))
             if not m:
                 note(f"No member called {w}.")
+                continue
+            if cmd == "bench" and is_permanent_supra(m):
+                note(f"@{m.shown()} is the council's permanent final judge and always stays seated "
+                     "(change its model with /model @supra-omnia …).")
                 continue
             if cmd == "seat" and not m.seated and len(meeting.seated()) >= MAX_SEATS:
                 note(f"The table is full ({MAX_SEATS} at most): ✕ someone first.")
@@ -5009,6 +5417,8 @@ def command_line(line, meeting, conf, accts):
             elif power not in ("remove", "judge"):
                 note("The powers there are: remove (strikes, then out) and judge (sits the round out, gives "
                      "the verdict when it ends).")
+            elif power == "judge" and not on and is_permanent_supra(m):
+                note(f"@{m.shown()} is always the council's final judge and cannot drop judge power.")
             else:
                 m.powers = sorted(set(getattr(m, "powers", [])) | {power}) if on else \
                     [x for x in getattr(m, "powers", []) if x != power]
@@ -5027,6 +5437,9 @@ def command_line(line, meeting, conf, accts):
             m = meeting.find(args[1].lstrip("@"))
             if not m or not m.made:
                 note(f"No made agent called {args[1]}.")
+            elif is_permanent_supra(m):
+                note(f"@{m.shown()} is the council's permanent final judge and cannot be removed "
+                     "(change its model with /model @supra-omnia …).")
             else:
                 name = m.shown()
                 m.seated = False
@@ -5111,9 +5524,13 @@ def command_line(line, meeting, conf, accts):
                     continue
             setattr(m, cmd, value)
             if m.made:
-                for a in conf["agents"]:
-                    if a["name"] == m.name:
-                        a[cmd] = value
+                hit = next((a for a in conf["agents"] if a["name"] == m.name), None)
+                if hit is None:
+                    hit = {"name": m.name, "tool": m.tool, "account": m.account, "model": m.model,
+                           "effort": m.effort, "persona": m.persona, "soul": m.soul, "rules": m.rules,
+                           "lean": getattr(m, "lean", "free"), "powers": list(getattr(m, "powers", []))}
+                    conf["agents"].append(hit)
+                hit[cmd] = value
             else:
                 conf.setdefault("llm", {}).setdefault(m.tool, {})[cmd] = value
             save_conf(conf)
@@ -5170,6 +5587,8 @@ def command_line(line, meeting, conf, accts):
             if FEED["grid"]:
                 GRID[0].close()
                 note("Split chat view: inline stream in one pane (Alt+O for bubble one view).")
+            elif not meeting.active_members():
+                note("Nobody is at the table yet: click ⚙ settings (or + add) to seat members or assign BP models first.")
             else:
                 GRID[0].open(meeting)
                 note("Split one view: bubbles above the chat box (Alt+O back to single pane).")
@@ -5297,17 +5716,7 @@ def main(argv):
     if argv[:1] == ["--add-menu"] and len(argv) >= 3:
         return add_menu(argv[1], argv[2])
     if argv[:1] == ["--open-settings"] and len(argv) >= 3:
-        cl, target = argv[1], argv[2]
-        start = argv[3] if len(argv) > 3 else "settings"
-        win = tmx("display-message", "-p", "-t", target, "#{window_id}") or target
-        if _popup_is_open(win):
-            return 0
-        chair = tmx("show-options", "-wqv", "-t", win, "@council_chair") or target
-        pop_cmd = " ".join(shlex.quote(str(x)) for x in (ME, "--settings-popup", chair, win, start))
-        tmx("display-popup", "-E", *(["-c", cl] if cl else []), "-x", "C", "-y", "C",
-            "-w", "84", "-h", "28", "-b", "rounded", "-S", "fg=#bb9af7",
-            "-T", " Council Settings ", pop_cmd)
-        return 0
+        return _launch_settings_popup_sync(argv[1], argv[2], argv[3] if len(argv) > 3 else "settings")
     if argv[:1] == ["--settings-popup"] and len(argv) >= 3:
         return settings_popup(argv[1], argv[2], argv[3] if len(argv) > 3 else "settings")
     folder = os.getcwd()
@@ -5387,7 +5796,7 @@ def main(argv):
         print(paint(f"Council · {os.path.basename(folder) or folder} · {FORMAT_SHOWN[meeting.format()]} · mode {meeting.mode} ({rinfo})", "chair"))
         if remembered:
             note(remembered.capitalize())
-        print("  At the table: " + " ".join(paint(m.label(), m.colour()) for m in meeting.seated()))
+        print("  At the table: " + " ".join(paint(m.label(), m.colour()) for m in meeting.active_members()))
         for o in outs:
             note(o)
         note("Tag with @name, /format, /mode order|roast, /model and /effort @name VALUE, /agent new NAME LLM "
@@ -5477,8 +5886,7 @@ def chat(meeting, members, conf, accts, folder):
                     note(BOX["note"])
         if GRID[0]:
             GRID[0].chair_header(meeting)
-            if not FEED["grid"]:
-                GRID[0].relabel(meeting)
+            GRID[0].relabel(meeting)
 
     while True:
         try:
@@ -5657,7 +6065,7 @@ def chat(meeting, members, conf, accts, folder):
             if line.split()[0].lower() in ("/again", "/more"):
                 line = ""
             else:
-                seats = [m.handle for m in meeting.seated()]
+                seats = [m.handle for m in (GRID[0].active_roster(meeting) if GRID[0] else meeting.seated())]
                 had_grid = FEED["grid"]
                 try:
                     keep_going = (boxed(command_line, line, meeting, conf, accts) if BOX["on"] else
@@ -5698,7 +6106,8 @@ def chat(meeting, members, conf, accts, folder):
                         note("A new meeting." + (f" Topic: {meeting.topic}" if meeting.topic else ""))
                 try:
                     sync_grid_ui(had_grid)
-                    if had_grid and FEED["grid"] and GRID[0] and seats != [m.handle for m in meeting.seated()]:
+                    after_seats = [m.handle for m in (GRID[0].active_roster(meeting) if GRID[0] else meeting.seated())]
+                    if had_grid and FEED["grid"] and GRID[0] and seats != after_seats:
                         GRID[0].open(meeting)          # someone joined or left: the grid is dealt out again
                 except Exception as e:  # noqa: BLE001
                     errlog("sync_grid_ui")
@@ -5742,7 +6151,7 @@ def chat(meeting, members, conf, accts, folder):
                 if not TTY:
                     show(meeting.thread[-1])
                 last = named or meeting.seated()
-                meeting.round(last, fresh=True)
+                meeting.round(last, fresh=True, directed=bool(named))
         except KeyboardInterrupt:
             STOP.set()
         except Exception as e:  # noqa: BLE001
@@ -5777,7 +6186,7 @@ class Worker:
             GEN[0] += 1
             gen = GEN[0]
         STOP.clear()
-        threading.Thread(target=self.run, args=(meeting, targets, fresh, gen), daemon=True).start()
+        threading.Thread(target=self.run, args=(meeting, targets, fresh, gen, bool(directed)), daemon=True).start()
 
     def sim(self, meeting, n, question, targets, base_thread):
         """Run a Monte Carlo simulation in the background (Ctrl+C or a newer message stops it)."""
@@ -5815,9 +6224,9 @@ class Worker:
                         BUSY.clear()
         threading.Thread(target=go, daemon=True).start()
 
-    def run(self, meeting, targets, fresh, gen):
+    def run(self, meeting, targets, fresh, gen, directed=False):
         try:
-            meeting.round(targets, fresh, gen)
+            meeting.round(targets, fresh, gen, directed=directed)
         except Exception as e:  # noqa: BLE001  (a round that breaks must not take the chat box with it)
             note(f"That round failed: {e}")
         if STOP.is_set() and gen == GEN[0] and not BUSY.is_set():

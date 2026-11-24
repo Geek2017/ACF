@@ -1001,10 +1001,147 @@ assert feed_esc(b"[I") == ("noop", None) and feed_esc(b"[O") == ("noop", None)
 assert feed_esc(b"[Mabc") == ("noop", None) and feed_esc(b"OH") == ("noop", None)
 assert feed_esc(b"[A") == ("up", None) and feed_esc(b"[<0;12;5M") == ("mouse", (0, 12, 5, "M"))
 
-# 19. Table Seats screen exists in persistent settings popup with Back button
+# 19. Table Seats screen exists in persistent settings popup with Back + Remove everyone, and /remove works on BP speakers
 _ts, _cs, rws_s = g["_settings_screen_items"](("seats",), bp_conf, mt_bp, fake_accts, {})
 acts_s = [r.get("action") for r in rws_s if r["kind"] == "item"]
-assert ("back",) in acts_s and ("seat_all",) in acts_s and any(a and a[0] == "toggle_seat" for a in acts_s), f"seats screen wrong: {acts_s}"
+assert ("back",) in acts_s and ("seat_all",) in acts_s and ("unseat_all",) in acts_s and any(a and a[0] == "toggle_seat" for a in acts_s), f"seats screen wrong: {acts_s}"
+# Test /remove bp_pm, /remove LO, /remove all on BP cast with 0 regular seats
+for xm in (m1, m2, m3, m_agy, m_cop, m_oc):
+    xm.seated = False
+bp_c2 = {"format": "bp", "bp_cast": {"PM": "claude:claude-opus-5-5", "LO": "gemini:gemini-4-neon", "DPM": "codex:gpt-6-astra"}}
+import contextlib as _cl, io as _io
+mt_rm = g["Meeting"](T, [m1, m2, m3], bp_c2)
+g["TABLE"][0] = mt_rm
+with _cl.redirect_stdout(_io.StringIO()):
+    g["command_line"]("/remove bp_pm", mt_rm, bp_c2, fake_accts)
+assert "PM" not in bp_c2.get("bp_cast", {}), f"bp_pm not removed: {bp_c2}"
+with _cl.redirect_stdout(_io.StringIO()):
+    g["command_line"]("/remove LO", mt_rm, bp_c2, fake_accts)
+assert "LO" not in bp_c2.get("bp_cast", {}), f"LO not removed: {bp_c2}"
+with _cl.redirect_stdout(_io.StringIO()):
+    g["command_line"]("/remove all", mt_rm, bp_c2, fake_accts)
+assert not bp_c2.get("bp_cast"), f"/remove all did not clear bp_cast: {bp_c2}"
+
+# 20. Permanent Supra Omnia: always present, always last decider in forum / bp / stake, protected from removal
+os.environ["AFC_COUNCIL_FORCE_SUPRA"] = "1"
+try:
+    s_conf = {"agents": [], "seats": {t: False for t in ("claude", "codex", "gemini", "agy", "copilot", "opencode")},
+              "format": "bp", "bp_cast": {"PM": "claude:claude-opus-5-5", "LO": "gemini:gemini-4-neon"}}
+    s_members = g["build_members"](s_conf, fake_accts)
+    supra = next((x for x in s_members if x.handle == "supra-omnia"), None)
+    assert supra is not None and supra.seated, f"supra-omnia must always be present and seated: {s_members}"
+    assert "judge" in supra.powers and "remove" in supra.powers, f"supra powers missing: {supra.powers}"
+    # Protected against /bench, /agent del, /agent power judge off, /remove all
+    mt_sup = g["Meeting"](T, s_members, s_conf)
+    g["TABLE"][0] = mt_sup
+    with _cl.redirect_stdout(_io.StringIO()):
+        g["command_line"]("/bench supra-omnia", mt_sup, s_conf, fake_accts)
+        g["command_line"]("/agent del supra-omnia", mt_sup, s_conf, fake_accts)
+        g["command_line"]("/agent power supra-omnia judge off", mt_sup, s_conf, fake_accts)
+    assert supra.seated, "supra-omnia must not be benchable"
+    assert any(x.handle == "supra-omnia" for x in mt_sup.members), "supra-omnia must not be deletable"
+    assert "judge" in supra.powers, "supra-omnia must keep judge power"
+    # Even if another judge exists, Supra Omnia is always LAST in judges() and adjudicators()
+    j2 = M("Arbiter", "codex", account="main", persona="Second judge", made=True)
+    j2.powers = ["judge"]; j2.seated = True
+    mt_sup.members.insert(0, j2)
+    assert mt_sup.judges()[-1].handle == "supra-omnia", f"supra must be last judge: {mt_sup.judges()}"
+    assert mt_sup.adjudicators()[-1].handle == "supra-omnia", f"supra must be last adjudicator: {mt_sup.adjudicators()}"
+    mt_sup.members.remove(j2)
+    # In BP with ALL base seats benched + bp_cast, active_roster includes BP cast + supra-omnia last
+    gr = g["Grid"]()
+    roster = gr.active_roster(mt_sup)
+    assert [x.handle for x in roster] == ["bp_pm", "bp_lo", "supra-omnia"], f"BP roster wrong: {[x.handle for x in roster]}"
+    # Verify speak order across all 3 formats: supra-omnia ALWAYS speaks LAST with phase 'verdict'
+    for fmt in ("bp", "forum", "stake"):
+        calls = []
+        s_conf["format"] = fmt
+        if fmt != "bp":
+            for xm in s_members:
+                if xm.handle in ("claude", "codex"):
+                    xm.seated = True
+        else:
+            for xm in s_members:
+                if xm.handle != "supra-omnia":
+                    xm.seated = False
+        mt_f = g["Meeting"](T, s_members, s_conf)
+        mt_f.rounds = 1
+        mt_f.save = lambda: None
+        def fake_speak(m, task, phase, rnd=None, _calls=calls, _mt=mt_f):
+            _calls.append((m.handle, phase))
+            txt = "Vote: @codex" if phase == "stake" and m.handle == "claude" else (
+                  "Vote: @claude" if phase == "stake" else "Verdict: done")
+            _mt.thread.append({"who": m.handle, "as": m.shown(), "name": m.name, "text": txt, "phase": phase})
+        mt_f.speak = fake_speak
+        mt_f.thread.append({"who": "chair", "name": "Chair", "text": "Decide this motion", "phase": "chair"})
+        with _cl.redirect_stdout(_io.StringIO()):
+            mt_f.round(mt_f.seated(), fresh=True, directed=False)
+        assert len(calls) >= 3, f"{fmt}: expected speakers + supra verdict, got {calls}"
+        assert calls[-1] == ("supra-omnia", "verdict"), f"{fmt}: supra-omnia must speak last with verdict, got {calls}"
+        assert all(h != "supra-omnia" for h, _ in calls[:-1]), f"{fmt}: supra-omnia must sit out until verdict, got {calls}"
+finally:
+    os.environ.pop("AFC_COUNCIL_FORCE_SUPRA", None)
+
+# 21. Triple-check regressions: Judge picker (all 6 providers), /bp JUDGE, replay BP colors, prompt BP roster, /sim BP with 0 base seats
+assert "judge" in g["LOCAL"], "judge must persist in LOCAL"
+jc_conf = {"agents": [], "format": "bp", "bp_cast": {"PM": "claude:claude-opus-5-5", "LO": "gemini:gemini-4-neon"}}
+for xm in (m1, m2, m3):
+    xm.seated = False
+mt_j = g["Meeting"](T, [m1, m2, m3], jc_conf)
+g["TABLE"][0] = mt_j
+with _cl.redirect_stdout(_io.StringIO()):
+    g["command_line"]("/bp JUDGE codex:gpt-6-astra", mt_j, jc_conf, fake_accts)
+assert jc_conf.get("judge") == "codex:gpt-6-astra", f"/bp JUDGE failed: {jc_conf}"
+adj_j = mt_j.adjudicators()
+assert len(adj_j) == 1 and adj_j[0].tool == "codex" and adj_j[0].runs_on()[0] == "gpt-6-astra", f"conf judge broken: {adj_j}"
+assert "bp_judge" in g["_status_names"](), f"_status_names missing bp_judge: {g['_status_names']()}"
+# BP prompt roster includes BP speakers + judge even when regular seats are all benched
+pr_bp = mt_j.prompt(mt_j.bp_cast()[0][1], "Speak")
+assert "@opus" in pr_bp and "@neon" in pr_bp and "@astra" in pr_bp, f"BP prompt missing active roster: {pr_bp[:300]}"
+# @ autocomplete includes active BP speakers
+assert "@neon" in g["matches"]("@n", False), f"matches() missing BP speaker @neon: {g['matches']('@n', False)}"
+# replay() preserves provider colors for BP speakers & judge via real JSONL feed
+with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as tf_feed:
+    feed_p = tf_feed.name
+old_feed = g["FEED"]["path"]
+g["FEED"]["path"] = feed_p
+try:
+    mt_j.thread.append({"who": "bp_lo", "as": "neon", "name": "Gemini LO", "text": "Hi", "phase": "bp"})
+    mt_j.thread.append({"who": "bp_judge", "as": "astra", "name": "Codex JUDGE", "text": "Verdict: OG", "phase": "verdict"})
+    g["replay"](mt_j)
+    replayed = [json.loads(line) for line in open(feed_p) if line.strip()]
+finally:
+    g["FEED"]["path"] = old_feed
+    os.unlink(feed_p)
+by_who = {e.get("who"): e.get("kind") for e in replayed if e.get("t") == "msg"}
+assert by_who.get("bp_lo") == "gemini" and by_who.get("bp_judge") == "codex", f"replay lost BP colors: {by_who}"
+# Settings popup screens include Judge row in both root & bp, and bp_role JUDGE lists all 6 providers + Back
+for scr in (("settings",), ("bp",), ("bp_role", "JUDGE"), ("bp_models", "JUDGE", "codex")):
+    _t, _c, rws_j = g["_settings_screen_items"](scr, jc_conf, mt_j, fake_accts, {})
+    acts_j = [r.get("action") for r in rws_j if r["kind"] == "item"]
+    if scr in (("settings",), ("bp",)):
+        assert ("push", ("bp_role", "JUDGE")) in acts_j, f"{scr} missing Judge item: {acts_j}"
+    else:
+        assert ("back",) in acts_j, f"{scr} missing Back button: {acts_j}"
+# /bp JUDGE auto clears conf["judge"]
+with _cl.redirect_stdout(_io.StringIO()):
+    g["command_line"]("/bp JUDGE auto", mt_j, jc_conf, fake_accts)
+assert not jc_conf.get("judge"), f"/bp JUDGE auto did not clear: {jc_conf}"
+# simulate() in BP mode with 0 base seats + bp_cast runs trials instead of bailing on empty targets
+sim_calls = []
+mt_j.save = lambda: None
+orig_round = g["Meeting"].round
+def fake_sim_round(self, targets, fresh, gen=None, directed=False):
+    sim_calls.append(len(self.bp_cast()))
+    self.thread.append({"who": "bp_pm", "as": "opus", "name": "Claude PM", "text": "[PM] hi", "phase": "bp"})
+    self.thread.append({"who": "bp_judge", "as": "astra", "name": "Codex JUDGE", "text": "Verdict: Government (OG)", "phase": "verdict"})
+g["Meeting"].round = fake_sim_round
+try:
+    with _cl.redirect_stdout(_io.StringIO()):
+        res_sim = mt_j.simulate(2, "Test motion", [], base_thread=[])
+    assert len(sim_calls) == 2 and "2/2 trials" in res_sim, f"BP simulate with 0 base seats failed: {sim_calls} {res_sim}"
+finally:
+    g["Meeting"].round = orig_round
 
 print("REGRESSIONS_OK")
 EOF
@@ -1058,15 +1195,18 @@ print(f"{len(ps)}:{leaked}")
 is "... each Monte Carlo trial runs isolated (no cross-trial leakage)" "$sim_check" "6:0"
 # /bp ROLE provider:model assigns models directly across providers, /bp ROLE auto resets one, /sync reloads settings
 mark
-out=$(run "/new" "/format bp" "/bp PM gemini:gemini-4-neon" "/bp LO codex:gpt-6-astra" "/bp DPM claude:claude-sonnet-5-5" "/bp" "This house would ship tests first")
+out=$(run "/new" "/format bp" "/bp PM gemini:gemini-4-neon" "/bp LO codex:gpt-6-astra" "/bp DPM claude:claude-sonnet-5-5" "/bp JUDGE claude:claude-opus-5-5" "/bp" "This house would ship tests first")
 has "/bp ROLE provider:model assigns Gemini model to PM" "$out" 'BP: PM speaks on Gemini \(gemini-4-neon\)'
 has "... and Codex model to LO" "$out" 'BP: LO speaks on Codex \(gpt-6-astra\)'
 has "... and Claude model to DPM" "$out" 'BP: DPM speaks on Claude \(claude-sonnet-5-5\)'
+has "... and Judge model via /bp JUDGE" "$out" 'Judge assigned: Claude \(claude-opus-5-5\)'
 has "... and runs the BP debate with the assigned models" "$(cat "$T/log/argv")" 'gemini-4-neon'
 has "... including Codex's assigned model" "$(cat "$T/log/argv")" 'gpt-6-astra'
 has "... including Claude's assigned model" "$(cat "$T/log/argv")" 'claude-sonnet-5-5'
-out=$(run "/bp PM auto" "/sync")
+has "... and delivers the Judge verdict on its assigned model" "$(cat "$T/log/argv")" 'claude-opus-5-5'
+out=$(run "/bp PM auto" "/bp JUDGE auto" "/sync")
 has "/bp ROLE auto resets a single position" "$out" 'BP: PM reset to auto'
+has "/bp JUDGE auto resets Judge" "$out" 'Judge reset to default'
 has "/sync reloads settings cleanly" "$out" 'Settings applied: BP debate'
 run "/bp auto" "/format forum" "/rounds 1" > /dev/null
 
