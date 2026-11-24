@@ -20,7 +20,9 @@
 #   agents --as <acct> [..] run Claude on that account in any terminal (sign one in: agents --as company, /login)
 #   agents --as gemini:<acct> | codex:<acct> [..]  the same for Gemini (then /auth) and Codex (agents --as codex:<acct> login)
 #   agents --express [project]  the express lane: list it, or put a project's tab on it / off it (Alt+E in the tab)
-#   agents --view [compact|classic] [pane|all]  how Claude draws its chat: compact folds a turn's steps into one line
+#   agents --view [unified|compact|classic] [pane|all]  how agents draw their chat: unified = one clean CLI UI
+#                               (checklist + 1-line bash bar) across Claude, Codex, Gemini and Antigravity;
+#                               compact = Claude's focus view; classic = native CLIs with tmux scrollbar
 #
 # Project list: ~/.config/agents/projects — one per line: <name> <folder>
 # Accounts:     ~/.config/agents/accounts        — one per line: <name> <Claude config folder>   (CLAUDE_CONFIG_DIR)
@@ -196,7 +198,8 @@ BYPASS=--allow-dangerously-skip-permissions
 #   cpu-wall <percent>       no new agent by hand once the machine's CPU is this busy (C: in the
 #                            bar); agents coming back after a restart are let through            (90)
 #   splash on|off            the logo's animation (5 s) before the fleet window opens (afc-splash) (on)
-#   claude-view classic|compact   how Claude draws its chat in the panes it is started in  (classic)
+#   view classic|compact|unified   how agents draw their chat in fleet panes                    (classic)
+#   claude-view classic|compact    legacy alias for view (used when view is unset)              (classic)
 SETTINGS="${AGENTS_SETTINGS:-$HOME/.config/agents/settings}"
 setting() {  # name default -> its value
   local n v _
@@ -208,19 +211,33 @@ setting() {  # name default -> its value
   echo "$2"
 }
 
-# How Claude draws its chat in the fleet's panes: `claude-view` in the settings.
-#   classic  every command and its output in the chat, which stays in tmux's history, so the
-#            scrollbar on the pane's right edge has the chat
-#   compact  a turn's steps folded into one line ("Read 4 files, ran 2 shell commands"), the step
-#            running now with its seconds, then the answer. It is Claude's focus view, which only
-#            its full-screen display has; the chat then scrolls inside Claude (the wheel, PgUp and
-#            PgDn; Ctrl+O shows the steps, /focus switches the folding off and on), and the tmux
-#            scrollbar has nothing for that pane.
-# It rides on $BYPASS, so every way the fleet starts Claude gets it, and it is asked for on the
-# command line, so ~/.claude/settings.json and Claude outside the fleet stay as they are. A
-# settings FILE, not JSON in the line: the line also goes through tmux and bash -c, where the
-# quotes would be eaten. Read when an agent starts: one that is running keeps the view it has.
-if [[ "$(setting claude-view classic)" == compact ]]; then
+# Active chat view mode across the fleet:
+#   classic  native CLIs as-is; Claude runs in classic mode so tmux keeps the chat scrollbar
+#   compact  native CLIs, with Claude in its full-screen focus view (steps folded into one line;
+#            chat scrolls inside Claude, tmux scrollbar empty for Claude panes)
+#   unified  provider-agnostic ACF CLI UI (afc-chat) for Claude, Codex, Gemini and Antigravity:
+#            short task checklist box + 1-line live running bash/tool bar, steps collapsed to one
+#            line (Ctrl+O or /steps expands), keeping tmux's scrollback and scrollbar for every tool.
+fleet_view() {
+  local v
+  v=$(setting view "")
+  [[ -n "$v" ]] || v=$(setting claude-view classic)
+  case "$v" in unified|compact|classic) echo "$v" ;; *) echo classic ;; esac
+}
+
+chat_bin() {
+  if [[ -x "$HOME/.local/bin/afc-chat" ]]; then echo "$HOME/.local/bin/afc-chat"
+  else echo "$(dirname "$(readlink -f "$0")")/afc-chat"; fi
+}
+
+chat_run() {  # tool account mode [extra afc-chat args...]
+  local tool="$1" acct="$2" mode="$3"; shift 3
+  local -a cmd=("$(chat_bin)" --tool "$tool" --mode "$mode")
+  [[ -n "$acct" && "$acct" != - ]] && cmd+=(--account "$acct")
+  "${cmd[@]}" "$@"
+}
+
+if [[ "$(fleet_view)" == compact ]]; then
   VIEWFILE="$HOME/.config/agents/claude-compact.json"
   if [[ "$VIEWFILE" != *[[:space:]]* ]]; then
     [[ -s "$VIEWFILE" ]] || printf '{"tui": "fullscreen", "viewMode": "focus"}\n' > "$VIEWFILE" 2>/dev/null || true
@@ -351,6 +368,16 @@ pane_cmd() {  # folder [seconds to wait first]
   # reopened every tab on one account, and Claude refused the earlier thinking of chats that
   # had been running on another ("can't use thinking from another organization").
   [[ "$(mode "$1")" == continue* ]] && acct=$(chat_account "$1" || true)
+  if [[ "$(fleet_view)" == unified ]]; then
+    local uacct="${acct:-$(current_account)}"
+    local chatcmd; chatcmd="$(chat_bin) --tool claude${uacct:+ --account $uacct}"
+    case "$(mode "$1")" in
+      skip*)     echo "echo 'Claude is already open for this folder in another window. Close it there, then type: claude --continue'; exec bash" ;;
+      continue*) echo "$wait$chatcmd --continue; exec bash" ;;
+      *)         echo "$wait$chatcmd; exec bash" ;;
+    esac
+    return 0
+  fi
   claude="$(account_prefix "$acct")claude $BYPASS"
   case "$(mode "$1")" in
     skip*)     echo "echo 'Claude is already open for this folder in another window. Close it there, then type: claude --continue'; exec bash" ;;
@@ -460,20 +487,51 @@ account_prefix() {  # [account]: the current one when none is given
   [[ "$dir" == "$HOME/.claude" ]] || printf 'CLAUDE_CONFIG_DIR=%q ' "$dir"
 }
 
-pane_agent() {  # pane-pid -> "<pid> claude|gemini|codex": the agent in that pane (a few levels below its shell)
+# Unified CLI UI (afc-chat) process helpers: afc-chat writes a small JSON record to
+# $XDG_RUNTIME_DIR/afc-chat/<pid>.json with its tool, account, session_id, mode and cwd.
+afc_chat_val() {  # pid key -> prints string value from afc-chat's runtime state file
+  local f="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-chat/$1.json" s="" re
+  [[ -r "$f" ]] || return 1
+  IFS= read -r -d '' s < "$f" 2>/dev/null || true
+  re="\"$2\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""
+  if [[ "$s" =~ $re ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; return 0; fi
+  return 1
+}
+is_afc_chat() {  # pid -> 0 if that process is afc-chat
+  [[ -r "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/afc-chat/$1.json" ]] && return 0
+  tr '\0' ' ' < "$PROC/$1/cmdline" 2>/dev/null | grep -qE '(^|/)afc-chat( |$)'
+}
+afc_chat_tool() {  # pid -> claude|codex|gemini|agy|copilot|opencode
+  local v
+  if v=$(afc_chat_val "$1" tool) && [[ "$v" =~ ^(claude|codex|gemini|agy|copilot|opencode)$ ]]; then echo "$v"; return 0; fi
+  arg_after "$1" --tool
+  if [[ "$PV" =~ ^(claude|codex|gemini|agy|copilot|opencode)$ ]]; then echo "$PV"; return 0; fi
+  echo claude
+}
+afc_chat_account() {  # pid -> account name (or empty)
+  local v
+  if v=$(afc_chat_val "$1" account) && [[ -n "$v" ]]; then echo "$v"; return 0; fi
+  arg_after "$1" --account
+  [[ -n "$PV" ]] && echo "$PV"
+  return 0
+}
+
+pane_agent() {  # pane-pid -> "<pid> claude|gemini|codex|agy|copilot|opencode": the agent in that pane
   local pids="$1" p _
   pf -t "$1"
   for _ in 1 2 3 4; do
     for p in $pids; do
       case "$(cat "$PROC/$p/comm" 2>/dev/null)" in
-        claude) echo "$p claude"; return 0 ;;
-        codex)  echo "$p codex"; return 0 ;;
-        agy)    echo "$p agy"; return 0 ;;
-        gemini) echo "$p gemini"; return 0 ;;
+        claude)   echo "$p claude"; return 0 ;;
+        codex)    echo "$p codex"; return 0 ;;
+        agy)      echo "$p agy"; return 0 ;;
+        gemini)   echo "$p gemini"; return 0 ;;
         opencode) echo "$p opencode"; return 0 ;;
-        node)   # Gemini is a node script; so is Copilot's loader (its work runs in a child called MainThread)
-                tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null | grep -qE '/bin/gemini |gemini-cli/' && { echo "$p gemini"; return 0; }
-                tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null | grep -qE '/bin/copilot |/@github/copilot/' && { echo "$p copilot"; return 0; } ;;
+        afc-chat) echo "$p $(afc_chat_tool "$p")"; return 0 ;;
+        python3*) tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null | grep -qE '(^|/)afc-chat( |$)' && { echo "$p $(afc_chat_tool "$p")"; return 0; } ;;
+        node)     # Gemini is a node script; so is Copilot's loader (its work runs in a child called MainThread)
+                  tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null | grep -qE '/bin/gemini |gemini-cli/' && { echo "$p gemini"; return 0; }
+                  tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null | grep -qE '/bin/copilot |/@github/copilot/' && { echo "$p copilot"; return 0; } ;;
       esac
     done
     pids=$(for p in $pids; do pgrep -P "$p" || true; done)
@@ -498,7 +556,14 @@ fleet_pane_of() {  # pid -> the fleet pane it runs under (walks up its parents)
 }
 
 claude_dir() {  # claude pid -> the config folder (account) it runs on
-  local dir; pf "$1"; dir=$(tr '\0' '\n' < "$PROC/$1/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | tail -1 || true)
+  local dir acct
+  if is_afc_chat "$1"; then
+    acct=$(afc_chat_account "$1" || true)
+    if [[ -n "$acct" ]] && dir=$(account_dir "$acct" 2>/dev/null); then echo "$dir"; return 0; fi
+    account_dir "$(current_account)" 2>/dev/null || echo "$HOME/.claude"
+    return 0
+  fi
+  pf "$1"; dir=$(tr '\0' '\n' < "$PROC/$1/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | tail -1 || true)
   echo "${dir:-$HOME/.claude}"
 }
 
@@ -624,6 +689,8 @@ tool_share() {  # tool folder: a new Gemini/Codex home gets the main one's setti
 tool_run() {  # tool account [args...]: that agent on that account
   local tool="$1" dir var; dir=$(tool_dir "$tool" "$2") || { echo "Unknown $tool account: $2 (see: agents --accounts)" >&2; return 1; }
   shift 2; tool_share "$tool" "$dir"; var=$(tool_var "$tool")
+  # Gemini's effort (afc-gemini-effort): put the level set last back, in case a Gemini dropped it
+  if [[ "$tool" == gemini ]]; then "$HOME/.local/bin/afc-gemini-effort" --home "$dir" ensure >/dev/null 2>&1 || true; fi
   if [[ "$tool" == agy ]]; then env "HOME=$dir" GEMINI_FORCE_FILE_STORAGE=true "$(tool_bin "$tool")" "$@"   # HOME is always set
   elif [[ "$tool" == opencode ]]; then "$(tool_bin "$tool")" "$@"                                            # no folder switch
   elif [[ "$dir" == "$(tool_default "$tool")" ]]; then env -u "$var" "$(tool_bin "$tool")" "$@"
@@ -631,7 +698,13 @@ tool_run() {  # tool account [args...]: that agent on that account
 }
 agent_dir() {  # tool pid -> the home/config folder (account) that agent runs on
   [[ "$1" == claude ]] && { claude_dir "$2"; return; }
-  local dir; pf "$2"; dir=$(tr '\0' '\n' < "$PROC/$2/environ" 2>/dev/null | sed -n "s/^$(tool_var "$1")=//p" | tail -1 || true)
+  local dir acct
+  if is_afc_chat "$2"; then
+    acct=$(afc_chat_account "$2" || true)
+    if [[ -n "$acct" ]] && dir=$(tool_dir "$1" "$acct" 2>/dev/null); then echo "$dir"; return 0; fi
+    echo "$(tool_default "$1")"; return 0
+  fi
+  pf "$2"; dir=$(tr '\0' '\n' < "$PROC/$2/environ" 2>/dev/null | sed -n "s/^$(tool_var "$1")=//p" | tail -1 || true)
   echo "${dir:-$(tool_default "$1")}"
 }
 
@@ -756,7 +829,7 @@ scan_procs() {
 }
 
 scan_agent() {  # pane pid -> AP and AK: its agent's pid and kind, found as pane_agent finds them, from scan_procs' table
-  local pids="$1" p next _ re='/bin/gemini |gemini-cli/' rec='/bin/copilot |/@github/copilot/'
+  local pids="$1" p next _ re='/bin/gemini |gemini-cli/' rec='/bin/copilot |/@github/copilot/' chatre='(^|[[:space:]]|/)afc-chat([[:space:]]|$)'
   local -a args
   AP=""; AK=""
   for _ in 1 2 3 4; do
@@ -764,6 +837,9 @@ scan_agent() {  # pane pid -> AP and AK: its agent's pid and kind, found as pane
     for p in $pids; do
       case "${COMM[$p]:-}" in
         claude|codex|agy|gemini|opencode) AP=$p; AK=${COMM[$p]}; return 0 ;;
+        afc-chat) AP=$p; AK=$(afc_chat_tool "$p"); return 0 ;;
+        python3*) args=(); mapfile -d '' args 2>/dev/null < "$PROC/$p/cmdline" || true
+                  if [[ " ${args[*]} " =~ $chatre ]]; then AP=$p; AK=$(afc_chat_tool "$p"); return 0; fi ;;
         node) args=(); mapfile -d '' args 2>/dev/null < "$PROC/$p/cmdline" || true   # Gemini and Copilot's loader are node scripts
               if [[ "${args[*]} " =~ $re ]]; then AP=$p; AK=gemini; return 0; fi
               if [[ "${args[*]} " =~ $rec ]]; then AP=$p; AK=copilot; return 0; fi ;;
@@ -813,6 +889,16 @@ pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its
   local -a args
   if scan_agent "$1"; then
     p=$AP; kind=$AK
+    if is_afc_chat "$p"; then
+      acct=$(afc_chat_account "$p" || true)
+      [[ -n "$acct" ]] || acct=$(tool_current "$kind" 2>/dev/null || true)
+      chat=$(afc_chat_val "$p" session_id || true)
+      if [[ -z "$chat" ]]; then arg_after "$p" --resume; chat=$PV; fi
+      cmode=$(afc_chat_val "$p" mode || true)
+      if [[ -z "$cmode" ]]; then arg_after "$p" --mode; cmode=$PV; fi
+      [[ "$cmode" == plan ]] && mode=p
+      cwd=$(afc_chat_val "$p" cwd || readlink "$PROC/$p/cwd" 2>/dev/null || true)
+    else
     proc_env "$p" "$(tool_var "$kind")"; dir=${PV:-$(tool_default "$kind")}
     k="$kind$TAB$dir"; acct=${ACCT[$k]:-}
     cwd=$(readlink "$PROC/$p/cwd" 2>/dev/null || true)
@@ -867,6 +953,7 @@ pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its
     # Codex and Antigravity have no hooks that tell the fleet a turn began: the watcher reads that
     # from the record each keeps (activity). Which pane, which agent, which file:
     if [[ "$kind" == codex || "$kind" == agy || ( "$kind" == copilot && -n "$rf" ) || ( "$kind" == gemini && -z "$GEMINI_HOOKED" ) ]]; then TRK[$3]="$kind$TAB$p$TAB$rf"; fi
+    fi
   else
     kind=term; cwd=$(readlink "$PROC/$1/cwd" 2>/dev/null || true)
     # No agent, but the pane's own command is still the launcher, not yet the shell it ends in: an
@@ -879,24 +966,34 @@ pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its
   [[ "$acct" =~ ^[A-Za-z0-9_.-]+$ ]] || acct=-
   [[ "$chat" =~ ^[A-Za-z0-9_.-]+$ && "$chat" != -* ]] || chat=-
   f="${2#-}$mode"; [[ -n "$f" ]] || f=-      # a = the focused split, m = minimised, p = started in plan mode
-  printf 'P\t%s\t%s\t%s\t%s\t%s\n' "$kind" "$acct" "$chat" "$f" "${cwd:-$HOME}"
+  printf -v PLINE 'P\t%s\t%s\t%s\t%s\t%s' "$kind" "$acct" "$chat" "$f" "${cwd:-$HOME}"
 }
 
 layout_scan() {  # prints the running fleet as W and P lines; fails when it cannot be read whole
-  local wins panes hidden win name project layout council w pid flag id
+  local wins panes hidden win name project layout council w pid flag id PLINE
+  local -a plines
   wins=$(t list-windows -t "$SESSION" -F "#{window_id}$TAB#{?window_name,#{window_name},-}$TAB#{?#{@project},#{@project},-}$TAB#{window_layout}$TAB#{?#{@council},c,-}") || return 1
-  panes=$(t list-panes -s -t "$SESSION" -F "#{window_id}$TAB#{pane_pid}$TAB#{?pane_active,a,-}$TAB#{pane_id}") || return 1
+  # A council open as a split (or grid) in a project tab (Alt+K) is a meeting, not kept over a restart:
+  # its panes (@council_chat, @council_member) get no window, so the loop below leaves them out while
+  # keeping the project's own coding panes.
+  panes=$(t list-panes -s -t "$SESSION" -F "#{?#{||:#{@council_chat},#{@council_member}},-,#{window_id}}$TAB#{pane_pid}$TAB#{?pane_active,a,-}$TAB#{pane_id}") || return 1
   # Minimised splits wait in the holding session afcmin (afc-min); @min_from is the tab each came from
   hidden=$(t list-panes -s -t "=afcmin" -F "#{?#{@min_from},#{@min_from},-}$TAB#{pane_pid}${TAB}m$TAB#{pane_id}" 2>/dev/null || true)
   scan_procs
   while IFS=$TAB read -r win name project layout council; do
     [[ -n "$win" ]] || continue
-    [[ "$council" == c ]] && continue     # the council's grid tab (@council, afc-council): a meeting, not kept over a restart
-    printf 'W\t%s\t%s\t%s\n' "$name" "$project" "$layout"
+    # Dedicated council tab (@council with no project): skip. Shared project tab: keep its non-council panes.
+    [[ "$council" == c && "$project" == - ]] && continue
+    plines=()
     while IFS=$TAB read -r w pid flag id; do
       [[ "$w" == "$win" && -n "$pid" ]] || continue
+      # Call pane_line directly (no subshell!) so TRK[$id] updates survive for activity().
       pane_line "$pid" "$flag" "$id" || return 1
+      plines+=("$PLINE")
     done <<< "$panes"$'\n'"$hidden"
+    [[ "$council" == c && ${#plines[@]} -eq 0 ]] && continue
+    printf 'W\t%s\t%s\t%s\n' "$name" "$project" "$layout"
+    for PLINE in "${plines[@]}"; do printf '%s\n' "$PLINE"; done
   done <<< "$wins"
 }
 
@@ -946,10 +1043,15 @@ usage_top() {  # "S92% W30%! O5%" -> 92: the higher of session and week
 
 chat_log() {  # agent kind, agent pid, pane pid, folder -> a readable file of that agent's chat, from the chat log (brought up to date first)
   local chat="" out
-  case "$1" in
-    claude) chat=$(jq -r '.sessionId // empty' "$(claude_dir "$2")/sessions/$2.json" 2>/dev/null || true) ;;
-    *)      out=$("$HOME/.local/bin/afc-agent-info" --chat "$1" "$3" 2>/dev/null || true); chat=${out%%$TAB*} ;;
-  esac
+  if is_afc_chat "$2"; then
+    chat=$(afc_chat_val "$2" session_id || true)
+  fi
+  if [[ -z "$chat" ]]; then
+    case "$1" in
+      claude) chat=$(jq -r '.sessionId // empty' "$(claude_dir "$2")/sessions/$2.json" 2>/dev/null || true) ;;
+      *)      out=$("$HOME/.local/bin/afc-agent-info" --chat "$1" "$3" 2>/dev/null || true); chat=${out%%$TAB*} ;;
+    esac
+  fi
   [[ "$chat" =~ ^[A-Za-z0-9_.-]+$ ]] || return 0
   "$HOME/.local/bin/afc-logs" run --force >/dev/null 2>&1 || true
   # the log is one database per project; `afc-logs file` writes this one chat out of it and prints the path
@@ -1355,29 +1457,36 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
            exec bash
          fi ;;
     esac
+    uview=$(fleet_view)
     case "$what" in
-      claude) claude_as "$acct" $BYPASS || true ;;                  # AGENTS_CLAUDE: test stub
-      plan)   claude_as "$acct" $BYPASS --permission-mode plan || true ;;
-      bypass) claude_as "$acct" $BYPASS --permission-mode bypassPermissions || true ;;
-      resume) if [[ "${4:-last}" == last ]]; then claude_as "$acct" $BYPASS --continue || true
+      claude) if [[ "$uview" == unified ]]; then chat_run claude "$acct" auto || true
+              else claude_as "$acct" $BYPASS || true; fi ;;                  # AGENTS_CLAUDE: test stub
+      plan)   if [[ "$uview" == unified ]]; then chat_run claude "$acct" plan || true
+              else claude_as "$acct" $BYPASS --permission-mode plan || true; fi ;;
+      bypass) if [[ "$uview" == unified ]]; then chat_run claude "$acct" bypass || true
+              else claude_as "$acct" $BYPASS --permission-mode bypassPermissions || true; fi ;;
+      resume) if [[ "$uview" == unified ]]; then
+                if [[ "${4:-last}" == last ]]; then chat_run claude "$acct" auto --continue || true
+                else chat_run claude "$acct" auto --resume "$4" || true; fi
+              elif [[ "${4:-last}" == last ]]; then claude_as "$acct" $BYPASS --continue || true
               else claude_as "$acct" $BYPASS --resume "$4" || true; fi ;;
-      gemini)        tool_run gemini "$acct" || true ;;
-      gemini-plan)   tool_run gemini "$acct" --approval-mode plan || true ;;
-      gemini-bypass) tool_run gemini "$acct" --approval-mode yolo || true ;;
-      codex)         tool_run codex "$acct" || true ;;
+      gemini)        if [[ "$uview" == unified ]]; then chat_run gemini "$acct" auto || true; else tool_run gemini "$acct" || true; fi ;;
+      gemini-plan)   if [[ "$uview" == unified ]]; then chat_run gemini "$acct" plan || true; else tool_run gemini "$acct" --approval-mode plan || true; fi ;;
+      gemini-bypass) if [[ "$uview" == unified ]]; then chat_run gemini "$acct" bypass || true; else tool_run gemini "$acct" --approval-mode yolo || true; fi ;;
+      codex)         if [[ "$uview" == unified ]]; then chat_run codex "$acct" auto || true; else tool_run codex "$acct" || true; fi ;;
       # Codex cannot start in its Plan mode (Shift+Tab inside switches to it); read-only is the closest
-      codex-plan)    tool_run codex "$acct" --sandbox read-only || true ;;
-      codex-bypass)  tool_run codex "$acct" --dangerously-bypass-approvals-and-sandbox || true ;;
-      agy)           tool_run agy "$acct" || true ;;
-      agy-plan)      tool_run agy "$acct" --mode plan || true ;;
-      agy-bypass)    tool_run agy "$acct" --dangerously-skip-permissions || true ;;
-      copilot)        tool_run copilot "$acct" || true ;;
-      copilot-plan)   tool_run copilot "$acct" --mode plan || true ;;
-      copilot-bypass) tool_run copilot "$acct" --allow-all || true ;;
+      codex-plan)    if [[ "$uview" == unified ]]; then chat_run codex "$acct" plan || true; else tool_run codex "$acct" --sandbox read-only || true; fi ;;
+      codex-bypass)  if [[ "$uview" == unified ]]; then chat_run codex "$acct" bypass || true; else tool_run codex "$acct" --dangerously-bypass-approvals-and-sandbox || true; fi ;;
+      agy)           if [[ "$uview" == unified ]]; then chat_run agy "$acct" auto || true; else tool_run agy "$acct" || true; fi ;;
+      agy-plan)      if [[ "$uview" == unified ]]; then chat_run agy "$acct" plan || true; else tool_run agy "$acct" --mode plan || true; fi ;;
+      agy-bypass)    if [[ "$uview" == unified ]]; then chat_run agy "$acct" bypass || true; else tool_run agy "$acct" --dangerously-skip-permissions || true; fi ;;
+      copilot)        if [[ "$uview" == unified ]]; then chat_run copilot "$acct" auto || true; else tool_run copilot "$acct" || true; fi ;;
+      copilot-plan)   if [[ "$uview" == unified ]]; then chat_run copilot "$acct" plan || true; else tool_run copilot "$acct" --mode plan || true; fi ;;
+      copilot-bypass) if [[ "$uview" == unified ]]; then chat_run copilot "$acct" bypass || true; else tool_run copilot "$acct" --allow-all || true; fi ;;
       # OpenCode in a server of its own, so it lives and ends with its pane and stays in the fleet's budget.
       # It has no start flag for its plan mode (Tab inside switches agents); --auto approves what is not denied.
-      opencode)        tool_run opencode "$acct" --standalone || true ;;
-      opencode-bypass) tool_run opencode "$acct" --standalone --auto || true ;;
+      opencode)        if [[ "$uview" == unified ]]; then chat_run opencode "$acct" auto || true; else tool_run opencode "$acct" --standalone || true; fi ;;
+      opencode-bypass) if [[ "$uview" == unified ]]; then chat_run opencode "$acct" bypass || true; else tool_run opencode "$acct" --standalone --auto || true; fi ;;
       handoff)
         # Alt+G to another tool, "this chat": agents --pane handoff 0 <tool> <account>. The log of the
         # chat that is handed on was noted for this pane by --switch.
@@ -1388,6 +1497,10 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
           echo "Handing on the chat in $file"
         else echo "No log of the earlier chat was found: this is a new chat."; fi
         tool_dir "$tool" "$acct" >/dev/null 2>&1 || acct=$(tool_current "$tool" || true)
+        if [[ "$uview" == unified ]] && [[ "$tool" =~ ^(claude|codex|gemini|agy|copilot|opencode)$ ]]; then
+          if (( ${#ask[@]} )); then chat_run "$tool" "$acct" auto --prompt "${ask[0]}" || true
+          else chat_run "$tool" "$acct" auto || true; fi
+        else
         case "$tool" in
           claude) claude_as "$acct" $BYPASS "${ask[@]}" || true ;;
           codex)  tool_run codex "$acct" "${ask[@]}" || true ;;
@@ -1395,30 +1508,58 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
           agy)    if (( ${#ask[@]} )); then tool_run agy "$acct" --prompt-interactive "${ask[0]}" || true; else tool_run agy "$acct" || true; fi ;;
           copilot)  if (( ${#ask[@]} )); then tool_run copilot "$acct" -i "${ask[0]}" || true; else tool_run copilot "$acct" || true; fi ;;
           opencode) if (( ${#ask[@]} )); then tool_run opencode "$acct" --standalone --prompt "${ask[0]}" || true; else tool_run opencode "$acct" --standalone || true; fi ;;
-        esac ;;
+        esac
+        fi ;;
       restore)
         # A split the fleet had open when it last stopped (layout_restore), back on its own account and chat.
-        # Usage: agents --pane restore 0 <tool> <account|-> <chat id|last|-> [plan|-] [seconds to wait first]
+        # Usage: agents --pane restore 0 <tool> <account|-> <chat id|last|-> [plan|-] [seconds to wait first] [model|-]
+        # (the model is for Gemini only: --gemini-restart keeps the one the pane was on)
         tool="${4:-term}"; acct="${5:--}"; chat="${6:--}"; plan=()
+        rmodel=(); [[ "$tool" == gemini && "${9:--}" != - ]] && rmodel=(-m "$9")
         case "$tool" in claude|gemini|codex|agy|copilot|opencode) ;; *) tool=term ;; esac
-        case "$tool:${7:--}" in   # a split that was started in plan mode comes back in plan mode
-          claude:plan) plan=(--permission-mode plan) ;; gemini:plan) plan=(--approval-mode plan) ;;
-          codex:plan)  plan=(--sandbox read-only) ;;    agy:plan)    plan=(--mode plan) ;;
-          copilot:plan) plan=(--mode plan) ;;
+        case "$tool:${7:--}" in   # preserve plan or bypass mode across restores and view switches
+          claude:plan)    plan=(--permission-mode plan) ;;
+          claude:bypass)  plan=(--permission-mode bypassPermissions) ;;
+          gemini:plan)    plan=(--approval-mode plan) ;;
+          gemini:bypass)  plan=(--approval-mode yolo) ;;
+          gemini:edit)    plan=(--approval-mode auto_edit) ;;   # only --gemini-restart passes it
+          codex:plan)     plan=(--sandbox read-only) ;;
+          codex:bypass)   plan=(--dangerously-bypass-approvals-and-sandbox) ;;
+          agy:plan)       plan=(--mode plan) ;;
+          agy:bypass)     plan=(--dangerously-skip-permissions) ;;
+          copilot:plan)   plan=(--mode plan) ;;
+          copilot:bypass) plan=(--allow-all) ;;
+          opencode:bypass) plan=(--auto) ;;
         esac
         if [[ "$tool" != term ]]; then
           start_wait "${8:-0}"
           tool_dir "$tool" "$acct" >/dev/null 2>&1 || acct=$(tool_current "$tool" || true)   # that account left the list
+          if [[ "$uview" == unified ]] && [[ "$tool" =~ ^(claude|codex|gemini|agy|copilot|opencode)$ ]]; then
+            cmode=auto
+            [[ "${7:--}" == plan ]] && cmode=plan
+            [[ "${7:--}" == bypass ]] && cmode=bypass
+            case "$tool:$chat" in
+              *:last) chat_run "$tool" "$acct" "$cmode" --continue || true ;;
+              *:-)    chat_run "$tool" "$acct" "$cmode" || true ;;
+              claude:*) if chat_open "$chat"; then
+                          echo "This chat is already open in another window. Close it there, then type: claude --resume $chat"
+                        else chat_run claude "$acct" "$cmode" --resume "$chat" || true; fi ;;
+              *)      chat_run "$tool" "$acct" "$cmode" --resume "$chat" || true ;;
+            esac
+          else
           case "$tool:$chat" in
             claude:-) claude_as "$acct" $BYPASS "${plan[@]}" || true ;;
+            claude:last) claude_as "$acct" $BYPASS "${plan[@]}" --continue || true ;;
             claude:*) if ! compgen -G "$HOME/.claude/projects/*/$chat.jsonl" >/dev/null; then
                         claude_as "$acct" $BYPASS "${plan[@]}" || true   # nothing had been said in it yet, or Claude has deleted it since
                       elif chat_open "$chat"; then
                         echo "This chat is already open in another window. Close it there, then type: claude --resume $chat"
                       else claude_as "$acct" $BYPASS "${plan[@]}" --resume "$chat" || true; fi ;;
             codex:-)  tool_run codex "$acct" "${plan[@]}" || true ;;
+            codex:last) tool_run codex "$acct" resume --last "${plan[@]}" || true ;;
             codex:*)  tool_run codex "$acct" resume "$chat" "${plan[@]}" || true ;;
             agy:-)    tool_run agy "$acct" "${plan[@]}" || true ;;
+            agy:last) tool_run agy "$acct" --continue "${plan[@]}" || true ;;
             agy:*)    tool_run agy "$acct" --conversation "$chat" "${plan[@]}" || true ;;
             copilot:-) tool_run copilot "$acct" "${plan[@]}" || true ;;
             copilot:*) tool_run copilot "$acct" "${plan[@]}" --resume="$chat" || true ;;
@@ -1427,9 +1568,11 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
             opencode:-)    tool_run opencode "$acct" --standalone || true ;;
             opencode:*)    tool_run opencode "$acct" --standalone --session "$chat" || true ;;
             # the folder's latest chat; when there is none Gemini stops at once, and a new chat starts instead
-            gemini:last) began=$SECONDS; tool_run gemini "$acct" "${plan[@]}" --resume latest || (( SECONDS - began > 10 )) || tool_run gemini "$acct" "${plan[@]}" || true ;;
-            gemini:*) tool_run gemini "$acct" "${plan[@]}" || true ;;
+            gemini:last) began=$SECONDS; tool_run gemini "$acct" "${plan[@]}" "${rmodel[@]}" --resume latest || (( SECONDS - began > 10 )) || tool_run gemini "$acct" "${plan[@]}" "${rmodel[@]}" || true ;;
+            gemini:-) tool_run gemini "$acct" "${plan[@]}" "${rmodel[@]}" || true ;;
+            gemini:*) tool_run gemini "$acct" "${plan[@]}" "${rmodel[@]}" --resume "$chat" || true ;;
           esac
+          fi
         fi ;;
     esac
     exec bash
@@ -1441,32 +1584,51 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
   --paste)
     # Ctrl+V in the fleet (tmux binding): an image on the clipboard goes to the app as Ctrl+V,
     # which is Claude's own image paste; text is pasted as text (bracketed, as if typed).
+    # In a council tab, pasting while a read-only member pane is focused redirects to the chat box.
     # Usage: agents --paste <pane-id> <tmux-socket-path>  (the binding passes both)
     pane="${2:?pane id}"; sock="${3:?socket path}"; ts() { tmux -S "$sock" "$@"; }
+    chair=$(ts show-options -pqv -t "$pane" @council_chair 2>/dev/null || true)
+    if [[ -n "$chair" ]]; then
+      pane="$chair"
+      ts select-pane -t "$pane" 2>/dev/null || true
+    fi
+    council_chat=$(ts show-options -pqv -t "$pane" @council_chat 2>/dev/null || true)
+    buf="fleet-paste-$$"
     if [[ -n "$MAC" ]]; then   # macOS: osascript says what kind of thing is on the clipboard, pbpaste gives its text
-      if osascript -e 'clipboard info' 2>/dev/null | grep -qE 'PNGf|TIFF|JPEG|GIFf'; then ts send-keys -t "$pane" C-v
-      elif pbpaste 2>/dev/null | ts load-buffer -b fleet-paste - 2>/dev/null; then ts paste-buffer -p -d -b fleet-paste -t "$pane"
-      else ts send-keys -t "$pane" C-v; fi
+      if [[ -z "$council_chat" ]] && osascript -e 'clipboard info' 2>/dev/null | grep -qE 'PNGf|TIFF|JPEG|GIFf'; then ts send-keys -t "$pane" C-v
+      elif pbpaste 2>/dev/null | ts load-buffer -b "$buf" - 2>/dev/null; then ts paste-buffer -p -d -b "$buf" -t "$pane"
+      elif [[ -z "$council_chat" ]]; then ts send-keys -t "$pane" C-v; fi
       exit 0
     fi
     if [[ -n "$WSL" ]] && { [[ -z "${DISPLAY:-}" ]] || ! command -v xclip >/dev/null; }; then
       # Windows, with no WSLg X clipboard to read: ask Windows itself. (With WSLg, xclip below
       # reads the same clipboard and is far quicker than starting PowerShell.)
-      if [[ -n "$(win 'if ((Get-Clipboard -Format Image) -ne $null) { "image" }' 5)" ]]; then
+      if [[ -z "$council_chat" && -n "$(win 'if ((Get-Clipboard -Format Image) -ne $null) { "image" }' 5)" ]]; then
         ts send-keys -t "$pane" C-v
       else
         txt=$(win 'Get-Clipboard -Raw' 5)   # $( ) drops the newline PowerShell adds, which would send the prompt
-        if [[ -n "$txt" ]] && printf '%s' "$txt" | ts load-buffer -b fleet-paste - 2>/dev/null; then
-          ts paste-buffer -p -d -b fleet-paste -t "$pane"
-        else ts send-keys -t "$pane" C-v; fi
+        if [[ -n "$txt" ]] && printf '%s' "$txt" | ts load-buffer -b "$buf" - 2>/dev/null; then
+          ts paste-buffer -p -d -b "$buf" -t "$pane"
+        elif [[ -z "$council_chat" ]]; then ts send-keys -t "$pane" C-v; fi
       fi
       exit 0
     fi
-    if timeout 1 xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -q '^image/'; then
+    if [[ -n "$council_chat" ]] && timeout 1 xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -q '^image/png'; then
+      # A screenshot in the council's chat box: saved for that council (afc-council attach_images moves it
+      # into the council's images folder when the line is sent) and tagged [Image #N] in the box
+      cpid=$(ts display -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)
+      rt="${XDG_RUNTIME_DIR:-/tmp}/afc-council"; mkdir -p "$rt"
+      n=1; while [[ -e "$rt/$cpid-img-$n.png" ]]; do n=$((n + 1)); done
+      if [[ -n "$cpid" ]] && timeout 3 xclip -selection clipboard -t image/png -o > "$rt/$cpid-img-$n.png" 2>/dev/null && [[ -s "$rt/$cpid-img-$n.png" ]]; then
+        ts send-keys -t "$pane" -l "[Image #$n] "
+      else
+        rm -f "$rt/$cpid-img-$n.png"; ts display-message -d 4000 "The screenshot could not be read from the clipboard"
+      fi
+    elif [[ -z "$council_chat" ]] && timeout 1 xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -q '^image/'; then
       ts send-keys -t "$pane" C-v
-    elif timeout 1 xclip -selection clipboard -o 2>/dev/null | ts load-buffer -b fleet-paste - 2>/dev/null; then
-      ts paste-buffer -p -d -b fleet-paste -t "$pane"
-    else
+    elif timeout 1 xclip -selection clipboard -o 2>/dev/null | ts load-buffer -b "$buf" - 2>/dev/null; then
+      ts paste-buffer -p -d -b "$buf" -t "$pane"
+    elif [[ -z "$council_chat" ]]; then
       ts send-keys -t "$pane" C-v   # empty or unreadable clipboard: let the app decide
     fi
     ;;
@@ -1488,7 +1650,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       [[ -n "$c" ]] || continue
       pgrep -P "$c" -f '/\.claude/shell-snapshots/' >/dev/null && continue
       t set -p -t "$pane" @busy 0 \; set -pu -t "$pane" @bgshell
-      t list-clients -F '#{window_id}' | grep -qxF "$win" || t set -w -t "$pane" @unseen 1
+      t list-clients -F '#{window_id}' | grep -qxF "$win" || t set -w -t "$pane" @unseen 1 \; set -g status-interval 1
     done
     [[ -r "$STAT" ]] || exit 0
     anon=$(awk '$1=="anon"{print $2}' "$STAT")
@@ -1504,7 +1666,8 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     #                                    instead, and --bar finishes it when the shell ends
     #   wait  asking you (permission) -> blinks like done, whatever is still running
     #   end   agent closed            -> clear the busy mark
-    # Outside tmux (desktop app, Konsole) it does nothing.
+    # Outside tmux (desktop app, Konsole) or inside a council child run it does nothing.
+    [[ -n "${AFC_COUNCIL_CHILD:-}" ]] && exit 0
     pane="${TMUX_PANE:-}"; tm=(command tmux)
     if [[ -z "${TMUX:-}" || -z "$pane" ]]; then
       # Gemini runs hooks with a cleaned environment (no TMUX) and Codex's notify adds a JSON
@@ -1545,7 +1708,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
           [[ "$w" == "$win" ]] || continue
           shown=1; if [[ ",$flags," == *,focused,* ]]; then watched=1; fi
         done < <(tmux list-clients -F '#{window_id} #{client_flags}' 2>/dev/null || true)
-        if (( ! shown )); then tmux set -w -t "$TMUX_PANE" @unseen 1; fi
+        if (( ! shown )); then tmux set -w -t "$TMUX_PANE" @unseen 1 \; set -g status-interval 1; fi
         # Not watched, and news (not a second "done" for one turn): a desktop notification. It is sent
         # by a job of the fleet's own (--notify), so the agent's hook returns at once.
         if (( ! watched )) && [[ "$was" != "$2" && -z "${AGENTS_NO_NOTIFY:-}" ]]; then
@@ -1713,6 +1876,10 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
   --account-menu)
     # Alt+G in the fleet. Usage: agents --account-menu <client> <pane-id> <pane-pid> (the binding passes them)
     client="${2:?client}"; pane="${3#%}"; pid="${4:?pane pid}"; start=""
+    if [[ -n "$(t show-options -wqv -t "%$pane" @council 2>/dev/null)" ]]; then
+      t display-message -c "$client" -d 3000 "Council tab: use Alt+M on a member pane for models, or Alt+A to add members."
+      exit 0
+    fi
     here=$("$0" --who "$pid" || true)
     item() {  # label key target
       local label="$1"; [[ "$4" == "$here" ]] && { label="$label   (this agent)"; start=$(( ${#items[@]} / 3 )); }
@@ -1767,7 +1934,9 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       if [[ "$kind" == claude && -n "$dir" ]]; then
         from=$(claude_dir "$p")
         [[ "$from" != "$dir" ]] || { t display-message "This agent is already on $who"; exit 0; }
-        chat=$(jq -r '.sessionId // empty' "$from/sessions/$p.json" 2>/dev/null || true)   # Claude's own record of this run
+        chat=""
+        if is_afc_chat "$p"; then chat=$(afc_chat_val "$p" session_id || true); fi
+        [[ -n "$chat" ]] || chat=$(jq -r '.sessionId // empty' "$from/sessions/$p.json" 2>/dev/null || true)   # Claude's own record of this run
         run="--pane resume 0 ${chat:-last}"
         # a deliberate move: remember it, so a later fleet restart reopens this chat on this account
         if [[ "$chat" =~ ^[A-Za-z0-9-]+$ ]]; then mkdir -p "$CHAT_ACCOUNTS" && printf '%s\n' "$dir" > "$CHAT_ACCOUNTS/$chat"; fi
@@ -1807,9 +1976,93 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$cwd" "$HOME/.local/bin/agents $run"
     t display-message "This pane is now $who"
     ;;
+  --gemini-restart)
+    # Alt+M's Gemini effort (afc-model-menu, afc-gemini-effort): Gemini reads its thinking level only
+    # when it starts, so the plain Gemini in this pane starts again on the same account, chat, mode and
+    # model. It is left alone unless that is certainly safe, as a code review of 2026-11-24 asked:
+    #   - Gemini owns the pane: the fleet's launcher started it right under the pane, it runs in front,
+    #     the pane is not in copy mode, and it was started with no flag a restart would lose;
+    #   - it is idle at an empty prompt: Gemini's own input line shows its placeholder, and nothing on
+    #     screen says it is working ("esc to cancel") or asking ("Allow once", "Action Required" …),
+    #     since keys typed then could answer its question; checked again right before the restart;
+    #   - the fleet has memory for it (else the new Gemini could not start after the old one stopped);
+    #   - its chat is certain: the Session ID its own /stats prints now (the newest one on screen),
+    #     whose chat file this Gemini has written (afc-gemini-effort chat).
+    # The mode is the one on screen (YOLO, Plan, Accepting edits), the model the one it was started
+    # on or picked with Alt+M since. afc-chat starts a new Gemini every turn, so its panes need nothing.
+    # Prints one line saying what happened. Usage: agents --gemini-restart <pane-id> <pane-pid>
+    pane="%${2#%}"; pid="${3:?pane pid}"
+    if ! read -r p kind < <(pane_agent "$pid") || [[ "$kind" != gemini ]]; then echo "No Gemini runs in this pane."; exit 0; fi
+    if is_afc_chat "$p"; then echo "This pane's next turn takes it."; exit 0; fi
+    later="it takes the effort when it next starts"
+    pf "$p" "$pid"
+    no() { echo "$1, so it was not restarted: $later."; exit 0; }
+    [[ "$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')" == "$pid" ]] || no "This Gemini was not started by the fleet in this pane"
+    [[ "$(tr '\0' ' ' < "$PROC/$pid/cmdline" 2>/dev/null)" == *"agents --pane "* ]] || no "This Gemini was not started by the fleet in this pane"
+    s=$(cat "$PROC/$p/stat" 2>/dev/null || true); s=${s##*) }; read -r pstate _ pgrp _ _ tpgid _ <<< "$s"
+    [[ "$pstate" != T && -n "$pgrp" && "$pgrp" == "$tpgid" ]] || no "This Gemini is not in front in its pane"
+    [[ "$(t display -p -t "$pane" '#{pane_in_mode}' 2>/dev/null)" == 0 ]] || no "The pane is in copy mode"
+    [[ "$(fleet_view)" != unified ]] || no "The fleet is in the unified view"
+    mapfile -d '' args < "$PROC/$p/cmdline" 2>/dev/null || true
+    model=""; i=2
+    while (( i < ${#args[@]} )); do
+      a=${args[i]}
+      case "$a" in
+        -m|--model) model=${args[i+1]:-}; i=$((i + 2)) ;;
+        --model=*) model=${a#--model=}; i=$((i + 1)) ;;
+        --approval-mode|-r|--resume|--session-id) i=$((i + 2)) ;;
+        --approval-mode=*|--resume=*|--session-id=*) i=$((i + 1)) ;;
+        *) no "This Gemini was started with $a, which a restart would lose" ;;
+      esac
+    done
+    idle() {   # Gemini at an empty prompt, asking nothing and doing nothing; sets SCR, the screen
+      SCR=$(t capture-pane -p -t "$pane" 2>/dev/null || true)
+      [[ "$SCR" != *"esc to cancel"* ]] || return 1
+      grep -qE 'Allow once|Action Required|Action required|Allow execution of|Apply this change|Ready to start implementation|Waiting for' <<< "$SCR" && return 1
+      tail -n 12 <<< "$SCR" | grep -qE '^[│ ]*[>*] +Type your message or @path/to/file'
+    }
+    [[ "$(t display -p -t "$pane" '#{@busy}' 2>/dev/null || true)" != 1 ]] || no "This Gemini is working"
+    idle || no "This Gemini is not idle at an empty prompt (working, asking, or with something typed)"
+    case "$SCR" in
+      *"YOLO mode"*) pmode=bypass ;;
+      *"Plan mode"*) pmode=plan ;;
+      *"Accepting edits"*) pmode=edit ;;
+      *) pmode=- ;;
+    esac
+    mem_room || no "$MEM_WALL_SAID"
+    adir=$(agent_dir gemini "$p"); acct=$(tool_name gemini "$adir" || true)
+    eff="$HOME/.local/bin/afc-gemini-effort"
+    "$eff" --home "$adir" ensure >/dev/null 2>&1 || true      # this account's settings get the level too
+    # The Session ID its /stats prints now: the newest on screen, once there is one more than before
+    uuid='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    ids() { t capture-pane -p -J -S - -t "$pane" 2>/dev/null | tr -d '│\n ' | grep -oE "SessionID:$uuid" || true; }
+    had=$(ids | wc -l); said=""
+    t send-keys -t "$pane" -l '/stats'; sleep 0.5; t send-keys -t "$pane" Enter
+    for _ in $(seq 1 24); do
+      sleep 0.25
+      now=$(ids)
+      if (( $(wc -l <<< "$now") > had )) && [[ -n "$now" ]]; then said=$(tail -1 <<< "$now"); said=${said#SessionID:}; break; fi
+    done
+    [[ -n "$said" ]] || no "Its /stats showed no Session ID"
+    chat=$("$eff" --home "$adir" chat "$p" "$said" 2>/dev/null || true)
+    [[ -n "$chat" ]] || no "Its chat could not be told for certain"
+    [[ "$chat" == new ]] && chat=-
+    # The model it was started on, or the one picked with Alt+M since it started
+    began=$(LC_ALL=C date -d "$(LC_ALL=C ps -o lstart= -p "$p")" +%s 2>/dev/null || true)   # C: this box writes months in Filipino
+    mat=$(t display -p -t "$pane" '#{@gemini_model_at}' 2>/dev/null || true)
+    if [[ "$began" =~ ^[0-9]+$ && "$mat" =~ ^[0-9]+$ ]] && (( mat >= began )); then
+      model=$(t display -p -t "$pane" '#{@gemini_model}' 2>/dev/null || true)
+    fi
+    idle || no "This Gemini got busy meanwhile"
+    cwd=$(readlink "$PROC/$p/cwd" 2>/dev/null || true)
+    [[ -d "$cwd" ]] || no "Its folder is gone"
+    t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$cwd" "$HOME/.local/bin/agents --pane restore 0 gemini ${acct:--} $chat $pmode 0 ${model:--}"
+    if [[ "$chat" == - ]]; then echo "This Gemini started again (its chat had nothing in it yet) and takes it now."
+    else echo "This Gemini started again on its chat and takes it now."; fi
+    ;;
   --tab-menu)
     # The tabs as a list. A click on the tab dropdown in the bottom bar opens it; the dropdown takes
-    # the place of the tab row when the window is narrow and the tabs do not fit (tmux.conf, @tabs_squeezed).
+    # the place of the tab row when the window is too narrow for every tab (tmux.conf, @tabs_squeezed).
     # Each tab has its number as its key. Usage: agents --tab-menu <client>
     client="${2:?client}"; items=()
     sess=$(t display-message -p -c "$client" '#{session_name}' 2>/dev/null || true); sess=${sess:-$SESSION}
@@ -1821,24 +2074,25 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     done < <(t list-windows -t "$sess" -F $'#{window_index}\t#{window_name}\t#{window_active}\t#{@unseen}\t#{P:#{@busy}}')
     (( ${#items[@]} )) || exit 0
     # -O: it is opened by a mouse click, and without it tmux closes a menu when the button comes up
-    # again (the list flashed and was gone)
-    t display-menu -O -M -c "$client" -T "#[align=centre] Tabs " -x M -y S "${items[@]}"
+    # again (the list flashed and was gone). Centred on the screen like every fleet pop-up (operator, 2026-11-24).
+    t display-menu -O -M -c "$client" -T "#[align=centre] Tabs " -x C -y C "${items[@]}"
     ;;
   --view)
-    # agents --view                         say which view the settings ask for
-    # agents --view compact|classic         write claude-view to the settings: every Claude the fleet
-    #                                       starts from now on uses it
-    # agents --view compact|classic <pane>|all   ... and restart the Claude in that pane (or in every
-    #                                       pane) so it shows that way now: in its own chat, on the
-    #                                       account it is on. A Claude that is working is left alone;
-    #                                       it gets the view the next time it starts.
+    # agents --view                                  say which view the settings ask for
+    # agents --view unified|compact|classic          write view to the settings for every new pane
+    # agents --view unified|compact|classic <pane>|all   ... and restart idle agent panes in that view,
+    #                                                each in its own chat and on the account it is on.
+    #                                                Working panes are left alone.
     want="${2:-}"; which="${3:-}"
-    if [[ -z "$want" ]]; then echo "claude-view: $(setting claude-view classic)"; exit 0; fi
-    [[ "$want" == compact || "$want" == classic ]] || { echo "Usage: agents --view [compact|classic] [pane|all]" >&2; exit 2; }
+    if [[ -z "$want" ]]; then echo "view: $(fleet_view)"; exit 0; fi
+    [[ "$want" == unified || "$want" == compact || "$want" == classic ]] || { echo "Usage: agents --view [unified|compact|classic] [pane|all]" >&2; exit 2; }
     mkdir -p "${SETTINGS%/*}"; touch "$SETTINGS"
-    if grep -q '^claude-view[[:space:]]' "$SETTINGS"; then sed -i "s/^claude-view[[:space:]].*/claude-view $want/" "$SETTINGS"
-    else printf 'claude-view %s\n' "$want" >> "$SETTINGS"; fi
-    echo "claude-view is now $want: every Claude the fleet starts from now on uses it."
+    if grep -q '^view[[:space:]]' "$SETTINGS"; then sed -i "s/^view[[:space:]].*/view $want/" "$SETTINGS"
+    else printf 'view %s\n' "$want" >> "$SETTINGS"; fi
+    if [[ "$want" == compact || "$want" == classic ]] && grep -q '^claude-view[[:space:]]' "$SETTINGS"; then
+      sed -i "s/^claude-view[[:space:]].*/claude-view $want/" "$SETTINGS"
+    fi
+    echo "view is now $want: every agent the fleet starts from now on uses it."
     [[ -n "$which" ]] || exit 0
     fleet_up || { echo "The fleet is not running: nothing to restart."; exit 0; }
     [[ "$which" == all ]] || which="%${which#%}"
@@ -1846,17 +2100,50 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     while IFS=$'\t' read -r pane pid busy; do
       [[ "$which" == all || "$which" == "$pane" ]] || continue
       read -r p kind < <(pane_agent "$pid") || continue
-      [[ "$kind" == claude ]] || continue
+      [[ "$kind" =~ ^(claude|codex|gemini|agy|copilot|opencode)$ ]] || continue
+      in_chat=0; is_afc_chat "$p" && in_chat=1
+      # Switching between classic and compact only affects Claude panes (unless returning from afc-chat)
+      if [[ "$want" != unified && "$kind" != claude && $in_chat == 0 ]]; then continue; fi
       if [[ "$busy" == 1 ]]; then busy_n=$((busy_n + 1)); continue; fi
-      cdir=$(claude_dir "$p"); acct=$(account_name "$cdir" || true)
-      chat=$(jq -r '.sessionId // empty' "$cdir/sessions/$p.json" 2>/dev/null || true)
-      [[ "$chat" =~ ^[A-Za-z0-9-]+$ ]] || chat=last
-      pf "$p"; cwd=$(readlink "$PROC/$p/cwd" 2>/dev/null || true)
+      acct=""; chat=""; pmode="-"; cwd=""
+      if (( in_chat )); then
+        acct=$(afc_chat_account "$p" || true)
+        chat=$(afc_chat_val "$p" session_id || true)
+        cm=$(afc_chat_val "$p" mode || true)
+        [[ "$cm" == plan || "$cm" == bypass ]] && pmode="$cm"
+        cwd=$(afc_chat_val "$p" cwd || true)
+      else
+        if [[ "$kind" == claude ]]; then
+          cdir=$(claude_dir "$p"); acct=$(account_name "$cdir" || true)
+          chat=$(jq -r '.sessionId // empty' "$cdir/sessions/$p.json" 2>/dev/null || true)
+          arg_after "$p" --permission-mode
+          [[ "$PV" == plan ]] && pmode=plan
+          [[ "$PV" == bypassPermissions ]] && pmode=bypass
+        else
+          adir=$(agent_dir "$kind" "$p"); acct=$(tool_name "$kind" "$adir" || true)
+          out=$("$HOME/.local/bin/afc-agent-info" --chat "$kind" "$pid" 2>/dev/null || true)
+          [[ "$out" == *$TAB* ]] && chat=${out%%$TAB*}
+          pf "$p"; cmdstr=$(tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null || true)
+          case "$kind" in
+            codex)    arg_after "$p" --sandbox; [[ "$PV" == read-only ]] && pmode=plan
+                      [[ " $cmdstr " == *" --dangerously-bypass-approvals-and-sandbox "* ]] && pmode=bypass ;;
+            gemini)   arg_after "$p" --approval-mode; [[ "$PV" == plan ]] && pmode=plan
+                      [[ "$PV" == yolo ]] && pmode=bypass ;;
+            agy)      arg_after "$p" --mode; [[ "$PV" == plan ]] && pmode=plan
+                      [[ " $cmdstr " == *" --dangerously-skip-permissions "* ]] && pmode=bypass ;;
+            copilot)  arg_after "$p" --mode; [[ "$PV" == plan ]] && pmode=plan
+                      [[ " $cmdstr " == *" --allow-all "* || " $cmdstr " == *" --yolo "* ]] && pmode=bypass ;;
+            opencode) [[ " $cmdstr " == *" --auto "* ]] && pmode=bypass ;;
+          esac
+        fi
+      fi
+      [[ "$chat" =~ ^[A-Za-z0-9_.-]+$ ]] || chat=$([[ "$kind" == claude || "$kind" == gemini || "$kind" == opencode ]] && echo last || echo "-")
+      [[ -n "$cwd" && -d "$cwd" ]] || { pf "$p"; cwd=$(readlink "$PROC/$p/cwd" 2>/dev/null || true); }
       [[ -d "$cwd" ]] || continue
-      t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$cwd" "$HOME/.local/bin/agents --pane resume 0 $chat $acct"
+      t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$cwd" "$HOME/.local/bin/agents --pane restore 0 $kind ${acct:--} $chat $pmode 0"
       done_n=$((done_n + 1))
     done < <(t list-panes -a -F $'#{pane_id}\t#{pane_pid}\t#{?#{@busy},#{@busy},0}')
-    echo "$done_n Claude pane(s) restarted in the $want view, each in its own chat."
+    echo "$done_n pane(s) restarted in the $want view, each in its own chat."
     if (( busy_n )); then echo "$busy_n left alone: working now. They get it at their next start, or run this again when they are done."; fi
     ;;
   --close)
@@ -1871,7 +2158,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     fi
     # The council's chat box: the council quits (/quit, so the meeting is saved), not a pane killed
     if [[ -n "$(t show-options -pqv -t "$pane" @council_chat 2>/dev/null)" ]]; then
-      t send-keys -t "$pane" C-u \; send-keys -t "$pane" -l "/quit" \; send-keys -t "$pane" Enter
+      t send-keys -t "$pane" -l '#!#C#/quit#!#C#' \; send-keys -t "$pane" Enter
       exit 0
     fi
     read -r panes win project < <(t display -p -t "$pane" '#{window_panes} #{window_id} #{@project}') || true
@@ -2074,6 +2361,10 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     fi
     for tool in "${TOOLS[@]}"; do command -v "$(tool_bin "$tool")" >/dev/null || note "$(tool_label "$tool") is not installed ($(tool_bin "$tool"))"; done
     echo "Hooks"
+    if [[ "$(fleet_view)" == unified ]]; then
+      if [[ -x "$(chat_bin)" ]]; then ok "View: unified (afc-chat): task checklist + 1-line running bash bar across Claude, Codex, Gemini, Antigravity, Copilot and OpenCode, keeping tmux scrollback"
+      else no "View: view is unified, but afc-chat is missing or not executable"; fi
+    fi
     cs="$HOME/.claude/settings.json"
     if [[ -r "$cs" ]]; then
       lack=""
@@ -2082,16 +2373,19 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       done
       if [[ -z "$lack" ]]; then ok "Claude: the five hooks call agents --mark"; else no "Claude: no agents --mark hook for:$lack" "merge config/claude/settings.fleet-keys.json into ~/.claude/settings.json"; fi
       if jq -e '.statusLine.command | test("afc-statusline")' "$cs" >/dev/null 2>&1; then ok "Claude: the status line is afc-statusline"; else no "Claude: the status line is not afc-statusline, so pane headers lack model, tokens and cost"; fi
-      if [[ "$(setting claude-view classic)" == compact ]]; then
-        if [[ -s "$HOME/.config/agents/claude-compact.json" ]]; then ok "Claude: compact view (claude-view compact): steps folded, the chat scrolls inside Claude, the tmux scrollbar is empty for its panes"
-        else no "Claude: claude-view is compact but ~/.config/agents/claude-compact.json could not be written, so panes start in the classic view"; fi
+      if [[ "$(fleet_view)" == unified ]]; then
+        :   # reported above for all providers
+      elif [[ "$(fleet_view)" == compact ]]; then
+        if [[ -s "$HOME/.config/agents/claude-compact.json" ]]; then ok "Claude: compact view (view compact): steps folded, the chat scrolls inside Claude, the tmux scrollbar is empty for its panes"
+        else no "Claude: view is compact but ~/.config/agents/claude-compact.json could not be written, so panes start in the classic view"; fi
       elif [[ "$(jq -r '.tui // empty' "$cs" 2>/dev/null)" == default ]]; then ok "Claude: classic mode (tui default), so the scrollbar has the chat"; else note "Claude: \"tui\" is not \"default\": the tmux scrollbar will have nothing to scroll"; fi
     else no "~/.claude/settings.json is missing"; fi
     if grep -qs 'agents --mark' "$HOME/.gemini/settings.json"; then ok "Gemini: hooks call agents --mark"; else note "Gemini: no agents --mark hook in ~/.gemini/settings.json: its tab signals are estimated from its chat file, and it sends no notification"; fi
     note "Codex needs no hook (the watcher reads each turn's start and end from its session file); Antigravity's tab signals are estimated"
     if [[ -x "$HOME/.local/bin/afc-rules" ]]; then
-      if "$HOME/.local/bin/afc-rules" doctor >/dev/null 2>&1; then ok "the rule check of TokenOps projects (afc-rules) has its hooks in all four tools"
-      else note "the rule check of TokenOps projects (afc-rules) lacks hooks in some tools: afc-rules doctor says which"; fi
+      if "$HOME/.local/bin/afc-rules" doctor 2>/dev/null | grep -q '^Mode: off'; then ok "the project rule check (afc-rules) is off"
+      elif "$HOME/.local/bin/afc-rules" doctor >/dev/null 2>&1; then ok "the project rule check (afc-rules) has its hooks in all four tools"
+      else note "the project rule check (afc-rules) lacks hooks in some tools: afc-rules doctor says which"; fi
     fi
     echo "Background services"
     if [[ -n "$MAC" ]]; then
@@ -2154,7 +2448,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       done < <(tool_accounts "$tool")
     done
     if [[ -r "$SETTINGS" ]]; then
-      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap|start-agent|log-md|mem-wall|ram-wall|cpu-wall|rules|rules-recap|splash|claude-view)$/ { printf " %s", $1 }' "$SETTINGS")
+      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap|start-agent|log-md|mem-wall|ram-wall|cpu-wall|rules|rules-recap|splash|claude-view|view)$/ { printf " %s", $1 }' "$SETTINGS")
       if [[ -n "$odd" ]]; then no "unknown names in $SETTINGS:$odd"; else ok "settings: $SETTINGS"; fi
     fi
     echo

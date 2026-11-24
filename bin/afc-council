@@ -13,28 +13,42 @@ raw take: no flattery, no hedging, disagree by name.
   @gemini @skeptic …   only those answer; @all is everyone
   Enter on an empty line, or /again   another round on the same message: they answer each other
 
+  /format forum|bp|stake   how the meeting runs (/format alone steps to the next; kept per project):
+                       forum = Open Forum, the modes below, ending after /rounds;
+                       bp    = British Parliamentary debate on your message (the motion): up to 8 members
+                               as PM, LO, DPM, DLO, MG, MO, GW, OW in that order, then the judge ranks
+                               the four benches (OG, OO, CG, CO);
+                       stake = Win Stake: everyone tries to win everyone over, /rounds rounds (at most
+                               12), then each votes for who convinced it most; the judge announces the
+                               winner and sums up the top 3.
+                       /bp: the BP speakers, four benches of two, each with its model; set by
+                       seat unless chosen (/bp ROLE @name, /bp auto); the menu opens with /format bp.
+                       The judge: a member with the judge power, else one with the remove power
+                       (Supra Omnia); it sits the debate out. With none, the council counts the votes.
   /mode                switch between the two modes below (/order and /roast go straight to one);
                        Shift+Tab does it too, and Alt+P steps the permission: plan, edit, bypass
   /mode order          everyone answers at once (each its own take), then round the table one by one,
                        each speaking to the others' answers (the default)
   /mode roast          everyone gives a point at once, then they roast each other, round after round,
-                       each answering what was just said about it, until you press Ctrl+C
-  /rounds N            order mode: passes round the table after the answers (0 = until Ctrl+C or
-                       everyone passes, the default; none = answers only); roast mode: roast rounds
-                       per message (0 = until Ctrl+C, the default)
+                       each answering what was just said about it
+  /rounds N            order mode: passes round the table after the answers (default 2; 0 = until Ctrl+C
+                       or everyone passes; none = answers only); roast mode: roast rounds per message
+                       (default 2; 0 = until Ctrl+C)
   /names model|llm     what an LLM goes by: the model it runs on (@opus, @gpt-6-astra; the default) or
                        its own name (@claude); agents with a character keep theirs. Kept per project
   /length N            answers of at most N words (default 60: two or three sentences); kept
   /topic TEXT          what the meeting is about (else your first message is)
   /agent new NAME LLM CHARACTER [|| SOUL || RULES]   make an agent (its soul, character, rules and memory
-                       go in <project>/agents/NAME/, read before every answer; edit them there). LLM: claude | codex | gemini | agy, with an
+                       go in <project>/agents/NAME/, read before every answer; edit them there). LLM: claude | codex | gemini | agy | copilot | opencode, with an
                        account and a model if you like: claude@others:opus, codex:gpt-5.5
   /lean @name opposition|government|free   where a member stands (any member, an LLM's seat too; @all
                        for everyone): always against the chair, for the chair and its agenda, or no side
                        (free will, the default). Alt+M on its pane: O, G, F. /agent lean NAME … the same
-  /agent power NAME remove [on|off]   let an agent remove members on its own judgement (it ends an
-                       answer with "Remove: @name - why"): an agent is deleted and its memory wiped; an
-                       LLM's own seat leaves the table
+  /agent power NAME remove [on|off]   let an agent give strikes on its own judgement (it ends an
+                       answer with "Strike: @name - why"); at 3 strikes the member is removed: an agent
+                       is deleted and its memory wiped, an LLM's own seat leaves the table. /strikes
+                       shows them, /strikes clear [@name] wipes them
+  /agent power NAME judge [on|off]    a judge sits each round out and gives its verdict when it ends
   /agent del NAME      remove one       /agents   who is at the table, and on what
   /bench NAME, /seat NAME   take a member off the table for now, or back (also an LLM: /seat agy)
   /remove all          everyone off the table, as ✕ on each would (+ add: Remove everyone…)
@@ -42,8 +56,9 @@ raw take: no flattery, no hedging, disagree by name.
                        every council; + add makes a new one); an LLM's own seat is benched
   /model @name MODEL   the model that member runs on (@all for everyone; `default` to go back)
   /effort @name LEVEL  how hard it thinks: low medium high xhigh max (Codex: minimal..xhigh;
-                       Gemini has no such setting, only the model). /model or /effort alone: who
-                       runs on what. /models: the names to pick from. Kept for the next meeting.
+                       Gemini: low..xhigh, one setting for every Gemini, not one per member).
+                       /model or /effort alone: who runs on what. /models: the names to pick from.
+                       Kept for the next meeting.
   /perm plan|edit|bypass   what members may do in this folder: plan reads only (the default), edit
                        may change files but runs no command, bypass may do anything with no asking.
                        /perm @name … for one member (also in Alt+M on its pane); shown in the headers
@@ -54,9 +69,11 @@ raw take: no flattery, no hedging, disagree by name.
   /new [TOPIC]         a new meeting, in a folder of its own (the old one stays saved; Alt+T: what is typed is its
                        topic). A council opened in a folder carries on that folder's last meeting: everyone remembers it
   /resume              carry on an earlier meeting instead (a list; /resume N picks one)
-  /retry [@name]       ask again a member whose run went wrong (all of those, without a name). A run
-                       that goes wrong is told on the note line with what to do; twice in a row, a
-                       pop-up asks: try again, change its model, take it off the table, or leave it
+  /retry [@name]       ask again a member whose run went wrong (all of those, without a name; @ is
+                       optional). Failures are reported on the note line with what to do next
+  /sim N [QUESTION]    Monte Carlo simulation: run N independent trials (1 to 20) in the current format
+                       (Open Forum, BP Debate, or Win Stake), each isolated from prior trials, and
+                       tally win rates, vote totals, and agreement (omit QUESTION to re-run the last)
   /quit                leave (Ctrl+D too). Ctrl+C while they answer stops that round.
 
 Members only read: files in this folder (and the web, where the LLM can), never a change. Each answer
@@ -82,7 +99,9 @@ import contextlib
 import json
 import io
 import os
+import random
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -108,21 +127,32 @@ CONF = os.environ.get("AFC_COUNCIL_CONF") or os.path.join(HOME, ".config/agents/
 GENERAL = os.environ.get("AFC_COUNCIL_GENERAL") or os.path.join(HOME, "Council")   # Alt+Shift+K: about no project
 # Kept per project (in its council folder), not in CONF: what one project's council is set to never
 # reaches another's (a Bypass in one leaves every other at Plan).
-LOCAL = ("mode", "perm", "words", "llm", "seats", "agent_perm", "names", "view")
+LOCAL = ("mode", "perm", "words", "llm", "seats", "agent_perm", "names", "view", "strikes", "format", "bp_cast", "rounds", "roasts", "stake_rounds")
+STRIKES = 3         # strikes from an agent with the remove power before the member is removed
 STAMP = re.compile(r"\d{4}-\d\d-\d\d_\d{4}(-\d+)?")      # a session folder not named by its topic yet
-TOOLS = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "agy": "Antigravity"}
+TOOLS = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "agy": "Antigravity",
+         "copilot": "Copilot", "opencode": "OpenCode"}
+CORE_TOOLS = ("claude", "codex", "gemini", "agy")
 NAMES = {"by": "model"}   # /names: a member that is not an agent with a character goes by its model (or "llm")
-ALIAS = {"antigravity": "agy", "google": "gemini", "openai": "codex", "gpt": "codex", "anthropic": "claude"}
+ALIAS = {"antigravity": "agy", "google": "gemini", "openai": "codex", "gpt": "codex", "anthropic": "claude",
+         "github": "copilot", "gh": "copilot", "cloudflare": "opencode"}
 KEEP_CHARS = 60000          # the thread each member reads is cut to the newest this many characters
-# What /effort takes per LLM (Gemini's command line has none: its model is the only setting), and
-# models /models suggests (any name the LLM's own program takes is accepted; `agy models` lists more)
+# What /effort takes per LLM, and models /models suggests (any name the LLM's own program takes is
+# accepted; `agy models` lists more). Gemini's command line has no effort: afc-gemini-effort puts one
+# thinking level per model in its settings, which every Gemini reads when it starts (each council
+# turn starts one), so for Gemini it is one setting for every Gemini, not one per member.
 EFFORTS = {"claude": ["low", "medium", "high", "xhigh", "max"], "codex": ["minimal", "low", "medium", "high", "xhigh"],
-           "gemini": [], "agy": ["low", "medium", "high", "xhigh", "max"]}
+           "gemini": ["low", "medium", "high", "xhigh"], "agy": ["low", "medium", "high", "xhigh", "max"],
+           "copilot": [], "opencode": []}
+GEMINI_EFFORT = (os.environ.get("AFC_COUNCIL_GEMINI_EFFORT")      # the tests point it at the folder's own copy
+                 or os.path.join(HOME, ".local/bin/afc-gemini-effort"))
 MODELS = {"claude": ["opus", "fable", "sonnet", "haiku", "claude-opus-5-5", "claude-fable-5-2", "claude-sonnet-5-5",
                      "claude-haiku-5-5", "claude-opus-4-8"],
           "codex": ["gpt-6-astra"],
-          "gemini": ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-3.8-flash"],
-          "agy": ["gemini-4-neon-high", "gemini-4-argon-high", "gemini-4-hydrogen-high", "gemini-3.8-flash-high"]}
+          "gemini": ["gemini-4-neon", "gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-3.8-flash"],
+          "agy": ["gemini-4-neon-high", "gemini-4-argon-high", "gemini-4-hydrogen-high", "gemini-3.8-flash-high"],
+          "copilot": ["gpt-6.1-sol", "claude-sonnet-5.5"],     # Copilot writes versions with a dot
+          "opencode": ["default"]}
 # Claude's short names stand for its newest models: the same model, so never two at the table
 CLAUDE_ALIAS = {"claude-opus-5-5": "opus", "claude-fable-5-2": "fable", "claude-sonnet-5-5": "sonnet",
                 "claude-haiku-5-5": "haiku"}
@@ -175,6 +205,8 @@ def models_for(tool, home=None):
         found = read_json(MODEL_CACHE).get(tool) or []
         if tool == "gemini":
             found = sorted(set(found) | set(MODELS["gemini"]), key=lambda k: version_key(k) + [len(k)])
+        elif tool == "copilot":
+            found = list(found) + [m for m in copilot_recent(home) if m not in found]
     out, seen = [], {}
     for m in found or MODELS.get(tool, []):
         c = canon(m)
@@ -192,9 +224,45 @@ def model_label(model):
     return f"{model}  ({a})" if a else model
 
 
+def copilot_recent(home=None):
+    """Models this Copilot account ran lately (config.json, recentModelIds): the account offers them even
+    when `copilot help config` does not name them (gemini-4-neon, mai-code-2-flash on 2026-11-24)."""
+    for h in [x for x in (home, os.path.join(HOME, ".copilot")) if x]:
+        try:
+            with open(os.path.join(h, "config.json"), errors="replace") as fh:   # JSON with // comment lines
+                d = json.loads("".join(line for line in fh if not line.lstrip().startswith("//")))
+        except (OSError, ValueError):
+            continue
+        ids = d.get("recentModelIds") if isinstance(d, dict) else None
+        return [m for m in ids if isinstance(m, str) and m] if isinstance(ids, list) else []
+    return []
+
+
+def copilot_help_models(text):
+    """The models `copilot help config` lists under its `model` setting, in its order."""
+    out, inside = [], False
+    for line in text.splitlines():
+        if re.match(r"\s*`model`:", line):
+            inside = True
+        elif inside and re.match(r"\s*`[\w.]+`:", line):
+            break
+        elif inside:
+            m = re.match(r'\s*-\s*"([^"\s]+)"\s*$', line)
+            if m and m[1] not in out:
+                out.append(m[1])
+    return out
+
+
+def opencode_list_models(text):
+    """`opencode models`: one provider/model per line, from the providers it is signed in to."""
+    return [x.strip() for x in text.splitlines() if re.fullmatch(r"[\w.-]+/[\w.:@/-]+", x.strip())]
+
+
 def refresh_models():
-    """When a council opens, in the background: the models Antigravity offers (`agy models`) and the ones
-    the Gemini CLI names, kept in MODEL_CACHE for the menus, read again only when that program changed."""
+    """When a council opens, in the background: the models Antigravity offers (`agy models`), the ones
+    the Gemini CLI names, Copilot's (`copilot help config`) and OpenCode's (`opencode models`), kept in
+    MODEL_CACHE for the menus. Read again only when that program changed; Copilot's and OpenCode's also
+    once a day, since what an account offers changes without an update."""
     if os.environ.get("AFC_COUNCIL_NO_REFRESH"):       # the tests: never ask the real programs
         return
     data, changed = read_json(MODEL_CACHE), False
@@ -231,6 +299,24 @@ def refresh_models():
                     pass
         if names:
             data["gemini"], data["gemini_stamp"], changed = sorted(names), stamp, True
+    day = time.strftime("%Y-%m-%d")
+    for tool, ask, pick in (("copilot", ["help", "config"], copilot_help_models),
+                            ("opencode", ["models"], opencode_list_models)):
+        prog = shutil.which(tool)
+        try:
+            st = os.stat(os.path.realpath(prog)) if prog else None
+        except OSError:
+            st = None
+        stamp = f"{st.st_mtime_ns}-{st.st_size}-{day}" if st else ""
+        if stamp and data.get(tool + "_stamp") != stamp:
+            try:
+                out = subprocess.run([prog] + ask, capture_output=True, text=True, timeout=90,
+                                     stdin=subprocess.DEVNULL, env=child_env()).stdout
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            ids = pick(out)
+            if ids:
+                data[tool], data[tool + "_stamp"], changed = ids, stamp, True
     if changed:
         try:
             write_json(MODEL_CACHE, data)
@@ -239,12 +325,28 @@ def refresh_models():
 
 
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"          # the thinking animation
-MAX_SEATS = 9       # members at the table at once (a 3 x 3 grid)
+MAX_SEATS = 12      # members at the table at once (a grid of 3 rows; 12 since 2026-11-24, the operator's word)
+PROBE = "A quick check before you join a council meeting: reply with the single word OK."
+FORMATS = ("forum", "bp", "stake")
+FORMAT_SHOWN = {"forum": "Open Forum", "bp": "BP debate", "stake": "Win Stake"}
+# British Parliamentary: the roles in speaking order (abbreviation, title, bench, the job)
+BP_ROLES = [
+    ("PM", "Prime Minister", "Opening Government", "Define the motion and set out the government's case: two or three arguments."),
+    ("LO", "Leader of the Opposition", "Opening Opposition", "Rebut the Prime Minister and set out the opposition's case."),
+    ("DPM", "Deputy Prime Minister", "Opening Government", "Rebuild the government's case against the Leader of the Opposition and add an argument."),
+    ("DLO", "Deputy Leader of the Opposition", "Opening Opposition", "Rebut the Deputy Prime Minister, rebuild the opposition and add an argument."),
+    ("MG", "Member of Government", "Closing Government", "Bring a new argument for the government (an extension) that the opening bench did not make."),
+    ("MO", "Member of Opposition", "Closing Opposition", "Bring a new argument for the opposition (an extension) that the opening bench did not make."),
+    ("GW", "Government Whip", "Closing Government", "Sum up the debate for the government: the main clashes and why your side won them. No new arguments."),
+    ("OW", "Opposition Whip", "Closing Opposition", "Sum up the debate for the opposition: the main clashes and why your side won them. No new arguments."),
+]
+PROBE_TIMEOUT = 90  # s: the one short question a member gets before it joins the table (check_before_seating)
 CHAT_LINES = 4      # the chat box under the grid: what you type, and the thinking line
 TMUXBIN = os.path.join(HOME, ".local/bin/tmux") if os.access(os.path.join(HOME, ".local/bin/tmux"), os.X_OK) else "tmux"
 ME = os.path.join(HOME, ".local/bin/afc-council")
 TTY = sys.stdout.isatty()
-C = {"rule2": "38;5;110", "rule": "38;5;60", "chair": "1;37", "claude": "38;5;173", "codex": "38;5;114", "gemini": "38;5;75", "agy": "38;5;141",
+C = {"rule2": "38;5;110", "rule": "38;5;60", "chair": "1;37", "claude": "38;5;173", "codex": "38;5;114",
+     "gemini": "38;5;75", "agy": "38;5;141", "copilot": "38;5;117", "opencode": "38;5;216",
      "agent": "38;5;221", "note": "38;5;244", "err": "38;5;203", "you": "38;5;252",
      # a member whose own colour is taken: cyan, pink, lime, tan, sky, peach, periwinkle, sea green
      "x1": "38;5;80", "x2": "38;5;211", "x3": "38;5;150", "x4": "38;5;180", "x5": "38;5;117", "x6": "38;5;216",
@@ -253,6 +355,16 @@ C = {"rule2": "38;5;110", "rule": "38;5;60", "chair": "1;37", "claude": "38;5;17
 
 def paint(text, kind):
     return f"\033[{C.get(kind, C['agent'])}m{text}\033[0m" if TTY else text
+
+
+def cells(text):
+    """Display width in terminal cells (wide chars / emoji = 2, combining = 0, ANSI ignored)."""
+    n = 0
+    for ch in ANSI.sub("", text or ""):
+        if unicodedata.combining(ch):
+            continue
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
 
 
 # The typing line's prompt. Its colour codes are wrapped in \001 … \002 so readline counts them as
@@ -270,7 +382,18 @@ BOXPROMPT = "\001\033[38;5;111m\002> \001\033[0m\002"
 
 def fit(text, n):
     t = " ".join(ANSI.sub("", text).split())
-    return t if len(t) <= n else t[:max(0, n - 1)] + "…"
+    if n <= 0:
+        return ""
+    if cells(t) <= n:
+        return t
+    out, used, limit = [], 0, max(0, n - 1)
+    for ch in t:
+        w = 0 if unicodedata.combining(ch) else (2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
+        if used + w > limit:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out).rstrip() + "…"
 
 
 # The box grows with what you type: a line that is full goes on to the next one, and the pane is made
@@ -327,8 +450,12 @@ def typed_rows():
     """How many lines what is being typed takes ("> " and the text, wide characters counting two),
     with a few columns to spare so the next line is there before the text reaches it."""
     cols = BOX.get("cols") or 80
-    w = 2 + sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in readline.get_line_buffer())
-    return max(1, min(TYPE_MAX, (w + 3) // cols + 1))
+    lines = readline.get_line_buffer().split("\n")
+    rows = 0
+    for i, seg in enumerate(lines):
+        w = (2 if i == 0 else 0) + sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in seg)
+        rows += max(1, (w + 3) // cols + 1)
+    return max(1, min(TYPE_MAX, rows))
 
 
 def grow():
@@ -418,7 +545,7 @@ def say(text):
 
 
 # ---- what you can type: / lists the commands, @ the members, as soon as you type it -----------------------
-COMMANDS = ["/mode", "/roast", "/order", "/rounds", "/names", "/length", "/topic", "/model", "/effort", "/models", "/agents",
+COMMANDS = ["/format", "/bp", "/mode", "/roast", "/order", "/rounds", "/round", "/sim", "/names", "/length", "/topic", "/model", "/effort", "/models", "/agents",
             "/agent", "/remove", "/bench", "/seat", "/view", "/lean", "/new", "/resume", "/retry", "/perm", "/again", "/grid", "/help", "/quit"]
 TABLE = [None]          # the meeting, for the @ names
 
@@ -465,9 +592,226 @@ def list_matches(substitution, found, longest):
 
 
 KEY_VIEW = "#!#%#"                                         # Alt+O: one view for everyone, or one pane each
-KEY_MODE, KEY_PERM, KEY_NEW = "#!#~#", "#!#^#", "#!#=#"   # what Shift+Tab and Alt+P put in front of the line (no letters: those
-                                           # are bound to the / and @ lists)
+KEY_MODE, KEY_PERM, KEY_NEW = "#!#~#", "#!#^#", "#!#=#"   # what Shift+Tab and Alt+P put in front of the line
+KEY_CMD = "#!#C#"                                          # menu command wrapper: runs /cmd and gives back the user's draft
 PENDING = {"text": ""}
+PASTES = {}             # "[Pasted #1 · N lines]" -> verbatim pasted text, expanded on submit
+PASTE_SEQ = [0]
+PASTE_CB = [None]       # keeps ctypes CFUNCTYPE callback alive for GNU readline
+
+
+def bind_bracketed_paste(lib):
+    """Handle ESC[200~ ... ESC[201~ bracketed pastes inside GNU readline:
+    - Single-line short pastes insert cleanly inline (tabs -> spaces, control chars stripped).
+    - Multi-line or long (>300 chars) pastes collapse into a compact pill `[Pasted #1 · N lines]`
+      so newlines never prematurely submit messages or smash the 4-line chat box, then expand
+      verbatim when Enter is pressed."""
+    try:
+        import ctypes
+        lib.rl_read_key.argtypes = []
+        lib.rl_read_key.restype = ctypes.c_int
+        lib.rl_insert_text.argtypes = [ctypes.c_char_p]
+        lib.rl_insert_text.restype = ctypes.c_int
+        cb_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int)
+        lib.rl_bind_keyseq.argtypes = [ctypes.c_char_p, cb_type]
+        lib.rl_bind_keyseq.restype = ctypes.c_int
+    except (AttributeError, ImportError, OSError):
+        return
+
+    @in_callback
+    def on_paste(count, key):
+        buf = bytearray()
+        end = b"\x1b[201~"
+        while len(buf) < 524288:         # 512 KB cap so nothing hangs or OOMs
+            c = lib.rl_read_key()
+            if c < 0:
+                break
+            buf.append(c & 0xFF)
+            if buf.endswith(end):
+                del buf[-len(end):]
+                break
+        text = buf.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        # Strip trailing newlines so copying a single line ("foo\n") stays a clean single-line paste
+        text = text.rstrip("\n")
+        if not text:
+            return 0
+        if "\n" in text or len(text) > 300:
+            PASTE_SEQ[0] += 1
+            n = text.count("\n") + 1
+            tag = f"[Pasted #{PASTE_SEQ[0]} · {n} lines]" if "\n" in text else f"[Pasted #{PASTE_SEQ[0]} · {len(text)} chars]"
+            PASTES[tag] = text
+            while len(PASTES) > 20:
+                PASTES.pop(next(iter(PASTES)))
+            lib.rl_insert_text(tag.encode("utf-8"))
+            if BOX["on"]:
+                show_note(f"Pasted {n} line{'s' if n != 1 else ''} ({len(text)} chars) as {tag} · Enter to send")
+        else:
+            clean = "".join("  " if ch == "\t" else (ch if 32 <= ord(ch) != 127 else "") for ch in text)
+            if clean:
+                lib.rl_insert_text(clean.encode("utf-8"))
+        if BOX["on"]:
+            grow()
+        return 0
+
+    PASTE_CB[0] = cb_type(on_paste)
+    lib.rl_bind_keyseq(b"\x1b[200~", PASTE_CB[0])
+
+
+IMG_TAG = re.compile(r"\[Image #(\d+)\]")
+IMG_PATH = re.compile(r"\[Image #\d+: (/[^\s\]]+\.png)")
+# Where pasted screenshots are kept: outside every project, because a project's logs/council is
+# git-ignored and Gemini's file reader refuses git-ignored files (it gets this folder as an included one)
+IMAGES = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "afc-council", "images")
+
+
+def attach_images(line, meeting):
+    """Screenshots pasted into the chat box: Ctrl+V (agents --paste) saved the clipboard image as
+    <runtime>/afc-council/<this council's pid>-img-N.png and typed [Image #N]. On sending, each is moved
+    into IMAGES (named by project and time) and the tag becomes [Image #N: <path> …], so every member can
+    open it with its own file reader (Claude; Gemini, given IMAGES as an included folder) and Codex gets
+    it attached (command())."""
+    rt = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "afc-council")
+
+    def one(mo):
+        src = os.path.join(rt, f"{os.getpid()}-img-{mo.group(1)}.png")
+        if not os.path.isfile(src):
+            return mo.group(0)
+        try:
+            os.makedirs(IMAGES, exist_ok=True)
+            proj = re.sub(r"[^\w.-]+", "-", os.path.basename(meeting.owner.rstrip("/")) or "council")
+            dst = os.path.join(IMAGES, f"{proj}_" + time.strftime("%Y-%m-%d_%H%M%S") + f"-{mo.group(1)}.png")
+            shutil.move(src, dst)
+        except OSError:
+            return mo.group(0)
+        return f"[Image #{mo.group(1)}: {dst} (a screenshot from the chair: open this file to see it)]"
+    return IMG_TAG.sub(one, line)
+
+
+def expand_pastes(line):
+    """Expand any `[Pasted #N · ...]` pills in line back to the exact pasted text (keeps the last
+    20 pastes so menu shortcuts and Up-arrow history re-submissions still expand cleanly)."""
+    if not PASTES:
+        return line
+    for tag, content in list(PASTES.items()):
+        if tag in line:
+            line = line.replace(tag, content)
+    return line
+
+
+def tmx_quote(s):
+    """Quote a string for tmux's own command parser (display-menu actions, etc.)."""
+    return '"' + (s or "").replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+
+
+def send_cmd(chair, text):
+    """tmux menu action: inject KEY_CMD <text> KEY_CMD and submit, so the chat loop runs <text>
+    and restores whatever the user was halfway through typing (works in emacs and vi modes)."""
+    payload = f"{KEY_CMD}{text}{KEY_CMD}"
+    return (f"send-keys -t {tmx_quote(chair)} -l {tmx_quote(payload)} ; "
+            f"send-keys -t {tmx_quote(chair)} Enter")
+
+
+def format_menu(meeting, pane, wait=1.5):
+    """The choice of format, offered when a council opens and on /new (operator, 2026-11-24): a menu in the
+    middle of the screen, the format set now marked; Esc keeps it. The pick is typed into the chat as
+    /format, so the chat says what it is. AFC_COUNCIL_NO_FORMAT_MENU=1 turns it off (the tests)."""
+    if os.environ.get("AFC_COUNCIL_NO_FORMAT_MENU") or not (os.environ.get("TMUX") and pane and TTY):
+        return
+
+    def go():
+        time.sleep(wait)          # the chat box is ready to take what the pick types
+        if tmx("display-message", "-p", "-t", pane, "#{&&:#{pane_active},#{window_active}}") != "1":
+            return                # user switched away or closed the council before the menu fired
+        client = tmx("display-message", "-p", "-t", pane, "#{client_name}")
+        cur = meeting.format()
+        n = meeting.stake_rounds()
+        adj = meeting.adjudicators()
+        judge = ("judge @" + adj[0].shown()) if adj else "no judge seated"
+        items = []
+        for key, f, what in (("1", "forum", f"Open Forum: {meeting.mode} mode, ends after /rounds"
+                                              + (f" ({judge})" if adj else "")),
+                             ("2", "bp", f"BP debate: up to 8 speakers, then the judge ({judge})"),
+                             ("3", "stake", f"Win Stake: {n} rounds, then the vote ({judge})")):
+            items += [("• " if f == cur else "  ") + what, key, send_cmd(pane, f"/format {f}")]
+        tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
+            "-T", "#[align=centre] Council format (Esc keeps it) ", "-x", "C", "-y", "C", "--", *items)
+    threading.Thread(target=go, daemon=True).start()
+
+
+def rounds_menu(meeting, pane):
+    """How many rounds, in the middle of the screen, after Open Forum or Win Stake is picked (operator,
+    2026-11-24): Win Stake 1 to 12; Open Forum by its mode. Esc keeps what is set; /rounds N does the same."""
+    if os.environ.get("AFC_COUNCIL_NO_FORMAT_MENU") or not (os.environ.get("TMUX") and pane and TTY):
+        return
+    client = tmx("display-message", "-p", "-t", pane, "#{client_name}")
+    if meeting.format() == "stake":
+        now, title = meeting.stake_rounds(), " Win Stake: how many rounds? "
+        opts = [(str(n), f"{n} round{'s' if n > 1 else ''}", n) for n in (1, 2, 3, 4, 5, 6, 8, 10, 12)]
+    elif meeting.mode == "roast":
+        now, title = meeting.roasts, " Roast: counters per member? "
+        opts = [(str(n), f"{n}", n) for n in (1, 2, 3, 4, 5, 8)] + [("0", "until Ctrl+C", 0)]
+    else:
+        now, title = meeting.rounds, " Order: passes round the table? "
+        opts = [(str(n), f"{n}", n) for n in (1, 2, 3, 4, 5, 8)] + [("0", "until Ctrl+C or all pass", 0),
+                                                                   ("-", "none (answers only)", "none")]
+    items = []
+    for key, label, val in opts:
+        on = (val == now) or (val == "none" and now == -1)
+        items += [("• " if on else "  ") + label, key if len(key) == 1 else "", send_cmd(pane, f"/rounds {val}")]
+    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
+        "-T", f"#[align=centre]{title}", "-x", "C", "-y", "C", "--", *items)
+
+
+def bp_menu(meeting, pane):
+    """The BP debate's speakers, in the middle of the screen: the four benches, two speakers each, with
+    the model each runs on, set by seat unless chosen. A slot opens the list of who can take it."""
+    if os.environ.get("AFC_COUNCIL_NO_FORMAT_MENU") or not (os.environ.get("TMUX") and pane and TTY):
+        return
+    client = tmx("display-message", "-p", "-t", pane, "#{client_name}")
+    cast = dict((r[0], m) for r, m in meeting.bp_cast())
+    chosen = meeting.conf.get("bp_cast") or {}
+    items, key = [], iter("12345678")
+    for bench, side, pair in (("Opening Government", "for the motion", ("PM", "DPM")),
+                              ("Opening Opposition", "against", ("LO", "DLO")),
+                              ("Closing Government", "for the motion", ("MG", "GW")),
+                              ("Closing Opposition", "against", ("MO", "OW"))):
+        items += [f"-#[bold]{bench} ({side})", "", ""]
+        for abbr in pair:
+            m = cast.get(abbr)
+            who = f"@{m.shown()} · {m.runs_on()[0]}" if m else "(empty: + add a member)"
+            mark = "" if abbr in chosen else "  (by seat)"
+            items += [f"   {abbr:<4}{who}{mark}", next(key), send_cmd(pane, f"/bp pick {abbr}")]
+    adj = meeting.adjudicators()
+    items += ["", "Auto-set all by seat", "a", send_cmd(pane, "/bp auto"),
+              "-Judge: " + (" ".join(f"@{j.shown()} · {j.runs_on()[0]}" for j in adj) if adj else "none seated"), "", ""]
+    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
+        "-T", "#[align=centre] BP debate: who speaks (Esc when done) ", "-x", "C", "-y", "C", "--", *items)
+
+
+def bp_pick_menu(meeting, pane, role):
+    """Who takes one BP role: every member at the table but the judge, with its model and the role it
+    has now (picking one that has a role swaps the two)."""
+    if not (os.environ.get("TMUX") and pane and TTY):
+        return
+    client = tmx("display-message", "-p", "-t", pane, "#{client_name}")
+    now = {m.handle: r[0] for r, m in meeting.bp_cast()}
+    adj = meeting.adjudicators()
+    items = []
+    for k, m in zip(MODEL_KEYS, [x for x in meeting.seated() if x not in adj]):
+        has = f"  (now {now[m.handle]})" if m.handle in now else "  (listening)"
+        items += [f"@{m.shown()} · {m.runs_on()[0]}{has}", k, send_cmd(pane, f"/bp {role} @{m.handle}")]
+    if not items:
+        items = ["-No seated speakers besides the judge (+ add someone)", "", ""]
+    name = next(r[1] for r in BP_ROLES if r[0] == role)
+    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
+        "-T", f"#[align=centre] {name} ({role}): who? ", "-x", "C", "-y", "C", "--", *items)
+
+
+def send_cmd_now(chair, text):
+    """Direct tmux call equivalent of send_cmd (used by --remove, --ask, --new-agent)."""
+    payload = f"{KEY_CMD}{text}{KEY_CMD}"
+    tmx("send-keys", "-t", chair, "-l", payload)
+    tmx("send-keys", "-t", chair, "Enter")
 
 
 @in_callback
@@ -482,8 +826,8 @@ def give_back():
 
 
 def setup_typing():
-    """Tab completes / commands and @ names. In the grid's chat box, / and @ (and every letter after
-    them, and Backspace) also list what matches at once on the note line."""
+    """Tab completes / commands and @ names (listed on the note line in the chat box). Never binds
+    regular letters so fast typing, paste and Vi mode are never interfered with."""
     readline.set_completer(completer)
     readline.set_completer_delims(" \t\n")
     if "libedit" in (readline.__doc__ or ""):      # a Mac's own Python: editline, Tab only
@@ -491,6 +835,11 @@ def setup_typing():
         return
     readline.parse_and_bind("tab: complete")
     readline.parse_and_bind("set bell-style none")
+    readline.parse_and_bind("set enable-bracketed-paste on")
+    if RL[0] is None:
+        RL[0] = rl_lib()
+    if RL[0]:
+        bind_bracketed_paste(RL[0])
     # Home, End and Delete as tmux sends them. Linux binds these in /etc/inputrc; a Mac has none, so
     # under a TERM whose terminfo names other codes (xterm-256color, Terminal.app's) Home typed a ~
     for k, f in (("\\e[1~", "beginning-of-line"), ("\\e[4~", "end-of-line"), ("\\e[3~", "delete-char"),
@@ -505,19 +854,40 @@ def setup_typing():
     readline.parse_and_bind('"\\et": "\\C-a' + KEY_NEW + '\\C-m"')      # Alt+T: a new topic (what is typed names it)
     readline.parse_and_bind('"\\eo": "\\C-a' + KEY_VIEW + '\\C-m"')      # Alt+O: one view / one pane each
     readline.set_pre_input_hook(give_back)
-    if BOX["on"]:
-        readline.set_completion_display_matches_hook(list_matches)
-        keys = "/@abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
-        for k in keys:
-            readline.parse_and_bind(f'"{k}": "\\C-v{k}\\e?"')    # quoted-insert: not this binding again
-        readline.parse_and_bind('"\\C-?": "\\C-h\\e?"')
+    readline.set_completion_display_matches_hook(list_matches if BOX["on"] else None)
+
+
+class ThreadOutput:
+    """sys.stdout while boxed() runs a command: what the command's own thread prints is caught in buf,
+    every other thread still writes to the terminal. redirect_stdout alone swaps the output of the
+    whole program, so the "are thinking" line (redrawn ten times a second, each frame starting with a
+    carriage return that less shows as ^M) and a member's answer arriving meanwhile went into the
+    command's pop-up instead of the chat (seen 2026-11-24, switching the view during a roast)."""
+    def __init__(self, real, buf):
+        self.real, self.buf, self.owner = real, buf, threading.get_ident()
+
+    def _to(self):
+        return self.buf if threading.get_ident() == self.owner else self.real
+
+    def write(self, s):
+        return self._to().write(s)
+
+    def flush(self):
+        return self._to().flush()
+
+    def isatty(self):
+        return self._to().isatty()
+
+    def __getattr__(self, name):
+        return getattr(self._to(), name)
 
 
 def boxed(fn, *args):
     """Run fn with what it prints caught: one line goes on the chat box's note line, more open in a
-    pop-up (/help, /agents, /models), so the box stays one line to type in."""
+    pop-up (/help, /agents, /models), so the box stays one line to type in. Only fn's own thread is
+    caught (ThreadOutput): members thinking and answering meanwhile still show in the chat."""
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    with contextlib.redirect_stdout(ThreadOutput(sys.stdout, buf)):
         result = fn(*args)
     text = buf.getvalue().rstrip()
     lines = [l for l in ANSI.sub("", text).split("\n") if l.strip()]
@@ -525,12 +895,18 @@ def boxed(fn, *args):
         BOX["note"] = lines[0].strip() if lines else BOX["note"]
     else:
         d = os.path.dirname(FEED["path"]) or tempfile.gettempdir()
-        path = os.path.join(d, f"popup-{os.getpid()}.txt")
-        with open(path, "w") as f:
-            f.write(text + "\n")
-        if subprocess.run([TMUXBIN, "display-popup", "-E", "-w", "90%", "-h", "75%", "-T", " council ",
-                           f"less -R +g {path}"], capture_output=True).returncode != 0:
-            BOX["note"] = lines[0].strip() + " …"
+        path = os.path.join(d, f"popup-{os.getpid()}-{threading.get_ident()}.txt")
+        try:
+            with open(path, "w") as f:
+                f.write(text + "\n")
+            if subprocess.run([TMUXBIN, "display-popup", "-E", "-w", "90%", "-h", "75%", "-T", " council ",
+                               f"less -R +g {shlex.quote(path)}"], capture_output=True).returncode != 0:
+                BOX["note"] = lines[0].strip() + " …"
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     return result
 
 
@@ -538,7 +914,10 @@ def note(text):
     if INPUT["open"]:
         say(paint(f"  {text}", "note"))
     else:
-        print(paint(f"  {text}", "note"), flush=True)
+        with LOCK:
+            clear_status()
+            print(paint(f"  {text}", "note"), flush=True)
+            draw_status()
 
 
 # ---- settings and made agents ------------------------------------------------------------------------
@@ -551,12 +930,23 @@ def read_json(path):
         return {}
 
 
+CONF_LOCK = threading.Lock()
+GRID_LOCK = threading.RLock()
+
+
 def write_json(path, d):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".new"
-    with open(tmp, "w") as f:
-        json.dump(d, f, indent=2)
-    os.replace(tmp, path)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def council_home(owner):
@@ -601,18 +991,19 @@ def load_conf(home=None, owner=None):
 def save_conf(d):
     """This project's settings to its own file; the rest (made agents, parallel, timeout) to the shared
     one, whose mode, models and efforts stay as they were: what a new project's council starts from."""
-    home = d.get("_home")
-    if not home:
-        write_json(CONF, {k: v for k, v in d.items() if not k.startswith("_")})
-        return
-    write_json(os.path.join(home, "settings.json"), {k: d[k] for k in LOCAL if k in d})
-    shared = read_json(CONF)
-    shared.update({k: v for k, v in d.items() if k not in LOCAL and not k.startswith("_")})
-    shared.pop("perm", None)                   # permissions are only ever a project's own now
-    for st in (shared.get("llm") or {}).values():
-        if isinstance(st, dict):
-            st.pop("perm", None)
-    write_json(CONF, shared)
+    with CONF_LOCK:
+        home = d.get("_home")
+        if not home:
+            write_json(CONF, {k: v for k, v in d.items() if not k.startswith("_")})
+            return
+        write_json(os.path.join(home, "settings.json"), {k: d[k] for k in LOCAL if k in d})
+        shared = read_json(CONF)
+        shared.update({k: v for k, v in d.items() if k not in LOCAL and not k.startswith("_")})
+        shared.pop("perm", None)                   # permissions are only ever a project's own now
+        for st in (shared.get("llm") or {}).values():
+            if isinstance(st, dict):
+                st.pop("perm", None)
+        write_json(CONF, shared)
 
 
 def handle_of(name):
@@ -625,7 +1016,8 @@ def parse_llm(spec):
     if not m:
         return None
     tool = ALIAS.get(m[1].lower(), m[1].lower())
-    if tool not in TOOLS or (m[4] and m[4] not in EFFORTS[tool]):
+    # Gemini's effort is one setting for every Gemini (/effort @gemini), so an agent cannot carry its own
+    if tool not in TOOLS or (m[4] and (m[4] not in EFFORTS[tool] or tool == "gemini")):
         return None
     return tool, m[2], m[3], m[4]
 
@@ -641,7 +1033,7 @@ def accounts():
     for line in text.splitlines():
         m = re.match(r"^\* (\S+)\s+(\S+)\s+(.*?)\s+(/\S.*)$", line)
         if m and m[1] in TOOLS:
-            out[m[1]] = (m[2], m[3].strip() != "not signed in", m[4].strip())
+            out[m[1]] = (m[2], not m[3].strip().startswith("not signed in"), m[4].strip())
     return out
 
 
@@ -658,7 +1050,17 @@ def defaults(tool, folder):
         return None, None
     if tool == "claude":
         d = js(os.path.join(folder, "settings.json"))
-        return d.get("model") or None, d.get("effortLevel") or None
+        model = d.get("model") or None
+        effort = d.get("effortLevel") or None
+        if not effort and model and isinstance(d.get("modelSettings"), dict):
+            ms = d["modelSettings"]
+            entry = ms.get(model)
+            if not isinstance(entry, dict):
+                mc = canon(model)
+                entry = next((v for k, v in ms.items() if isinstance(v, dict) and canon(k) == mc), None)
+            if isinstance(entry, dict):
+                effort = entry.get("effortLevel") or None
+        return model, effort
     if tool == "codex":
         try:
             with open(os.path.join(folder, "config.toml")) as f:
@@ -672,8 +1074,51 @@ def defaults(tool, folder):
     if tool == "gemini":
         d = js(os.path.join(folder, ".gemini", "settings.json")).get("model")
         return (d.get("name") if isinstance(d, dict) else d) or None, None
-    d = js(os.path.join(folder, ".gemini", "antigravity-cli", "settings.json")).get("model")
-    return (d if isinstance(d, str) else None), None
+    if tool == "agy":
+        d = js(os.path.join(folder, ".gemini", "antigravity-cli", "settings.json")).get("model")
+        return (d if isinstance(d, str) else None), None
+    return None, None
+
+
+def gemini_effort(folder, model=None):
+    """The fleet's one Gemini effort, from afc-gemini-effort's lines in <folder>/.gemini/settings.json:
+    the level asked for, or with a model the level that model gets (Argon has no xhigh: high), or None
+    for a model the lines do not cover. None as well when it is Gemini's own default. Never reads a
+    home other than the one given (the tests' Gemini account is not this machine's)."""
+    if not folder:
+        return None
+    try:
+        with open(os.path.join(folder, ".gemini", "settings.json")) as f:
+            d = json.load(f)
+        lines = [o for o in (d.get("modelConfigs") or {}).get("customOverrides") or []
+                 if isinstance(o, dict) and o.get("afc") == "effort"]
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not lines:
+        return None
+    if not model or model == "default model":
+        return lines[0].get("level") or None
+    for o in lines:
+        if (o.get("match") or {}).get("model") == model:
+            try:
+                return o["modelConfig"]["generateContentConfig"]["thinkingConfig"]["thinkingLevel"].lower()
+            except (KeyError, TypeError, AttributeError):
+                return o.get("level") or None
+    return None
+
+
+def set_gemini_effort(folder, level):
+    """afc-gemini-effort set LEVEL in that Gemini home: (True, '') or (False, why)."""
+    if not folder:
+        return False, "its account's folder is not known"
+    try:
+        r = subprocess.run([GEMINI_EFFORT, "--home", folder, "set", level], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    if r.returncode:
+        return False, ((r.stderr or r.stdout).strip().splitlines() or ["afc-gemini-effort failed"])[-1]
+    return True, ""
 
 
 class Member:
@@ -688,10 +1133,13 @@ class Member:
 
     def runs_on(self):
         """(model, effort) as it will run: what was set here, else the account's own setting, else
-        the LLM's default. Effort is '' for an LLM that has no such setting (Gemini)."""
+        the LLM's default. Effort is '' for an LLM that has no such setting (Copilot, OpenCode). For
+        Gemini it is the fleet's one Gemini effort, as this member's model gets it (gemini_effort)."""
         model = self.model or self.default_model or "default model"
         if not EFFORTS[self.tool]:
             return model, ""
+        if self.tool == "gemini":
+            return model, (gemini_effort(self.home, model) or "default")
         if self.tool == "agy" and "(" in model:      # its model names carry an effort: "Gemini 4 Neon (XHigh)"
             if not self.effort:
                 return model, ""
@@ -725,7 +1173,7 @@ class Member:
     def shown(self):
         """The name it goes by at the table (what the panes show, what the others call it, what you tag)."""
         t = TABLE[0]
-        return table_names(t.members if t else [self]).get(self.handle, self.handle)
+        return table_names(list(t.members) if t else [self]).get(self.handle, self.handle)
 
     def label(self):
         if self.by_model():
@@ -741,12 +1189,13 @@ class Member:
         """Its colour at this table: its own, or the next free one when another member has that already
         (a second Claude is not orange too)."""
         t = TABLE[0]
-        return table_colours(t.members if t else [self]).get(self.handle, self.own_colour())
+        return table_colours(list(t.members) if t else [self]).get(self.handle, self.own_colour())
 
 
-# The model's family and maker: not part of the name a member goes by (gpt-6-astra goes by astra)
-FAMILY = {"claude", "anthropic", "gpt", "openai", "codex", "gemini", "google", "antigravity", "agy", "models",
-          "model", "latest", "preview", "exp", "chat"}
+# The model's family and maker: not part of the name a member goes by (gpt-6-astra goes by astra,
+# opencode/deepseek-v4.1-flash-free goes by deepseek)
+FAMILY = {"claude", "anthropic", "gpt", "openai", "codex", "gemini", "google", "antigravity", "agy",
+          "opencode", "copilot", "github", "cloudflare", "models", "model", "latest", "preview", "exp", "chat"}
 EXTRA = ["x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8"]     # colours for a member whose own is taken
 
 
@@ -847,27 +1296,27 @@ def table_names(members):
     is not known, keep their own; the rest go by their model, numbered when two share it (astra, astra2)."""
     out, used = {}, set()
     # those at the table first: one that left keeps no name from them (a new opus is @opus, not @opus2)
-    members = [m for m in members if m.seated] + [m for m in members if not m.seated]
-    for m in members:
-        if not m.by_model():
-            out[m.handle] = m.handle
-            used.add(m.handle)
-    words = {}
-    for m in members:
-        if m.handle not in out and m.seated:
-            words.setdefault(m.model_slug(), set()).add(canon(m.runs_on()[0]))
-    for m in members:
-        if m.handle in out:
-            continue
-        w = n = m.model_slug()
-        if len(words.get(w, ())) > 1:         # gpt-6.2-sol and gpt-6-sol: sol-6.2 and sol-6
-            ver = ".".join(t for t in re.split(r"[^a-z0-9.]+", m.runs_on()[0].lower()) if re.search(r"\d", t))
-            n = f"{w}-{ver}" if ver else w
-        k, base = 2, n
-        while n in used:
-            n, k = f"{base}{k}", k + 1
-        out[m.handle] = n
-        used.add(n)
+    for group in ([m for m in members if m.seated], [m for m in members if not m.seated]):
+        for m in group:
+            if not m.by_model():
+                out[m.handle] = m.handle
+                used.add(m.handle)
+        words = {}
+        for m in group:
+            if m.handle not in out:
+                words.setdefault(m.model_slug(), set()).add(canon(m.runs_on()[0]))
+        for m in group:
+            if m.handle in out:
+                continue
+            w = n = m.model_slug()
+            if len(words.get(w, ())) > 1:         # gpt-6.2-sol and gpt-6-sol: sol-6.2 and sol-6
+                ver = ".".join(t for t in re.split(r"[^a-z0-9.]+", m.runs_on()[0].lower()) if re.search(r"\d", t))
+                n = f"{w}-{ver}" if ver else w
+            k, base = 2, n
+            while n in used:
+                n, k = f"{base}{k}", k + 1
+            out[m.handle] = n
+            used.add(n)
     return out
 
 
@@ -886,15 +1335,46 @@ def table_colours(members):
 
 # ---- running one member ------------------------------------------------------------------------------
 RUNNING = {}              # process groups of members at work -> whose, for Ctrl+C and /bench
-LOCK = threading.Lock()
+LOCK = threading.RLock()
+_CGROUP_PREFIX = None     # cached systemd-run prefix for agents-council.slice (or [] if unavailable)
+
+
+def council_cgroup_prefix():
+    """Return a systemd-run prefix placing each turn in agents-council.slice, or [] if unavailable."""
+    global _CGROUP_PREFIX
+    with LOCK:
+        if _CGROUP_PREFIX is not None:
+            return _CGROUP_PREFIX
+        prefix = []
+        if sys.platform == "linux" and not os.environ.get("AFC_COUNCIL_NO_CGROUP"):
+            srun = shutil.which("systemd-run")
+            slice_unit = os.path.join(HOME, ".config", "systemd", "user", "agents-council.slice")
+            cg_parent = f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/agents.slice"
+            if srun and os.path.exists(slice_unit) and os.path.isdir(cg_parent):
+                base = [srun, "--user", "--scope", "--quiet", "--collect",
+                        "--slice=agents-council.slice", "-p", "MemoryMax=2G", "-p", "TasksMax=200"]
+                for extra in (["-p", "OOMPolicy=continue"], []):
+                    try:
+                        r = subprocess.run(base + extra + ["--", "/bin/true"],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                        if r.returncode == 0:
+                            prefix = base + extra + ["--"]
+                            break
+                    except (OSError, subprocess.TimeoutExpired):
+                        break
+        _CGROUP_PREFIX = prefix
+        return _CGROUP_PREFIX
 
 
 def child_env():
     env = dict(os.environ)
-    for k in list(env):     # a run started from inside an agent must not look like part of that agent
-        if k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT") or k.startswith("CLAUDE_CODE_SESSION"):
+    for k in list(env):     # a run started from inside an agent or tmux must not trigger fleet hooks
+        if k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "TMUX", "TMUX_PANE") or \
+                k.startswith("CLAUDE_CODE_SESSION"):
             env.pop(k)
     env["NO_COLOR"] = "1"
+    env["AFC_COUNCIL_CHILD"] = "1"
+    env["AFC_RULES_SKIP"] = "1"
     return env
 
 
@@ -910,6 +1390,17 @@ PERM_TEXT = {
 }
 
 
+def argv_clamp(text, max_bytes=100000):
+    """Ensure a prompt passed via CLI argv never exceeds Linux MAX_ARG_STRLEN (128 KiB)."""
+    raw = (text or "").encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    keep = max_bytes - 64
+    head = raw[:keep // 3].decode("utf-8", errors="ignore")
+    tail = raw[-(keep * 2 // 3):].decode("utf-8", errors="ignore")
+    return head + "\n\n...(truncated for CLI argument length limit)...\n\n" + tail
+
+
 def command(m, prompt, folder, perm="plan"):
     """argv, stdin text, and a file the answer is read from instead of stdout (Codex). perm: plan
     (read-only), edit (may change files, no commands) or bypass (anything, no asking)."""
@@ -923,7 +1414,8 @@ def command(m, prompt, folder, perm="plan"):
                      "--allowedTools", "Read", "Grep", "Glob", "Edit", "Write", "MultiEdit", "WebSearch", "WebFetch",
                      "--disallowedTools", "Bash"]
         else:
-            argv += ["--allowedTools", "Read", "Grep", "Glob", "WebSearch", "WebFetch",
+            argv += ["--permission-mode", "plan",
+                     "--allowedTools", "Read", "Grep", "Glob", "WebSearch", "WebFetch",
                      "--disallowedTools", "Bash", "Edit", "Write", "NotebookEdit"]
         if m.model:
             argv += ["--model", m.model]
@@ -933,27 +1425,55 @@ def command(m, prompt, folder, perm="plan"):
     if m.tool == "codex":
         fd, out = tempfile.mkstemp(prefix="afc-council-", suffix=".txt")
         os.close(fd)
-        mode = (["--dangerously-bypass-approvals-and-sandbox"] if perm == "bypass" else
-                ["--sandbox", "workspace-write" if perm == "edit" else "read-only"])
+        if perm == "bypass":
+            mode = ["--dangerously-bypass-approvals-and-sandbox"]
+        elif perm == "edit":
+            mode = ["--sandbox", "workspace-write", "-c", 'approval_policy="never"', "--disable", "shell_tool"]
+        else:
+            mode = ["--sandbox", "read-only"]
         argv = [AGENTS, "--as", f"codex:{acct}", "exec", *mode, "--skip-git-repo-check",
                 "--ephemeral", "--color", "never", "-C", folder, "-o", out]
         if m.model:
             argv += ["-m", m.model]
         if m.effort:
             argv += ["-c", f'model_reasoning_effort="{m.effort}"']
+        # screenshots the chair pasted (attach_images): Codex cannot open an image from its shell, so
+        # the newest few are attached
+        pics = [x for x in dict.fromkeys(IMG_PATH.findall(prompt)) if os.path.isfile(x)][-4:]
+        argv += [f"--image={x}" for x in pics]
         return argv + ["-"], prompt, out
     if m.tool == "gemini":
         argv = [AGENTS, "--as", f"gemini:{acct}", "--approval-mode",
                 {"bypass": "yolo", "edit": "auto_edit"}.get(perm, "plan"), "--skip-trust",
                 "-p", "Answer as the text above asks."]
+        if IMG_PATH.search(prompt):           # pasted screenshots: Gemini may read only from included folders
+            argv += ["--include-directories", IMAGES]
         if m.model:
             argv += ["-m", m.model]
         return argv, prompt, None
+    if m.tool == "copilot":
+        argv = [AGENTS, "--as", f"copilot:{acct}", "--output-format", "text", "-s", "--no-ask-user"]
+        if perm == "bypass":
+            argv += ["--allow-all"]
+        elif perm == "edit":
+            argv += ["--allow-all-tools", "--deny-tool", "shell"]
+        else:
+            argv += ["--mode", "plan"]
+        if m.model:
+            argv += ["--model", m.model]
+        return argv + ["-p", argv_clamp(prompt)], "", None
+    if m.tool == "opencode":
+        argv = [AGENTS, "--as", f"opencode:{acct}", "run", "--standalone", "--archived"]
+        if perm == "bypass":
+            argv += ["--auto"]
+        if m.model:
+            argv += ["-m", m.model]
+        return argv + [argv_clamp(prompt)], "", None
     # plan = read-only. Not with --disable-slash-commands: Antigravity ignores --mode then (our prompts
     # never start with a slash anyway)
     mode = (["--dangerously-skip-permissions"] if perm == "bypass" else
             ["--mode", "accept-edits" if perm == "edit" else "plan"])
-    argv = [AGENTS, "--as", f"agy:{acct}", *mode, "-p", prompt]
+    argv = [AGENTS, "--as", f"agy:{acct}", *mode, "-p", argv_clamp(prompt)]
     model, effort = agy_model(m.model, m.effort)
     if model:
         argv += ["--model", model]
@@ -987,7 +1507,8 @@ def ask(m, prompt, folder, timeout, perm="plan"):
     except Exception as e:  # noqa: BLE001
         return "", f"could not start: {e}"
     try:
-        p = subprocess.Popen(argv, cwd=folder, env=child_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        p = subprocess.Popen(council_cgroup_prefix() + argv, cwd=folder, env=child_env(),
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, start_new_session=True)
     except OSError as e:
         return "", f"could not start: {e}"
@@ -997,7 +1518,14 @@ def ask(m, prompt, folder, timeout, perm="plan"):
         out, err = p.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
         stop_group(p.pid)
-        p.communicate()
+        try:
+            p.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            stop_group(p.pid, signal.SIGKILL)
+            try:
+                p.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
         return "", f"no answer within {timeout} s"
     finally:
         with LOCK:
@@ -1059,24 +1587,24 @@ def error_of(err, prompt):
     return " | ".join(pick)[:300]
 
 
-def stop_group(pid):
+def stop_group(pid, sig=signal.SIGTERM):
     try:
-        os.killpg(pid, signal.SIGTERM)
+        os.killpg(pid, sig)
     except OSError:
         pass
 
 
-def stop_member(handle):
+def stop_member(handle, sig=signal.SIGTERM):
     # no LOCK: a copy of the dict is one step under the GIL, and Ctrl+C's handler may run while
     # this thread holds LOCK
     pids = [pid for pid, h in list(RUNNING.items()) if h == handle]
     for pid in pids:
-        stop_group(pid)
+        stop_group(pid, sig)
 
 
-def stop_all():
+def stop_all(sig=signal.SIGTERM):
     for pid in list(RUNNING):
-        stop_group(pid)
+        stop_group(pid, sig)
 
 
 def room():
@@ -1086,6 +1614,74 @@ def room():
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return "" if r.returncode == 0 else (r.stdout.strip() or "the fleet's memory wall is up")
+
+
+def say_now(text):
+    """A note shown at once, also from inside a command, whose own output boxed() holds back until
+    the command is done: for a wait the chair should know about while it lasts."""
+    if BOX["on"] and TTY:
+        with LOCK:
+            BOX["note"] = ANSI.sub("", text).strip()
+            show_note(BOX["note"])
+        return
+    out = sys.stdout
+    with contextlib.redirect_stdout(out.real if isinstance(out, ThreadOutput) else out):
+        note(text)
+
+
+# What a failed check before seating says, by the kind diagnose() finds (an answer that reads as one
+# of the first four is a failure too: some LLMs print a spent limit as their answer, exit code 0)
+PROBE_FAILS = ("signed out", "limit hit", "model refused", "no connection")
+PROBE_SAYS = {"signed out": "its account needs signing in again (agents --as {tool}:{acct})",
+              "limit hit": "its plan or rate limit is spent: wait, or pick another account or model",
+              "model refused": "that model is refused: pick another",
+              "no connection": "no connection to its service",
+              "too slow": "no answer within {t} s",
+              "memory wall": "the fleet is out of memory room: close a split first",
+              "empty answer": "it answered nothing"}
+
+
+def check_before_seating(m, folder):
+    """Before a member joins the table (+ add, /agent new or more, /seat): one short question to it,
+    run the way its turns run (its LLM, account, model and effort; read-only), so that one that
+    cannot answer is not seated: signed out, plan or rate limit spent, model refused, no connection,
+    too slow, or any other failure. '' when it answered, else what the chat says instead. Costs one
+    short request of that LLM (operator, 2026-11-24: check the agent or model before adding it). The
+    account list's "not signed in" is not taken on trust (/seat is how to try such a seat anyway): the
+    question shows whether it can answer, and a real sign-in problem comes back as its own error."""
+    who = m.label()
+    if not m.account:
+        return f"{who} was not added: {TOOLS[m.tool]} has no account in the fleet's list (agents --accounts)."
+    full = room()
+    if full:
+        return f"{who} was not added: {full}."
+    say_now(f"Checking {who} before it joins: one short question (up to {PROBE_TIMEOUT} s)…")
+    STOP.clear()
+    with LOCK:
+        ROUNDS[0] += 1
+        BUSY.set()
+    try:
+        answer, problem = ask(m, PROBE, folder, PROBE_TIMEOUT)
+    except KeyboardInterrupt:
+        stop_member(m.handle)
+        return f"{who} was not added: check cancelled."
+    finally:
+        with LOCK:
+            ROUNDS[0] -= 1
+            if not ROUNDS[0]:
+                BUSY.clear()
+    if STOP.is_set() and not answer:
+        STOP.clear()
+        return f"{who} was not added: check cancelled."
+    if not problem:
+        head = answer[:400]
+        if re.search(r"\bok(ay)?\b", head, re.I) or diagnose(head)[0] not in PROBE_FAILS:
+            return ""
+        problem = head
+    kind = diagnose(problem)[0]
+    why = PROBE_SAYS.get(kind, "it failed").format(tool=m.tool, acct=m.account or "<account>", t=PROBE_TIMEOUT)
+    said = re.sub(r"\s+", " ", problem).strip()[:180]
+    return f"{who} was not added: {why}. {TOOLS[m.tool]} said: {said}"
 
 
 # ---- the meeting ---------------------------------------------------------------------------------------
@@ -1121,8 +1717,11 @@ class Meeting:
         self.general = self.home == GENERAL
         self.dir = None
         self.mode = conf.get("mode", "order")
-        self.rounds = 0 if TTY else 1    # passes round the table per message: 0 = until Ctrl+C, -1 = none
-        self.roasts = 0 if TTY else 1    # roast rounds per message; 0 = until Ctrl+C
+        self.rounds = 2 if TTY else 1    # passes round the table per message: 0 = until Ctrl+C, -1 = none
+        self.roasts = 2 if TTY else 1    # roast rounds per message; 0 = until Ctrl+C
+        for k in ("rounds", "roasts"):    # /rounds is kept per project (operator, 2026-11-24)
+            if isinstance(conf.get(k), int):
+                setattr(self, k, conf[k])
         self.at = 0                      # the roast round being run, for its labels
         self.topic = ""
         self.thread = []      # {"who": handle or "chair", "name", "text", "phase"}
@@ -1176,6 +1775,10 @@ class Meeting:
         self.dir, self.file = new, os.path.join(new, "thread.md")
         if self.general:
             self.folder = new
+            try:
+                os.chdir(new)
+            except OSError:
+                pass
 
     def close_session(self):
         """A meeting nobody said anything in leaves no folder behind (only an empty one is removed)."""
@@ -1217,33 +1820,47 @@ class Meeting:
     def name_of(self, e):
         """The name a message's member goes by now (one saved before a rename shows the new name);
         a member no longer at the table: the name it had."""
-        m = next((x for x in self.members if x.handle == e.get("who")), None)
+        with LOCK:
+            members = list(self.members)
+        m = next((x for x in members if x.handle == e.get("who")), None)
         return m.shown() if m else (e.get("as") or e.get("who", "?"))
 
     def seated(self):
-        return [m for m in self.members if m.seated]
+        with LOCK:
+            return [m for m in self.members if m.seated]
 
     def find(self, word):
         """A member by the name it goes by (its model), its own name, or the LLM's ("claude" finds
         the one going by "opus" too)."""
         w = ALIAS.get(word.lower(), word.lower())
-        for m in self.members:
+        with LOCK:
+            members = list(self.members)
+        for m in members:
             if handle_of(word) in (handle_of(m.shown()), m.full_model() if m.by_model() else None):
                 return m
-        for m in self.members:
+        for m in members:
             if m.handle == w or handle_of(m.name) == handle_of(word):
                 return m
         return None
 
     # -- what a member reads
     def transcript(self, limit=KEEP_CHARS):
+        with LOCK:
+            snap = list(self.thread)
         lines = []
-        for e in self.thread:
+        for e in snap:
             if e.get("problem"):
                 continue          # a skipped or failed run is shown to you, not read out to the others
-            who = "Chair (the human running this meeting)" if e["who"] == "chair" else f"@{self.name_of(e)}"
+            if e["who"] == "chair":
+                who = "Chair (the human running this meeting)"
+            else:
+                cur = self.name_of(e)
+                old = e.get("as")
+                who = f"@{cur} (formerly @{old})" if old and old != cur else f"@{cur}"
             tag = {"roast": " [roast" + (f" {e['round']}" if e.get("round", 1) > 1 else "") + "]",
-                   "table": " [round table]"}.get(e.get("phase"), "")
+                   "table": " [round table" + (f" {e['round']}" if e.get("round", 1) > 1 else "") + "]",
+                   "verdict": " [verdict]", "bp": " [debate]", "stake": " [win stake]"}.get(
+                       e.get("phase"), "")
             lines.append(f"{who}{tag}: {e['text']}")
         text = "\n\n".join(lines)
         if len(text) > limit:
@@ -1273,11 +1890,12 @@ class Meeting:
                 parts.append("To keep something for the next meeting here, end your answer with lines starting "
                              "'Remember:' (one short fact each), only what is worth keeping.")
                 if "remove" in getattr(m, "powers", []):
-                    parts.append("You have the power to take a member off the table on your own judgement, without "
-                                 "the chair asking: end your answer with a line 'Remove: @name - why' (one per member). "
-                                 "Use it rarely and only with a reason you state: bad faith, derailing, repeating "
-                                 "itself, refusing the chair. It takes effect at once: an agent removed is deleted "
-                                 "for good with its memory wiped.")
+                    parts.append(f"You may give a strike to a member that does not serve the chair's purpose, on your "
+                                 f"own judgement, without the chair asking: end your answer with a line 'Strike: @name "
+                                 f"- why' (one per member). Use it only with a reason you state: bad faith, derailing, "
+                                 f"off the chair's purpose, repeating itself, refusing the chair. At {STRIKES} strikes "
+                                 f"the council removes that member: an agent is deleted for good with its memory "
+                                 f"wiped, an LLM's own seat leaves the table. " + self.strike_board())
                 who += ". " + "\n".join(parts)
         else:
             who += f" ({TOOLS[m.tool]})"
@@ -1287,7 +1905,7 @@ class Meeting:
         return (f"{who}. You are one member of a council of AI models and agents in a group chat, chaired by a "
                 f"human. At the table: {roster}.\n\n{RULES.replace('WORDS', str(self.words())).replace('PERMS', PERM_TEXT[self.perm_of(m)])}\n\nTopic: {topic}\n\n"
                 f"--- The thread so far ---\n"
-                f"{self.transcript(30000 if m.tool == 'agy' else KEEP_CHARS)}\n--- End of the thread ---\n\n{task}")
+                f"{self.transcript(28000 if m.tool in ('agy', 'copilot', 'opencode') else KEEP_CHARS)}\n--- End of the thread ---\n\n{task}")
 
     # -- one member's turn, shown and kept
     def speak(self, m, task, phase, prompt=None, rnd=None):
@@ -1317,7 +1935,7 @@ class Meeting:
             return                      # stopped by Ctrl+C (or a new meeting): a run cut short says nothing
         # an answer that starts by copying the thread's own "@name:" line loses it
         answer = re.sub(r"^\s*\**@(" + re.escape(m.handle) + "|" + re.escape(m.shown()) +
-                        r")\**\s*(\[[a-z ]+\])?\s*:\s*", "", answer)
+                        r")\**\s*(\[[a-z0-9 ]+\])?\s*:\s*", "", answer)
         answer = tidy(answer)
         if m.made and m.persona and answer:
             keep = [x.strip() for x in re.findall(r"(?im)^[ \t>*_-]*remember[*_]*\s*:\s*(.+)$", answer)]
@@ -1326,10 +1944,12 @@ class Meeting:
                 answer = re.sub(r"(?im)^[ \t>*_-]*remember[*_]*\s*:.*(\n|$)", "", answer).strip()
         removals = []
         if "remove" in getattr(m, "powers", []) and answer:
-            line = r"(?im)^[ \t>*_-]*remove[*_]*\s*:\s*@?([\w.-]+)[ \t]*(?:[-–—:][ \t]*)?(.*)$"
+            # 'Strike: @name - why' (a 'Remove:' line counts as a strike too). Must be on its own top-level line
+            # (not inside a > blockquote or - bullet)
+            line = r"(?im)^[ \t]*\*{0,2}(?:strike|remove)\*{0,2}[ \t]*:[ \t]*@?([\w.-]+)[ \t]*(?:[-–—:][ \t]*)?(.*)$"
             removals = [(x.group(1), x.group(2).strip()) for x in re.finditer(line, answer)]
-            answer = re.sub(line, lambda x: f"⚖ Removed @{x.group(1)}" + (f": {x.group(2).strip()}"
-                                                                            if x.group(2).strip() else "."), answer)
+            answer = re.sub(line, lambda x: f"⚖ Strike for @{x.group(1)}" + (f": {x.group(2).strip()}"
+                                                                               if x.group(2).strip() else "."), answer)
         if problem and not answer:
             self.add(m, f"({problem})", phase, problem=True, rnd=rnd)
             self.alert(m, problem)
@@ -1337,7 +1957,59 @@ class Meeting:
             FAILS[m.handle] = 0
             self.add(m, answer + (f"\n({problem})" if problem else ""), phase, rnd=rnd)
         for word, why in removals:
-            self.judge_remove(m, word, why)
+            self.strike(m, word, why)
+
+    def strike_board(self):
+        """The strikes standing, for the prompt of an agent with the remove power."""
+        got = []
+        for h, n in (self.conf.get("strikes") or {}).items():
+            if not n:
+                continue
+            m = self.find(h)
+            if m:
+                got.append((m.shown(), n))
+        if not got:
+            return "Nobody has a strike yet."
+        return "Strikes so far: " + ", ".join(f"@{name} {n}/{STRIKES}" for name, n in got) + "."
+
+    def strike(self, by, word, why):
+        """A strike from an agent with the remove power; at STRIKES the member is removed (judge_remove).
+        Kept per project, so strikes carry from one meeting to the next. Never itself, never someone not
+        at the table."""
+        with LOCK:
+            m = self.find(word)
+            if not m or m is by or not m.seated:
+                return
+            got = self.conf.setdefault("strikes", {})
+            got[m.handle] = got.get(m.handle, 0) + 1
+            n = got[m.handle]
+            if n >= STRIKES:
+                got.pop(m.handle, None)
+            save_conf(self.conf)
+        if n >= STRIKES:
+            note(f"⚖ @{by.shown()}: strike {n} of {STRIKES} for @{m.shown()}" + (f" ({fit(why, 80)})" if why else "") +
+                 ": out.")
+            self.judge_remove(by, word, why)
+        else:
+            note(f"⚖ @{by.shown()}: strike {n} of {STRIKES} for @{m.shown()}" + (f" ({fit(why, 80)})" if why else "") +
+                 f". {STRIKES - n} more and it is removed.")
+
+    def judges(self):
+        """Members with the judge power: they sit out the round and give their verdict when it ends."""
+        return [m for m in self.seated() if "judge" in getattr(m, "powers", [])]
+
+    def judge_round(self, judges, live):
+        """After a round: each judge, last, weighs what was said and gives its verdict (and strikes)."""
+        task = ("The round is over. You are the judge and speak last: weigh what each member said this round, "
+                "by @name, against the chair's purpose: who served it, who was right, who was wrong, and the one "
+                "point that decided it. Then give your verdict.")
+        for j in judges:
+            if STOP.is_set() or not live() or not j.seated:
+                break
+            set_status([j.handle])
+            self.speak(j, task, "verdict")
+        set_status([])
+        self.save()
 
     def judge_remove(self, by, word, why):
         """An agent with the remove power removes a member on its own judgement, its run stopped and the grid
@@ -1345,42 +2017,45 @@ class Meeting:
         agents list, its folder here (soul, character, rules, memory) erased, not moved aside. An LLM's own
         seat (your account, nothing of it to delete) leaves the table; + add brings it back. Never itself,
         never someone not at the table."""
-        m = self.find(word)
-        if not m or m is by or not m.seated:
-            return
-        name = m.shown()
-        m.seated = False
-        stop_member(m.handle)
-        if m.made:
-            self.conf["agents"] = [a for a in self.conf["agents"] if a["name"] != m.name]
-            (self.conf.get("agent_perm") or {}).pop(m.name, None)
-            (self.conf.get("seats") or {}).pop(m.handle, None)
-            top, d = agents_dir(self.owner), agent_dir(self.owner, m.name)
-            if os.path.isdir(d) and os.path.exists(os.path.join(top, AGENT_MARK)) and \
-                    os.path.realpath(d).startswith(os.path.realpath(top) + os.sep):
-                shutil.rmtree(d, ignore_errors=True)       # its memory wiped, as the chair ordered for this power
-            if m in self.members:
-                self.members.remove(m)
-            what = "removed for good, its memory wiped"
-        else:
-            self.conf.setdefault("seats", {})[m.handle] = False
-            what = "taken off the table (an LLM's own seat: + add brings it back)"
-        save_conf(self.conf)
+        with LOCK:
+            m = self.find(word)
+            if not m or m is by or not m.seated:
+                return
+            name = m.shown()
+            m.seated = False
+            stop_member(m.handle)
+            if m.made:
+                self.conf["agents"] = [a for a in self.conf["agents"] if a["name"] != m.name]
+                (self.conf.get("agent_perm") or {}).pop(m.name, None)
+                (self.conf.get("seats") or {}).pop(m.handle, None)
+                top, d = agents_dir(self.owner), agent_dir(self.owner, m.name)
+                if os.path.isdir(d) and os.path.exists(os.path.join(top, AGENT_MARK)) and \
+                        os.path.realpath(d).startswith(os.path.realpath(top) + os.sep):
+                    shutil.rmtree(d, ignore_errors=True)       # its memory wiped, as the chair ordered for this power
+                if m in self.members:
+                    self.members.remove(m)
+                what = "removed for good, its memory wiped"
+            else:
+                self.conf.setdefault("seats", {})[m.handle] = False
+                what = "taken off the table (an LLM's own seat: + add brings it back)"
+            save_conf(self.conf)
         note(f"⚖ @{by.shown()}: @{name} {what}" + (f" ({fit(why, 80)})" if why else "") + ".")
         if GRID[0] and FEED["grid"] and GRID[0].me:
-            GRID[0].open(self)
+            if BOX["on"]:
+                send_cmd_now(GRID[0].me, "/grid refresh")
+            else:
+                GRID[0].open(self)
 
     def alert(self, m, problem):
-        """A member's run went wrong: say so where you type, with what to do; the second time in a
-        row, ask (a pop-up in the grid: try again, change its model, take it off the table, leave it)."""
+        """A member's run went wrong: say so on the note line with what to do (never steals focus
+        with a modal pop-up from a background thread while you are typing)."""
         kind, advice = diagnose(problem)
         with LOCK:
             FAILS[m.handle] = FAILS.get(m.handle, 0) + 1
             n = FAILS[m.handle]
             LAST_FAIL[m.handle] = problem
-        note(f"⚠ @{m.shown()}: {kind} ({fit(problem, 70)}) · {advice.replace('{m}', '@' + m.shown())}")
-        if n == 2 and BOX["on"] and GRID[0]:
-            ask_what_now(m, kind, problem)
+        extra = " · repeated failure: Alt+M to change model, or /bench" if n >= 2 else ""
+        note(f"⚠ @{m.shown()}: {kind} ({fit(problem, 65)}) · {advice.replace('{m}', '@' + m.shown())}{extra}")
 
     def add(self, m, text, phase, problem=False, rnd=None):
         e = {"who": m.handle, "as": m.shown(), "name": m.name, "text": text, "phase": phase, "problem": problem}
@@ -1396,11 +2071,339 @@ class Meeting:
             emit(dict(e, t="msg", kind=m.colour()))
 
     # -- a round
+    # -- formats (/format): Open Forum is the modes; these two run a set course and end with a judge
+    def format(self):
+        f = self.conf.get("format") or "forum"
+        return f if f in FORMATS else "forum"
+
+    def stake_rounds(self):
+        """Win Stake's rounds: its own setting (/rounds N while Win Stake is on), 1 to 12, 3 by default."""
+        try:
+            return max(1, min(12, int(self.conf.get("stake_rounds") or 3)))
+        except (TypeError, ValueError):
+            return 3
+
+    def adjudicators(self):
+        """Who judges a BP debate or a Win Stake: members with the judge power, else those with the
+        remove power (Supra Omnia, the council's final judge)."""
+        return self.judges() or [m for m in self.seated() if "remove" in getattr(m, "powers", [])]
+
+    def format_round(self, targets, gen):
+        def live():
+            return gen is None or gen == GEN[0]
+        adj = self.adjudicators()
+        players = [m for m in targets if m not in adj] or [m for m in self.seated() if m not in adj]
+        if len(players) < 2:
+            note("This format needs at least two members besides the judge: + add someone.")
+            return
+        if self.format() == "bp":
+            cast = self.bp_cast(players)
+            if len(cast) < 8:
+                note(f"A BP debate has 8 speakers; {len(cast)} are at the table besides the judge, so "
+                     f"{', '.join(r[0] for r in BP_ROLES[len(cast):])} stay empty. + add more for a full debate.")
+            task = self.bp_debate(cast, live)
+            rest = [m for m in players if m not in [x for _r, x in cast]]
+            if rest:
+                note("Only 8 speak in a BP debate: " + " ".join("@" + m.shown() for m in rest) + " listened.")
+        else:
+            task = self.win_stake(players, live)
+        if not task or STOP.is_set() or not live():
+            set_status([])
+            self.save()
+            return
+        if adj:
+            for j in adj:
+                if STOP.is_set() or not live() or not j.seated:
+                    break
+                set_status([j.handle])
+                self.speak(j, task, "verdict")
+        else:
+            note("No judge at the table (/agent power NAME judge on, or seat Supra Omnia): no verdict this time.")
+        set_status([])
+        self.save()
+
+    def bp_cast(self, players=None):
+        """[(role, member)] in speaking order: the roles set with /bp (or its menu) first, the rest filled
+        by seat order from those not judging. At most 8."""
+        adj = self.adjudicators()
+        players = players if players is not None else [m for m in self.seated() if m not in adj]
+        chosen = self.conf.get("bp_cast") or {}
+        taken, cast = set(), {}
+        for abbr, *_x in BP_ROLES:
+            m = self.find(chosen.get(abbr, "")) if chosen.get(abbr) else None
+            if m and m in players and m.handle not in taken:
+                cast[abbr] = m
+                taken.add(m.handle)
+        free = [m for m in players if m.handle not in taken]
+        out = []
+        for role in BP_ROLES:
+            m = cast.get(role[0]) or (free.pop(0) if free else None)
+            if m:
+                out.append((role, m))
+        return out
+
+    def bp_debate(self, cast, live):
+        """British Parliamentary: the chair's message is the motion; each speaker in BP order (cast: the
+        [(role, member)] of bp_cast), one by one, each hearing the speeches before it. Returns the judge's
+        task, or '' when it was cut short."""
+        benches = {}
+        for (abbr, _name, bench, _job), m in cast:
+            benches.setdefault(bench, []).append(f"@{m.shown()} ({abbr})")
+        note("BP debate · " + " · ".join(f"{b}: {', '.join(w)}" for b, w in benches.items()))
+        for (abbr, name, bench, job), m in cast:
+            if STOP.is_set() or not live():
+                return ""
+            if not m.seated:
+                continue
+            task = (f"British Parliamentary debate. The motion is the chair's latest message. You are the {name} "
+                    f"({abbr}), {bench}. {job} Argue your bench's side whatever you think yourself, and answer "
+                    f"the speeches before yours by @name. Start with [{abbr}]. For this BP speech, up to "
+                    f"{2 * self.words()} words (overrides the default word limit).")
+            set_status([m.handle])
+            self.speak(m, task, "bp")
+        roll = "; ".join(f"{b}: {', '.join(w)}" for b, w in benches.items())
+        return ("The British Parliamentary debate is over; you adjudicate it. The benches: " + roll + ". Rank the "
+                "benches 1st to last, each with one or two sentences on why (the clash they won or lost, by "
+                "@name). Name the best speaker. End with one line starting 'Verdict:' saying which side carried "
+                "the motion.")
+
+    def win_stake(self, players, live):
+        """Win Stake: every round, everyone at once tries to win everyone over; the last round ends in a
+        vote for who convinced each most (never itself). Returns the judge's task with the count, or ''."""
+        n = self.stake_rounds()
+        note(f"Win Stake · {len(players)} players · {n} round{'s' if n != 1 else ''} · then the vote")
+        player_handles = {m.handle for m in players}
+        last_start = len(self.thread)
+        for k in range(1, n + 1):
+            if STOP.is_set() or not live():
+                return ""
+            if k == n:
+                last_start = len(self.thread)
+            if k == 1:
+                task = (f"Win Stake, round 1 of {n}: the stake is the chair's latest message. Make the case that "
+                        "will win every other member over to your answer.")
+            else:
+                task = (f"Win Stake, round {k} of {n}: win the others over. Answer their cases by @name, show why "
+                        "yours is stronger, concede only what is right. New points only.")
+            if k == n:
+                task += (" This is the last round: end with one line 'Vote: @name' naming the member, not "
+                         "yourself, whose case convinced you most.")
+            self.parallel(players, lambda m, t=task: t, "stake", label=f"  ─── win stake {k}/{n} ───", live=live)
+        if STOP.is_set() or not live():
+            return ""
+        votes, cast = {}, {}
+        with LOCK:
+            tail = list(self.thread[last_start:])
+        for e in reversed(tail):
+            if e.get("phase") != "stake" or e.get("problem") or e["who"] not in player_handles or e["who"] in cast:
+                continue
+            got = re.findall(r"\bvote\b[^@\n]{0,16}@([\w.-]+)", e["text"], re.I)
+            to = self.find(got[-1].rstrip(".-")) if got else None
+            if to and to.handle != e["who"] and to in players:
+                cast[e["who"]] = to.handle
+                votes[to.handle] = votes.get(to.handle, 0) + 1
+        if not votes:
+            note("No votes came in.")
+            return ("Win Stake is over. No valid 'Vote: @name' lines came in. Decide the winner on the strength "
+                    "of the cases, sum up each of the top 3 in two or three sentences by @name, and end with "
+                    "one line starting 'Verdict:'.")
+        ranked = sorted(votes.items(), key=lambda kv: -kv[1])
+        count = ", ".join(f"@{(self.find(h).shown() if self.find(h) else h)} {v}" for h, v in ranked)
+        note(f"⚖ Votes: {count}" + (f" · {len(players) - len(cast)} did not vote" if len(cast) < len(players) else ""))
+        return (f"Win Stake is over. The votes, counted from each member's 'Vote:' line: {count}. Announce the "
+                "winner: the most votes; on a tie, you decide by the strength of the cases and say so. Then sum "
+                "up the case of each of the top 3 in two or three sentences each, by @name. End with one line "
+                "starting 'Verdict:'.")
+
+    def sim_outcome(self, fmt, entries, players, trial):
+        """Extract a normalized outcome dict from one isolated Monte Carlo trial's entries."""
+        verdicts = [e["text"].strip() for e in entries if e.get("phase") == "verdict" and not e.get("problem")]
+        vline = ""
+        if verdicts:
+            m_v = re.search(r"(?im)^\s*\*{0,2}verdict\*{0,2}\s*[:—–-]\s*(.+)$", verdicts[-1])
+            vline = fit(m_v.group(1) if m_v else verdicts[-1].splitlines()[0], 110)
+        if fmt == "stake":
+            player_handles = {m.handle for m in players}
+            votes, cast = {}, {}
+            for e in reversed(entries):
+                if e.get("phase") != "stake" or e.get("problem") or e["who"] not in player_handles or e["who"] in cast:
+                    continue
+                got = re.findall(r"\bvote\b[^@\n]{0,16}@([\w.-]+)", e["text"], re.I)
+                to = trial.find(got[-1].rstrip(".-")) if got else None
+                if to and to.handle != e["who"] and to in players:
+                    cast[e["who"]] = to.handle
+                    votes[to.handle] = votes.get(to.handle, 0) + 1
+            if votes:
+                top_v = max(votes.values())
+                tops = sorted(h for h, v in votes.items() if v == top_v)
+                name_of_h = lambda h: "@" + (self.find(h).shown() if self.find(h) else h)
+                label = name_of_h(tops[0]) if len(tops) == 1 else "tie: " + "/".join(name_of_h(h) for h in tops)
+            else:
+                label = "no votes"
+            return {"label": label, "votes": votes, "verdict": vline}
+        if fmt == "bp":
+            src = vline or (verdicts[-1] if verdicts else "")
+            bench = ""
+            m_b = re.search(r"\b(OG|OO|CG|CO|Opening Government|Opening Opposition|Closing Government|Closing Opposition)\b",
+                            src, re.I)
+            if m_b:
+                raw = m_b.group(1).lower()
+                bench = {"og": "OG", "oo": "OO", "cg": "CG", "co": "CO",
+                         "opening government": "OG", "opening opposition": "OO",
+                         "closing government": "CG", "closing opposition": "CO"}.get(raw, raw.upper())
+            side = ""
+            if bench in ("OG", "CG") or re.search(r"\b(government|prop(?:osition)?)\b", src, re.I):
+                side = "Government"
+            if bench in ("OO", "CO") or (not side and re.search(r"\bopp(?:osition)?\b", src, re.I)):
+                side = "Opposition"
+            if side and bench:
+                label = f"{side} ({bench})"
+            elif side:
+                label = side
+            elif bench:
+                label = bench
+            else:
+                label = fit(src, 48) if src else "no verdict"
+            return {"label": label, "side": side, "bench": bench, "verdict": vline}
+        # Open Forum: tally judge Verdict: (if present) or lead consensus stance
+        if vline:
+            m_yn = re.match(r"^\s*(yes|no|for|against|approve|reject)\b", vline, re.I)
+            label = m_yn.group(1).capitalize() if m_yn else fit(vline, 48)
+        else:
+            replies = [e["text"].strip() for e in entries if e.get("who") != "chair" and not e.get("problem")]
+            label = fit(replies[-1].splitlines()[0], 48) if replies else "no answers"
+        return {"label": label, "verdict": vline}
+
+    def format_sim_summary(self, fmt, n, question, results):
+        """Render the aggregated Monte Carlo summary across completed trials."""
+        done = len(results)
+        head = (f"Monte Carlo ({done}/{n} trial{'s' if n != 1 else ''}"
+                + (", stopped early" if done < n else "")
+                + f" · {FORMAT_SHOWN[fmt]}): “{fit(question, 72)}”")
+        if not results:
+            return head + "\nNo trials completed."
+        counts = {}
+        for r in results:
+            counts[r["label"]] = counts.get(r["label"], 0) + 1
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        lines = [head]
+        top_lbl, top_c = ranked[0]
+        pct = round(100 * top_c / done)
+        lines.append(f"Distribution: " + " · ".join(f"{k} {v}/{done} ({round(100 * v / done)}%)" for k, v in ranked))
+        lines.append(f"Stability: {top_lbl} led {top_c}/{done} trials ({pct}% agreement)")
+        if fmt == "bp":
+            sides = {}
+            benches = {}
+            for r in results:
+                if r.get("side"):
+                    sides[r["side"]] = sides.get(r["side"], 0) + 1
+                if r.get("bench"):
+                    benches[r["bench"]] = benches.get(r["bench"], 0) + 1
+            if sides:
+                lines.append("Sides: " + " · ".join(f"{k} {v}/{done} ({round(100 * v / done)}%)"
+                                                    for k, v in sorted(sides.items(), key=lambda kv: -kv[1])))
+            if benches:
+                lines.append("Benches: " + " · ".join(f"{k} {v}" for k, v in sorted(benches.items(), key=lambda kv: -kv[1])))
+        elif fmt == "stake":
+            tot = {}
+            for r in results:
+                for h, v in (r.get("votes") or {}).items():
+                    tot[h] = tot.get(h, 0) + v
+            if tot:
+                tr = sorted(tot.items(), key=lambda kv: (-kv[1], kv[0]))
+                lines.append("Total votes: " + " · ".join(
+                    f"@{(self.find(h).shown() if self.find(h) else h)} {v}" for h, v in tr))
+        for i, r in enumerate(results, 1):
+            extra = f" — {r['verdict']}" if r.get("verdict") and r["verdict"] != r["label"] else ""
+            lines.append(f"  Trial {i}: {r['label']}{extra}")
+        return "\n".join(lines)
+
+    def simulate(self, n, question, targets, base_thread=None, gen=None):
+        """Run n independent Monte Carlo trials of question in the current format without cross-trial
+        anchoring, then append and save the aggregated distribution."""
+        def live():
+            return gen is None or gen == GEN[0]
+        if not targets:
+            note("Nobody at the table to simulate. /agents shows who is benched; /seat NAME brings one back.")
+            return ""
+        fmt = self.format()
+        adj = self.adjudicators()
+        players = [m for m in targets if m not in adj] or [m for m in self.seated() if m not in adj]
+        if fmt in ("bp", "stake") and len(players) < 2:
+            note("This format needs at least two members besides the judge: + add someone.")
+            return ""
+        base = list(base_thread) if base_thread is not None else list(self.thread)
+        results = []
+        with LOCK:
+            ROUNDS[0] += 1
+            BUSY.set()
+        try:
+            for k in range(1, n + 1):
+                if STOP.is_set() or not live():
+                    break
+                if not FEED["grid"]:
+                    with LOCK:
+                        clear_status()
+                        print(paint(f"  ─── sim {k}/{n} ({FORMAT_SHOWN[fmt]}) ───", "note"), flush=True)
+                else:
+                    note(f"🎲 Sim {k}/{n} ({FORMAT_SHOWN[fmt]})…")
+                trial_conf = dict(self.conf)
+                if fmt == "bp" and not self.conf.get("bp_cast") and k > 1 and len(players) > 1:
+                    perm = list(players)
+                    random.shuffle(perm)
+                    trial_conf["bp_cast"] = {BP_ROLES[i][0]: perm[i].handle
+                                             for i in range(min(len(BP_ROLES), len(perm)))}
+                trial = Meeting(self.folder, self.members, trial_conf)
+                trial.mode, trial.rounds, trial.roasts, trial.topic = self.mode, self.rounds, self.roasts, self.topic
+                trial.thread = list(base) + [{"who": "chair", "name": "Chair", "text": question, "phase": "chair"}]
+                trial.save = lambda: None
+                trial.open_session = lambda *_a, **_kw: None
+                start_idx = len(trial.thread)
+                trial.round(targets, fresh=True, gen=gen)
+                entries = trial.thread[start_idx:]
+                answered = [e for e in entries if e.get("who") != "chair" and not e.get("problem")]
+                if STOP.is_set() and not answered:
+                    break
+                results.append(self.sim_outcome(fmt, entries, players, trial))
+            summary = self.format_sim_summary(fmt, n, question, results)
+            entry = {"who": "sim", "as": "sim", "name": "Monte Carlo", "text": summary, "phase": "sim"}
+            with LOCK:
+                self.thread.append(entry)
+                clear_status()
+                show(entry)
+                emit(dict(entry, t="msg", kind="chair"))
+            if BOX["on"]:
+                headline = summary.splitlines()[1] if len(summary.splitlines()) > 1 else summary
+                BOX["note"] = f"🎲 {fit(headline, 110)}"
+                show_note(BOX["note"])
+            self.save()
+            return summary
+        finally:
+            set_status([])
+            with LOCK:
+                ROUNDS[0] -= 1
+                if not ROUNDS[0]:
+                    BUSY.clear()
+
     def round(self, targets, fresh, gen=None):
         with LOCK:
             ROUNDS[0] += 1
             BUSY.set()
         try:
+            # A judge (the judge power) sits the round out and gives its verdict when the round ends;
+            # a message the chair sends to the judges alone (or one single member) is answered directly
+            judges = self.judges()
+            if self.format() in ("bp", "stake"):
+                adj = self.adjudicators()
+                if (adj and all(m in adj for m in targets)) or len(targets) == 1:
+                    self.round_(targets, fresh, gen)
+                    return
+                self.format_round(targets, gen)
+                return
+            if judges and not all(m in judges for m in targets):
+                self.round_([m for m in targets if m not in judges], fresh, gen, skip=judges)
+                self.judge_round(judges, lambda: gen is None or gen == GEN[0])
+                return
             self.round_(targets, fresh, gen)
         finally:
             with LOCK:
@@ -1408,7 +2411,7 @@ class Meeting:
                 if not ROUNDS[0]:
                     BUSY.clear()
 
-    def round_(self, targets, fresh, gen=None):
+    def round_(self, targets, fresh, gen=None, skip=()):
         """targets: the members to hear from; fresh: the chair has just spoken (else: another round).
         gen: the message this round is for (the grid); once a newer one is sent, this round starts no
         more turns (the ones already at work still answer)."""
@@ -1417,13 +2420,13 @@ class Meeting:
         if not targets:
             note("Nobody at the table to answer. /agents shows who is benched; /seat NAME brings one back.")
             return
-        asked = "" if len(targets) == len(self.seated()) else (
+        asked = "" if len(targets) == len([m for m in self.seated() if m not in skip]) else (
             " The chair asked only " + " ".join("@" + m.shown() for m in targets) + " this time.")
         if self.mode == "roast":
-            table = self.seated()
+            table = [m for m in self.seated() if m not in skip]
             if len(table) < 2:
                 point = "Give your point on the chair's latest message." + asked
-                self.parallel(targets, lambda m: point, "point")
+                self.parallel(targets, lambda m: point, "point", live=live)
                 note("Only one at the table, so there is nobody to roast.")
             else:
                 # everyone at the table roasts; those the message was for give the first points
@@ -1431,13 +2434,13 @@ class Meeting:
         else:
             # Order: everyone answers the chair at once first (each its own take, without the others'),
             # then the round table: one by one in seat order, each speaking to the others' answers.
-            # With /rounds 0 (the default in the chat box) the table goes round and round until Ctrl+C,
-            # a newer message, or a pass in which everyone has nothing new to add ("Pass").
+            # With /rounds 0 the table goes round and round until Ctrl+C, a newer message, everyone passes,
+            # or the TABLE_CAP safety cap (so an unattended council never loops forever).
             many = len(targets) > 1
             if fresh:
                 first = ("Give your own answer to the chair's latest message now, at the same time as the others "
                          "(you will see theirs next).") + asked
-                self.parallel(targets, lambda m: first, "first")
+                self.parallel(targets, lambda m: first, "first", live=live)
                 if STOP.is_set() or not live():
                     return
             if self.rounds == 0 and many:
@@ -1446,8 +2449,9 @@ class Meeting:
                 passes = max(0, self.rounds) if many else 0
             else:
                 passes = max(1, self.rounds)            # Enter: once more round the table
+            TABLE_CAP = 20
             n = 0
-            while passes is None or n < passes:
+            while (n < TABLE_CAP if passes is None else n < passes):
                 n += 1
                 with LOCK:
                     clear_status()
@@ -1477,12 +2481,16 @@ class Meeting:
                     said = [e for e in self.thread[before:] if e["who"] == m.handle and not e.get("problem")]
                     if said:
                         spoke += 1
-                        passed += re.sub(r"[^a-z]", "", said[-1]["text"].lower()) == "pass"
+                        txt = said[-1]["text"].strip()
+                        passed += bool(re.match(r"^\*{0,2}pass\*{0,2}\b", txt, re.I)) and len(txt.split()) <= 8
                 if passes is None and (not spoke or passed == spoke):
                     note("Everyone passed: nothing new at the table. Enter for another pass, or a new message."
                          if spoke else "No answer got through in that pass, so the table stopped. /retry, or a new "
                          "message.")
                     break
+            else:
+                if passes is None and n >= TABLE_CAP:
+                    note(f"Round table reached {TABLE_CAP} passes (safety cap). Enter for more, or a new message.")
         set_status([])
         self.save()
 
@@ -1500,6 +2508,14 @@ class Meeting:
         slots = threading.Semaphore(self.together(targets))
         start, limit = len(self.thread), self.roasts
         wait_max = max(600, 2 * int(self.conf.get("timeout", 300)))
+        points_done = threading.Event()
+        rem_points = [len(pointers)]
+        if not rem_points[0]:
+            points_done.set()
+        active_roasters = [len(targets)]
+        waiting_roasters = set()
+        ROAST_CAP = 20          # safety cap for /rounds 0 so an unattended tab never loops forever
+        cap_noted = [False]
         if not FEED["grid"]:
             with LOCK:
                 clear_status()
@@ -1507,11 +2523,22 @@ class Meeting:
             if not limit:
                 note("The roast goes on until you press Ctrl+C.")
 
-        def heard(m):           # what has been said since, by the others or by the chair (a new message joins in)
-            return sum(1 for e in self.thread[start:] if e["who"] != m.handle and not e.get("problem"))
+        def heard(m):           # what has been said since, by the others or by the chair (unless addressed elsewhere)
+            with LOCK:
+                snap = list(self.thread[start:])
+            return sum(1 for e in snap if e["who"] != m.handle and not e.get("problem")
+                       and (not e.get("to") or m.handle in e["to"]))
+
+        def others_spoke(m):
+            with LOCK:
+                snap = list(self.thread[start:])
+            return [x for x in targets if x is not m
+                    and any(e["who"] == x.handle and not e.get("problem") for e in snap)]
 
         def counter(m, k, chair_new):
-            others = " ".join("@" + x.shown() for x in targets if x is not m)
+            spoke = others_spoke(m)
+            who_list = spoke if spoke else [x for x in targets if x is not m]
+            others = " ".join("@" + x.shown() for x in who_list)
             with LOCK:
                 asked_me = m.handle in ROAST["directed"]
                 ROAST["directed"].discard(m.handle)
@@ -1536,34 +2563,78 @@ class Meeting:
                     f"that gives your position now in one sentence. At most {self.words()} words in all.")
 
         def member(m):
-            if m.handle in prompts:
-                with slots:
-                    if STOP.is_set() or not live():
-                        return
-                    self.speak(m, "", "point", prompts[m.handle])
-            seen, k, fails, idle, mark = 0, 0, 0, time.time(), start
-            while (not STOP.is_set() and live() and m.seated and self.mode == "roast"
-                   and (not limit or k < limit)):
-                if heard(m) <= seen:            # nothing new from the others yet
-                    if time.time() - idle > wait_max:
+            try:
+                if m.handle in prompts:
+                    try:
+                        with slots:
+                            if STOP.is_set() or not live():
+                                return
+                            self.speak(m, "", "point", prompts[m.handle])
+                    finally:
+                        with LOCK:
+                            rem_points[0] -= 1
+                            if rem_points[0] <= 0:
+                                points_done.set()
+                # Brief grace for initial points to arrive so a fast member never roasts an empty thread
+                grace = time.time() + min(15, max(2, int(self.conf.get("timeout", 300)) // 10))
+                while not points_done.is_set() and time.time() < grace and not STOP.is_set() and live() and m.seated:
+                    time.sleep(0.2)
+                seen, k, fails, idle, mark = 0, 0, 0, time.time(), start
+                while (not STOP.is_set() and live() and m.seated and self.mode == "roast"
+                       and k < (self.roasts or ROAST_CAP)):
+                    cur_wait = min(wait_max, 120) if fails else wait_max
+                    h_now = heard(m)
+                    with LOCK:
+                        chair_waiting = any(e.get("who") == "chair" and (not e.get("to") or m.handle in e["to"])
+                                            for e in self.thread[mark:])
+                    if h_now <= seen or (k == 0 and not others_spoke(m) and not chair_waiting):
+                        with LOCK:
+                            waiting_roasters.add(m.handle)
+                            stalled = points_done.is_set() and len(waiting_roasters) >= active_roasters[0]
+                        if stalled:
+                            time.sleep(0.5)
+                            with LOCK:
+                                chair_waiting = any(e.get("who") == "chair" and (not e.get("to") or m.handle in e["to"])
+                                                    for e in self.thread[mark:])
+                                still_stalled = (points_done.is_set()
+                                                 and len(waiting_roasters) >= active_roasters[0]
+                                                 and (heard(m) <= seen or (k == 0 and not others_spoke(m) and not chair_waiting)))
+                            if still_stalled:
+                                break
+                            continue
+                        if time.time() - idle > cur_wait:
+                            break
+                        time.sleep(0.3)
+                        continue
+                    with LOCK:
+                        waiting_roasters.discard(m.handle)
+                    k += 1
+                    with slots:
+                        if STOP.is_set() or not live():
+                            break
+                        seen = heard(m)
+                        with LOCK:
+                            chair_new = any(e.get("who") == "chair" and (not e.get("to") or m.handle in e["to"])
+                                            for e in self.thread[mark:])
+                            mark = len(self.thread)
+                        prompt = self.prompt(m, counter(m, k, chair_new))
+                        before = len(self.thread)
+                        self.speak(m, "", "roast", prompt, rnd=k)
+                    with LOCK:
+                        ok = any(e["who"] == m.handle and not e.get("problem") for e in self.thread[before:])
+                    fails = 0 if ok else fails + 1
+                    if fails >= 2:
                         break
-                    time.sleep(0.4)
-                    continue
-                k += 1
-                with slots:
-                    if STOP.is_set() or not live():
-                        break
-                    seen = heard(m)
-                    chair_new = any(e.get("who") == "chair" for e in self.thread[mark:])
-                    mark = len(self.thread)
-                    prompt = self.prompt(m, counter(m, k, chair_new))
-                    before = len(self.thread)
-                    self.speak(m, "", "roast", prompt, rnd=k)
-                fails = 0 if any(e["who"] == m.handle and not e.get("problem") for e in self.thread[before:]) \
-                    else fails + 1
-                if fails >= 2:
-                    break
-                idle = time.time()
+                    idle = time.time()
+                if not limit and k >= ROAST_CAP:
+                    with LOCK:
+                        if not cap_noted[0]:
+                            cap_noted[0] = True
+                            note(f"Roast reached {ROAST_CAP} counters each (safety cap). Enter for more, or a new message.")
+            finally:
+                with LOCK:
+                    waiting_roasters.discard(m.handle)
+                    active_roasters[0] = max(0, active_roasters[0] - 1)
 
         with LOCK:
             ROAST["meeting"], ROAST["directed"] = self, set()
@@ -1582,7 +2653,7 @@ class Meeting:
         set_status([])
         self.save()
 
-    def parallel(self, targets, task, phase, label=None):
+    def parallel(self, targets, task, phase, label=None, live=None):
         waiting = [m.handle for m in targets]
         set_status(waiting)
         slots = threading.Semaphore(self.together(targets))
@@ -1593,11 +2664,13 @@ class Meeting:
 
         def run(m):
             with slots:
-                if not STOP.is_set():
+                if not STOP.is_set() and (not live or live()):
                     self.speak(m, "", phase, prompts[m.handle])
             with LOCK:
-                waiting.remove(m.handle)
-            set_status(waiting)
+                if m.handle in waiting:
+                    waiting.remove(m.handle)
+                snap = list(waiting)
+            set_status(snap)
 
         if label and not FEED["grid"]:     # in the grid each pane labels its own rounds
             with LOCK:
@@ -1616,32 +2689,52 @@ class Meeting:
             self.save_()
 
     def save_(self):
-        if not self.thread:
+        with LOCK:
+            thread = list(self.thread)
+            members = list(self.members)
+        if not thread:
             return
         if not self.dir:
             self.open_session()
         os.makedirs(self.dir, exist_ok=True)
         roster = "\n".join(f"- {m.label()}" + (f": {m.persona}" if m.made and m.persona else "") + ("" if m.seated else " (benched)")
-                           for m in self.members)
-        body = [f"# Council{' on ' + self.project() if self.project() else ''}: {self.topic or self.thread[0]['text'][:80]}", "",
+                           for m in members)
+        body = [f"# Council{' on ' + self.project() if self.project() else ''}: {self.topic or fit(thread[0]['text'], 80)}", "",
                 f"Started {self.started} in {os.path.basename(self.owner) or self.owner}. Mode: {self.mode}.", "",
                 "Members:", roster, ""]
-        for e in self.thread:
+        for e in thread:
             who = "**Chair**" if e["who"] == "chair" else f"**@{self.name_of(e)}**"
             tag = {"roast": " (roast" + (f" {e['round']}" if e.get("round", 1) > 1 else "") + ")",
-                   "table": " (round table" + (f" {e['round']}" if e.get("round", 1) > 1 else "") + ")"}.get(
+                   "table": " (round table" + (f" {e['round']}" if e.get("round", 1) > 1 else "") + ")",
+                   "verdict": " (verdict)", "bp": " (debate)", "stake": " (win stake)",
+                   "sim": " (monte carlo)"}.get(
                        e.get("phase"), "")
             body.append(f"{who}{tag}: {e['text']}\n")
-        tmp = self.file + ".new"
-        with open(tmp, "w") as f:
-            f.write("\n".join(body))
-        os.replace(tmp, self.file)
+        uniq = f".{os.getpid()}.{threading.get_ident()}.tmp"
+        tmp = self.file + uniq
+        try:
+            with open(tmp, "w") as f:
+                f.write("\n".join(body))
+            os.replace(tmp, self.file)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         # the same thread as data, for carrying the meeting on (the .md is for reading)
-        tmp = self.file[:-3] + ".json.new"
-        with open(tmp, "w") as f:
-            json.dump({"topic": self.topic, "started": self.started, "mode": self.mode,
-                       "thread": [{k: v for k, v in e.items() if k != "problem" or v} for e in self.thread]}, f)
-        os.replace(tmp, self.file[:-3] + ".json")
+        tmp = self.file[:-3] + ".json" + uniq
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"topic": self.topic, "started": self.started, "mode": self.mode,
+                           "thread": [{k: v for k, v in e.items() if k != "to" and (k != "problem" or v)} for e in thread]}, f)
+            os.replace(tmp, self.file[:-3] + ".json")
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 # ---- memory: a council carries on the last meeting of its folder ----------------------------------------
@@ -1658,7 +2751,7 @@ def upgrade(src, home):
             continue
         try:
             with open(md) as fh:
-                if not fh.readline().startswith("# Council:"):
+                if not re.match(r"^# Council(?: on [^:]+)?:", fh.readline()):
                     continue                  # not a meeting the council saved: left where it is
         except OSError:
             continue
@@ -1697,7 +2790,7 @@ def read_meeting(md):
             text = f.read()
     except OSError:
         return "", "", []
-    top = re.search(r"^# Council: (.*)$", text, re.M)
+    top = re.search(r"^# Council(?: on [^:]+)?: (.*)$", text, re.M)
     began = re.search(r"^Started (\S+ \S+)", text, re.M)
     thread = []
     for m in re.finditer(r"^\*\*(Chair|@[\w.-]+)\*\*(?: \(([^)]*)\))?: (.*?)(?=^\*\*(?:Chair|@[\w.-]+)\*\*|\Z)",
@@ -1709,8 +2802,19 @@ def read_meeting(md):
             e["phase"] = "roast"
             n = re.search(r"\d+", tag)
             e["round"] = int(n[0]) if n else 1
-        elif tag == "round table":
+        elif tag.startswith("round table"):
             e["phase"] = "table"
+            n = re.search(r"\d+", tag)
+            if n:
+                e["round"] = int(n[0])
+        elif tag == "verdict":
+            e["phase"] = "verdict"
+        elif tag == "debate":
+            e["phase"] = "bp"
+        elif tag == "win stake":
+            e["phase"] = "stake"
+        elif tag == "monte carlo":
+            e["phase"] = "sim"
         thread.append(e)
     return (top[1].strip() if top else ""), (began[1] if began else ""), thread
 
@@ -1726,21 +2830,23 @@ def carry_on(meeting, md):
     return len(thread)
 
 
+def tmx_run(*argv):
+    """Build a tmux `run-shell -b` action string safely quoted for both tmux and /bin/sh."""
+    return "run-shell -b " + tmx_quote(" ".join(shlex.quote(str(x)) for x in argv))
+
+
 def ask_what_now(m, kind, problem):
-    """The pop-up after a member's second failure in a row."""
+    """Action menu for a failed member (on demand)."""
     me = GRID[0].me if GRID[0] else ""
     pane = GRID[0].panes.get(m.handle, "") if GRID[0] else ""
     if not me:
         return
     client = tmx("display-message", "-p", "-t", me, "#{client_name}")
 
-    def send(text):
-        return f"send-keys -t '{me}' -l '{text}' ; send-keys -t '{me}' Enter"
-
-    items = ["Try again", "t", send(f"/retry @{m.handle}")]
+    items = ["Try again", "t", send_cmd(me, f"/retry @{m.handle}")]
     if pane:
-        items += ["Change its model or effort…", "m", f"run-shell -b \"{ME} --menu '{client}' '{pane}'\""]
-    items += ["Take it off the table", "x", send(f"/bench {m.handle}"), "", "Leave it", "n", ""]
+        items += ["Change its model or effort…", "m", tmx_run(ME, "--menu", client, pane)]
+    items += ["Take it off the table", "x", send_cmd(me, f"/bench {m.handle}"), "", "Leave it", "n", ""]
     tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", me,
         "-T", f"#[align=centre] @{m.shown()} went wrong twice: {kind} ", "-x", "C", "-y", "C", "--", *items)
 
@@ -1755,21 +2861,22 @@ def resume_menu(past):
     me = os.environ.get("TMUX_PANE", "")
     items = []
     for i, md in enumerate(past[:9], 1):
-        items += [label_of(md), str(i), f"send-keys -t '{me}' -l '/resume {i}' ; send-keys -t '{me}' Enter"]
+        items += [label_of(md), str(i), send_cmd(me, f"/resume {i}")]
     if not items:
         BOX["note"] = "No earlier meeting in this folder."
         return
     client = tmx("display-message", "-p", "-t", me, "#{client_name}")
     tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", me,
-        "-T", "#[align=centre] Carry on which meeting? ", "-x", "C", "-y", "S", "--", *items)
+        "-T", "#[align=centre] Carry on which meeting? ", "-x", "C", "-y", "C", "--", *items)
 
 
 def replay(meeting):
     """Put the meeting's thread back into the members' panes (they read the feed from its start)."""
-    kinds = {m.handle: m.colour() for m in meeting.members}
     with LOCK:
+        kinds = {m.handle: m.colour() for m in list(meeting.members)}
+        thread = list(meeting.thread)
         emit({"t": "reset"})
-        for e in meeting.thread:
+        for e in thread:
             if e.get("who") == "chair":
                 emit({"t": "msg", "who": "chair", "text": e.get("text", ""), "phase": "chair"})
             elif not e.get("problem"):
@@ -1805,12 +2912,12 @@ RUNWHO = {}                  # members at work -> how many runs (their panes' sp
 SAVING = threading.Lock()
 FAILS = {}                   # member -> runs gone wrong in a row
 LAST_FAIL = {}               # member -> what went wrong last
-ROAST = {"meeting": None, "directed": set()}   # the roast going on: a new message joins it, not restarts it
+ROAST = {"meeting": None, "directed": set()}   # the roast going on (a new message starts a new round: Worker.submit)
 
 
 def emit_status():
     """Who is thinking, for the members' panes. Call with LOCK held."""
-    names = table_names(TABLE[0].members) if TABLE[0] else {}
+    names = table_names(list(TABLE[0].members)) if TABLE[0] else {}
     emit({"t": "status", "who": sorted(RUNWHO), "names": {h: names.get(h, h) for h in RUNWHO}})
 FEED = {"path": "", "grid": False}   # the live feed the member panes read; grid: the panes are open
 
@@ -1842,14 +2949,36 @@ def clear_status():
         sys.stdout.flush()
 
 
+def thinking_line(frame, names, secs, cols, indent="", plural=True):
+    """Single-line spinner status clamped strictly below cols so \\r\\033[K always erases it cleanly
+    (never wrapping onto 2+ rows and spamming endless thinking lines in a narrow split or one view)."""
+    avail = max(12, cols - len(indent) - 1)
+    if not names:
+        full = f"{frame} thinking  {secs}s"
+        return indent + (full if cells(full) <= avail else fit(full, avail))
+    who = " ".join("@" + n for n in names)
+    verb = ("is thinking" if len(names) == 1 else "are thinking") if plural else "thinking"
+    full = f"{frame} {who} {verb}  {secs}s"
+    if cells(full) <= avail:
+        return indent + full
+    prefix = f"{frame} "
+    suffix = f" {verb}  {secs}s"
+    room = avail - cells(prefix) - cells(suffix)
+    if room >= 4:
+        return indent + prefix + fit(who, room) + suffix
+    return indent + fit(f"{frame} {len(names)} thinking  {secs}s", avail)
+
+
 def draw_status():
     """The animated line under the thread while members think: a spinner, who, and for how long."""
     if STATUS["line"] and TTY and not FEED["grid"]:   # in the grid each member's pane has its own spinner
         who = STATUS["who"]
+        names = table_names(list(TABLE[0].members)) if TABLE[0] else {}
+        shown_who = [names.get(h, h) for h in who]
         frame = SPIN[int(time.time() * 10) % len(SPIN)]
         secs = int(time.time() - STATUS["since"])
-        sys.stdout.write(paint(f"  {frame} " + " ".join("@" + h for h in who) +
-                               (" is thinking" if len(who) == 1 else " are thinking") + f"  {secs}s", "note"))
+        cols = shutil.get_terminal_size((80, 20)).columns
+        sys.stdout.write(paint(thinking_line(frame, shown_who, secs, cols, indent="  ", plural=True), "note"))
         sys.stdout.flush()
 
 
@@ -1862,6 +2991,23 @@ def animate():
                     if shutil.get_terminal_size((80, 4)).columns != BOX.get("cols"):
                         draw_frame()
             grow()
+            if INPUT.get("rl") and not INPUT.get("cb"):
+                # As you type a / command or an @ name, what it can be shows on the note line under the
+                # box at once, as Tab would list it (operator, 2026-11-24: "nothing pops up when I type")
+                buf = readline.get_line_buffer()
+                word = buf.rsplit(None, 1)[-1] if buf and not buf[-1].isspace() else ""
+                first = bool(word) and buf.lstrip() == word
+                found = matches(word, first) if word.startswith(("/", "@")) else []
+                with LOCK:
+                    if found and tuple(found) != BOX.get("live"):
+                        BOX["live"], BOX["listing"] = tuple(found), True
+                        cols = max(20, shutil.get_terminal_size((80, 4)).columns)
+                        sys.stdout.write(f"\0337\033[{NOTE_ROW()};1H\033[K" +
+                                         paint(fit("  ".join(found), cols - 1), "rule2") + "\0338")
+                        sys.stdout.flush()
+                    elif not found and BOX.get("listing"):
+                        BOX["listing"], BOX["live"] = False, None
+                        show_note(BOX["note"])
             if BOX.get("relayout") and not INPUT.get("cb") and INPUT.get("rl"):
                 BOX["relayout"] = False
                 os.kill(os.getpid(), signal.SIGWINCH)      # the redraw put off: now, between keystrokes
@@ -1876,8 +3022,9 @@ def show(e, m=None):
         print(paint("you", "chair") + ": " + e["text"], flush=True)
         return
     name = f"@{e.get('as') or e['who']}" + {"roast": " ⚔" + (str(e["round"]) if e.get("round", 1) > 1 else ""),
-                             "table": " ↻" + (str(e["round"]) if e.get("round", 1) > 1 else "")}.get(e.get("phase"), "")
-    kind = "err" if e.get("problem") else (m.colour() if m else "agent")
+                             "table": " ↻" + (str(e["round"]) if e.get("round", 1) > 1 else ""),
+                             "sim": " 🎲"}.get(e.get("phase"), "")
+    kind = "err" if e.get("problem") else ("chair" if e.get("phase") == "sim" else (m.colour() if m else "agent"))
     if FEED["grid"]:          # the chat strip is for typing: every answer is in its member's own pane
         return
     text = e["text"].replace("\n", "\n    ")
@@ -1885,7 +3032,8 @@ def show(e, m=None):
 
 
 # ---- the grid: one pane per member, each with its own scroll of the thread ------------------------------
-TMUX_COLOUR = {"claude": "colour173", "codex": "colour114", "gemini": "colour75", "agy": "colour141", "agent": "colour221",
+TMUX_COLOUR = {"claude": "colour173", "codex": "colour114", "gemini": "colour75", "agy": "colour141",
+               "copilot": "colour117", "opencode": "colour216", "agent": "colour221",
                "x1": "colour80", "x2": "colour211", "x3": "colour150", "x4": "colour180", "x5": "colour117",
                "x6": "colour216", "x7": "colour147", "x8": "colour72"}
 
@@ -1906,98 +3054,171 @@ class Grid:
         self.panes = {}          # handle -> pane id
 
     def open(self, meeting):
-        self.close()
-        seated = meeting.seated()
-        if not self.me or not FEED["path"]:
-            FEED["grid"] = False
-            return
-        if not seated:
-            # nobody at the table: the chat box and + add still, to bring members in
-            tmx("set-option", "-w", "-t", self.me, "@council", "1")
-            self.chair_header(meeting)
-            self.relabel(meeting)
-            FEED["grid"] = True
-            return
-        if meeting.conf.get("view") == "one":
-            # one pane above the chat box with everyone's answers, the way a group chat looks
-            one = tmx("split-window", "-vb", "-d", "-l", "70%", "-t", self.me, "-P", "-F", "#{pane_id}",
-                      f"{ME} --view {FEED['path']} {ALL} {os.getpid()}")
-            if not one:
+        with GRID_LOCK:
+            self.close()
+            seated = meeting.seated()
+            if not self.me or not FEED["path"]:
                 FEED["grid"] = False
                 return
-            self.panes[ALL] = one
-            tmx("set-option", "-p", "-t", one, "@council_member", ALL)      # ✕ there: back to one pane each
-            tmx("set-option", "-p", "-t", one, "@council_one", "1")
-            tmx("set-option", "-p", "-t", one, "@council_chair", self.me)
-            tmx("resize-pane", "-t", self.me, "-y", str(CHAT_LINES))
+            if not seated:
+                # nobody at the table: the chat box and + add still, to bring members in
+                tmx("set-option", "-w", "-t", self.me, "@council", "1")
+                self.chair_header(meeting)
+                self.relabel(meeting)
+                FEED["grid"] = True
+                return
+
+            def view_cmd(h):
+                return " ".join(shlex.quote(str(x)) for x in (ME, "--view", FEED["path"], h, os.getpid()))
+
+            if meeting.conf.get("view") == "one":
+                # one pane above the chat box with everyone's answers, the way a group chat looks
+                one = tmx("split-window", "-vb", "-d", "-l", "70%", "-t", self.me, "-P", "-F", "#{pane_id}",
+                          view_cmd(ALL))
+                if not one:
+                    FEED["grid"] = False
+                    return
+                self.panes[ALL] = one
+                tmx("set-option", "-p", "-t", one, "@council_member", ALL)      # ✕ there: back to one pane each
+                tmx("set-option", "-p", "-t", one, "@council_one", "1")
+                tmx("set-option", "-p", "-t", one, "@council_chair", self.me)
+                tmx("resize-pane", "-t", self.me, "-y", str(CHAT_LINES))
+                self.chair_header(meeting)
+                tmx("set-option", "-w", "-t", self.me, "@council", "1")
+                self.relabel(meeting)
+                tmx("select-pane", "-t", self.me)
+                FEED["grid"] = True
+                return
+            n = len(seated)
+            rows = 1 if n <= 3 else (2 if n <= 8 else 3)
+            cols = -(-n // rows)
+
+            def split(how, target, m, size=None):
+                return tmx("split-window", how, "-d", *(["-l", size] if size else []), "-t", target, "-P", "-F",
+                           "#{pane_id}", view_cmd(m.handle)) if target else ""
+
+            created = []
+            first = split("-vb", self.me, seated[0], "70%")
+            if not first:
+                FEED["grid"] = False
+                return
+            created.append(first)
+            columns = [[first]]
+            ok = True
+            for c in range(1, min(cols, n)):
+                p = split("-h", columns[-1][0], seated[c])
+                if not p:
+                    ok = False
+                    break
+                created.append(p)
+                columns.append([p])
+            if ok:
+                for r in range(1, rows):
+                    for c in range(cols):
+                        i = r * cols + c
+                        if i < n:
+                            p = split("-v", columns[c][-1], seated[i])
+                            if not p:
+                                ok = False
+                                break
+                            created.append(p)
+                            columns[c].append(p)
+                    if not ok:
+                        break
+            if not ok:
+                for p in created:
+                    tmx("kill-pane", "-t", p)
+                # Not enough room for an N-pane grid: fall back cleanly to one view above the chat box
+                one = tmx("split-window", "-vb", "-d", "-l", "70%", "-t", self.me, "-P", "-F", "#{pane_id}",
+                          view_cmd(ALL))
+                if not one:
+                    FEED["grid"] = False
+                    return
+                self.panes[ALL] = one
+                tmx("set-option", "-p", "-t", one, "@council_member", ALL)
+                tmx("set-option", "-p", "-t", one, "@council_one", "1")
+                tmx("set-option", "-p", "-t", one, "@council_chair", self.me)
+                tmx("resize-pane", "-t", self.me, "-y", str(CHAT_LINES))
+                self.chair_header(meeting)
+                tmx("set-option", "-w", "-t", self.me, "@council", "1")
+                self.relabel(meeting)
+                tmx("select-pane", "-t", self.me)
+                FEED["grid"] = True
+                BOX["note"] = f"Not enough room for {n} panes here: using one view (Alt+Shift+K for a full tab)."
+                return
+            for i, m in enumerate(seated):
+                self.panes[m.handle] = columns[i % cols][i // cols]
+                p = self.panes[m.handle]
+                tmx("set-option", "-p", "-t", p, "@council_member", m.handle)
+                tmx("set-option", "-p", "-t", p, "@council_tool", m.tool)
+                tmx("set-option", "-p", "-t", p, "@council_chair", self.me)
+            # Even: the row of columns, then each column's stack (afc-even counts a stack as one column)
+            even = os.path.join(HOME, ".local/bin/afc-even")
+            if cols > 1:
+                subprocess.run([even, first, "1"], capture_output=True)
+            for col in columns:
+                if len(col) > 1:
+                    subprocess.run([even, col[0], "2" if cols > 1 else "1"], capture_output=True)
+            try:
+                height = int(tmx("display-message", "-p", "-t", self.me, "#{window_height}") or 0)
+            except ValueError:
+                height = 0
+            if height:
+                tmx("resize-pane", "-t", self.me, "-y", str(CHAT_LINES))
             self.chair_header(meeting)
             tmx("set-option", "-w", "-t", self.me, "@council", "1")
             self.relabel(meeting)
             tmx("select-pane", "-t", self.me)
             FEED["grid"] = True
-            return
-        n = len(seated)
-        rows = 1 if n <= 3 else (2 if n <= 8 else 3)
-        cols = -(-n // rows)
-
-        def split(how, target, m, size=None):
-            return tmx("split-window", how, "-d", *(["-l", size] if size else []), "-t", target, "-P", "-F",
-                       "#{pane_id}", f"{ME} --view {FEED['path']} {m.handle} {os.getpid()}")
-
-        first = split("-vb", self.me, seated[0], "70%")
-        if not first:
-            FEED["grid"] = False
-            return
-        columns = [[first]]
-        for c in range(1, min(cols, n)):
-            columns.append([split("-h", columns[-1][0], seated[c])])
-        for r in range(1, rows):
-            for c in range(cols):
-                i = r * cols + c
-                if i < n:
-                    columns[c].append(split("-v", columns[c][-1], seated[i]))
-        for i, m in enumerate(seated):
-            self.panes[m.handle] = columns[i % cols][i // cols]
-            p = self.panes[m.handle]
-            tmx("set-option", "-p", "-t", p, "@council_member", m.handle)
-            tmx("set-option", "-p", "-t", p, "@council_tool", m.tool)
-            tmx("set-option", "-p", "-t", p, "@council_chair", self.me)
-        # Even: the row of columns, then each column's stack (afc-even counts a stack as one column)
-        even = os.path.join(HOME, ".local/bin/afc-even")
-        if cols > 1:
-            subprocess.run([even, first, "1"], capture_output=True)
-        for col in columns:
-            if len(col) > 1:
-                subprocess.run([even, col[0], "2" if cols > 1 else "1"], capture_output=True)
-        try:
-            height = int(tmx("display-message", "-p", "-t", self.me, "#{window_height}") or 0)
-        except ValueError:
-            height = 0
-        if height:
-            tmx("resize-pane", "-t", self.me, "-y", str(CHAT_LINES))
-        self.chair_header(meeting)
-        tmx("set-option", "-w", "-t", self.me, "@council", "1")
-        self.relabel(meeting)
-        tmx("select-pane", "-t", self.me)
-        FEED["grid"] = True
 
     def chair_header(self, meeting):
         """The chat box's own header, with the mode it is in. Not the fleet's agent header, which took
         the LLM running under it (Gemini, say) for the pane's agent and showed its account and tokens."""
         if not self.me:
             return
-        if meeting.mode == "roast":
-            mode = "#[fg=colour203,bold]mode: ROAST#[default]#[fg=colour244] (all at once, until Ctrl+C)"
+        try:
+            pw = int(tmx("display-message", "-p", "-t", self.me, "#{pane_width}") or 120)
+        except ValueError:
+            pw = 120
+        perm_key = meeting.conf.get("perm") or "plan"
+        tmx("set-option", "-p", "-t", self.me, "@council_chat", "1")    # ✕ / Alt+Q here: the council quits
+        if pw < 95:
+            # Narrow split inside a project tab (~55-80 cols): keep format/mode, rounds, and perm
+            # compact so none of them get clipped off by the right-aligned close button.
+            if meeting.format() != "forum":
+                n = meeting.stake_rounds()
+                mode = (f"#[fg=colour213,bold]{FORMAT_SHOWN[meeting.format()].upper()}#[default]#[fg=colour244] ("
+                        + ("8+judge" if meeting.format() == "bp" else f"{n}r") + ")")
+            elif meeting.mode == "roast":
+                rs = "∞" if not meeting.roasts else f"{meeting.roasts}×"
+                mode = f"#[fg=colour203,bold]mode: ROAST#[default]#[fg=colour244] ({rs})"
+            else:
+                ts = "∞" if meeting.rounds == 0 else ("0×" if meeting.rounds < 0 else f"{meeting.rounds}×")
+                mode = f"#[fg=colour111,bold]mode: ORDER#[default]#[fg=colour244] ({ts})"
+            short_perm = {"plan": "#[fg=colour111,bold]perm: PLAN#[default]",
+                          "edit": "#[fg=colour221,bold]perm: EDIT#[default]",
+                          "bypass": "#[fg=colour203,bold]perm: BYPASS#[default]"}.get(
+                              perm_key, "#[fg=colour111,bold]perm: PLAN#[default]")
+            tmx("set-option", "-p", "-t", self.me, "pane-border-format",
+                f" #[fg=colour252,bold]council#[default] {mode} · {short_perm}"
+                "#[align=right]#[fg=colour244] ✕ #[default]")
+            return
+        if meeting.format() != "forum":
+            n = meeting.stake_rounds()
+            mode = (f"#[fg=colour213,bold]format: {FORMAT_SHOWN[meeting.format()].upper()}#[default]#[fg=colour244] ("
+                    + ("8 speakers, then the judge" if meeting.format() == "bp" else f"{n} rounds, then the vote")
+                    + ", /format)")
+        elif meeting.mode == "roast":
+            roasts = "until Ctrl+C" if not meeting.roasts else f"{meeting.roasts}× roast"
+            mode = f"#[fg=colour203,bold]mode: ROAST#[default]#[fg=colour244] (all at once, {roasts})"
         else:
             table = ("round the table until Ctrl+C" if meeting.rounds == 0 else "no round table" if meeting.rounds < 0
                      else f"{meeting.rounds}× round the table")
             mode = f"#[fg=colour111,bold]mode: ORDER#[default]#[fg=colour244] (answers, then {table})"
-        perm = meeting.conf.get("perm") or "plan"
         perm = {"plan": "#[fg=colour111,bold]perm: PLAN#[default]#[fg=colour244] (read-only)",
                 "edit": "#[fg=colour221,bold]perm: EDIT#[default]#[fg=colour244] (change files)",
                 "bypass": "#[fg=colour203,bold]perm: BYPASS#[default]#[fg=colour244] (anything, no asking)"}.get(
-                    perm, "#[fg=colour111,bold]perm: PLAN")
-        tmx("set-option", "-p", "-t", self.me, "@council_chat", "1")    # ✕ / Alt+Q here: the council quits
+                    perm_key, "#[fg=colour111,bold]perm: PLAN")
         tmx("set-option", "-p", "-t", self.me, "pane-border-format",
             f" #[fg=colour252,bold]council{(' · ' + meeting.project().replace('#', '##')) if meeting.project() else ''}"
             f"#[default] {mode} #[fg=colour244](Shift+Tab)#[default] · {perm} "
@@ -2032,7 +3253,8 @@ class Grid:
             tmx("set-option", "-p", "-t", p, "@council_name", m.shown())       # what ✕ asks about
             tmx("set-option", "-p", "-t", p, "@council_what", "Delete agent" if m.made else "Remove")
             tmx("set-option", "-p", "-t", p, "@council_model", m.model or "")
-            tmx("set-option", "-p", "-t", p, "@council_effort", m.effort or "")
+            tmx("set-option", "-p", "-t", p, "@council_effort",
+                (gemini_effort(m.home) or "") if m.tool == "gemini" else (m.effort or ""))
             tmx("set-option", "-p", "-t", p, "@council_runs", runs.replace("#", "##"))
             tmx("set-option", "-p", "-t", p, "@council_default", (m.default_model or "its own").replace("#", "##"))
             tmx("set-option", "-p", "-t", p, "pane-border-format",
@@ -2062,10 +3284,28 @@ class Grid:
             ";".join(f"{m.handle}={m.label()}" for m in out).replace("#", "##"))
 
     def close(self):
-        for p in self.panes.values():
-            tmx("kill-pane", "-t", p)
-        self.panes = {}
-        FEED["grid"] = False
+        with GRID_LOCK:
+            for p in list(self.panes.values()):
+                if p:
+                    tmx("kill-pane", "-t", p)
+            self.panes = {}
+            FEED["grid"] = False
+
+    def clear_window_opts(self):
+        """Remove window-level @council* options on exit so a shared project tab is left spotless."""
+        if not self.me:
+            return
+        win = tmx("display-message", "-p", "-t", self.me, "#{window_id}")
+        if not win:
+            return
+        others = [r.split()[0] for r in tmx("list-panes", "-t", win, "-F",
+                                            "#{pane_id} #{?#{@council_chat},c,-}").splitlines()
+                  if r.endswith(" c") and r.split()[0] != self.me]
+        if others:
+            return
+        for opt in ("@council", "@council_chair", "@council_used", "@council_homes",
+                    "@council_seated", "@council_full", "@council_out"):
+            tmx("set-option", "-wu", "-t", win, opt)
 
 
 def menu(client, pane):
@@ -2074,12 +3314,14 @@ def menu(client, pane):
     def opt(k):
         return tmx("show-options", "-pqv", "-t", pane, k)
     handle, tool, chair = opt("@council_member"), opt("@council_tool"), opt("@council_chair")
+    if handle == ALL:
+        return one_menu(client, pane)
     if not handle or tool not in TOOLS or not chair:
         return 0
     model, effort, default = opt("@council_model"), opt("@council_effort"), opt("@council_default")
 
     def send(text):
-        return f"send-keys -t '{chair}' -l '{text}' ; send-keys -t '{chair}' Enter"
+        return send_cmd(chair, text)
 
     def mark(on):
         return "• " if on else "  "
@@ -2112,14 +3354,16 @@ def menu(client, pane):
         for e in EFFORTS[tool]:
             items += [mark(e == effort) + f"effort {e}", keys[e], send(f"/effort @{handle} {e}")]
         items += [mark(not effort) + "default effort", "d", send(f"/effort @{handle} default")]
+        if tool == "gemini":
+            items += ["-  (one effort for every Gemini)", "", ""]
     else:
-        items += ["-  no effort setting in Gemini: pick a model", "", ""]
+        items += [f"-  no effort setting in {TOOLS[tool]}: pick a model", "", ""]
     items += [""]
     for key, (p, text) in zip("rwb", (("plan", "plan (read-only)"), ("edit", "edit (change files, no commands)"),
                                        ("bypass", "bypass (anything, no asking)"))):
         items += [mark(p == perm) + "permission: " + text, key, send(f"/perm @{handle} {p}")]
     tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
-        "-T", f"#[align=centre] @{handle}: model and effort ", "-x", "P", "-y", "P", "--", *items)
+        "-T", f"#[align=centre] @{handle}: model and effort ", "-x", "C", "-y", "C", "--", *items)
     return 0
 
 
@@ -2128,6 +3372,12 @@ def mark(e):
     r = e.get("round", 1)
     if e.get("phase") == "roast":
         return " ⚔" + (f" {r}" if r > 1 else "")
+    if e.get("phase") == "verdict":
+        return " ⚖"
+    if e.get("phase") == "bp":
+        return " 🎙"
+    if e.get("phase") == "stake":
+        return " ⚑"
     return " ↻" + (f" {r}" if r > 1 else "") if e.get("phase") == "table" else ""
 
 
@@ -2156,9 +3406,9 @@ def bubble(name, text, kind, right):
     code = C.get(kind, C["agent"])
     head = f"\033[1;{code}m{name}\033[0m"
     if right:
-        span = max([len(name)] + [len(l) for l in body])
+        span = max([cells(name)] + [cells(l) for l in body])
         pad = " " * max(0, cols - span)
-        return (" " * max(0, cols - len(name)) + head + "\n" +
+        return (" " * max(0, cols - cells(name)) + head + "\n" +
                 "\n".join(pad + f"\033[{code}m{l}\033[0m" for l in body) + "\n\n")
     return head + "\n" + "\n".join(f"\033[{code}m{l}\033[0m" for l in body) + "\n\n"
 
@@ -2170,14 +3420,12 @@ def remove(pane):
     handle = tmx("show-options", "-pqv", "-t", pane, "@council_member")
     chair = tmx("show-options", "-pqv", "-t", pane, "@council_chair")
     if handle == ALL and chair:
-        tmx("send-keys", "-t", chair, "-l", "/view grid")
-        tmx("send-keys", "-t", chair, "Enter")
+        send_cmd_now(chair, "/view grid")
         return 0
     if handle and chair:
         # what every council understands, one opened before /remove was there too: an agent you made
         # (any name that is not an LLM's) is deleted, an LLM's own seat benched
-        tmx("send-keys", "-t", chair, "-l", f"/bench {handle}" if handle in TOOLS else f"/agent del {handle}")
-        tmx("send-keys", "-t", chair, "Enter")
+        send_cmd_now(chair, f"/bench {handle}" if handle in TOOLS else f"/agent del {handle}")
     return 0
 
 
@@ -2202,19 +3450,25 @@ def add_menu(client, win):
         if h in seated:
             items += [f"-  {what}  at the table", "", ""]
         else:
-            items += [f"{grey}  {what}", next(key, ""), f"send-keys -t '{chair}' -l '/seat {h}' ; send-keys -t '{chair}' Enter"]
+            items += [f"{grey}  {what}", "" if full else next(key, ""), "" if full else send_cmd(chair, f"/seat {h}")]
     if items:
         items += [""]
-    for key, tool in zip("cxga", ("claude", "codex", "gemini", "agy")):
-        items += [f"{grey}Another {TOOLS[tool]} seat…", key,
-                  f"run-shell -b \"'{ME}' --model-menu '{client}' '{win}' {tool}\""]
+    for key, tool in zip("cxga", CORE_TOOLS):
+        items += [f"{grey}Another {TOOLS[tool]} seat…", "" if full else key,
+                  "" if full else tmx_run(ME, "--model-menu", client, win, tool)]
+    hmap = homes(win)
+    for key, tool in (("p", "copilot"), ("u", "opencode")):
+        if tool in hmap or shutil.which(tool):
+            items += [f"{grey}Another {TOOLS[tool]} seat…", "" if full else key,
+                      "" if full else tmx_run(ME, "--model-menu", client, win, tool)]
     if full:
-        items += ["-The table is full (9): ✕ someone first", "", ""]
+        items += [f"-The table is full ({MAX_SEATS}): ✕ someone first", "", ""]
     if tmx("show-options", "-wqv", "-t", win, "@council_seated"):
-        items += ["", "Remove everyone…", "r", f"run-shell -b \"'{ME}' --clear-menu '{client}' '{win}'\""]
+        items += ["", "Remove everyone…", "r", tmx_run(ME, "--clear-menu", client, win)]
     # a form in the middle of the screen (tmux's own prompt sits on the bottom line)
-    items += ["", f"{grey}New agent…", "n",
-              f"display-popup -E -x C -y C -w 84 -h 32 -T ' New agent ' \"'{ME}' --new-agent '{chair}' '{win}'\""]
+    pop_cmd = " ".join(shlex.quote(str(x)) for x in (ME, "--new-agent", chair, win))
+    items += ["", f"{grey}New agent…", "" if full else "n",
+              "" if full else f"display-popup -E -x C -y C -w 84 -h 32 -T ' New agent ' {tmx_quote(pop_cmd)}"]
     tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-T", "#[align=centre] Add to the council ",
         "-x", "C", "-y", "C", "--", *items)
     return 0
@@ -2239,10 +3493,20 @@ def model_menu(client, win, tool):
         return 0
     used = used_models(win)
     items = []
-    for key, model in zip(MODEL_KEYS, models_for(tool, homes(win).get(tool))):
+    # Every model, those past the keys picked with the mouse or the arrows. tmux opens no menu at all that
+    # is taller than the window, so a short window gets as many as fit (Another model… takes any name).
+    models = models_for(tool, homes(win).get(tool))
+    try:
+        rows = int(tmx("display-message", "-p", *(["-c", client] if client else []), "#{client_height}") or 0)
+    except ValueError:
+        rows = 0
+    if rows and len(models) > rows - 6:
+        models = models[:max(rows - 6, 1)]
+    for i, model in enumerate(models):
+        key = MODEL_KEYS[i] if i < len(MODEL_KEYS) else ""
         who = used.get(canon(model))
         items += [f"-{model_label(model)}  (@{who} has it)" if who else model_label(model), key,
-                  f"send-keys -t '{chair}' -l '/agent more {tool}:{model}' ; send-keys -t '{chair}' Enter"]
+                  send_cmd(chair, f"/agent more {tool}:{model}")]
     if not any(not i.startswith("-") for i in items[0::3]):
         items += ["", f"-Every {TOOLS[tool]} model is at the table", "", ""]
     items += ["", "Another model…", "o", popup_ask(chair, f"Model for the new {TOOLS[tool]} seat",
@@ -2255,8 +3519,9 @@ def model_menu(client, win, tool):
 def popup_ask(chair, question, template):
     """A tmux command for a menu: one question in a small pop-up in the middle of the screen; the answer
     goes into the template (%s) and is typed into the chat box."""
-    return (f"display-popup -E -x C -y C -w 72 -h 7 -T ' {question} ' "
-            f"\"'{ME}' --ask '{chair}' '{question}' '{template}'\"")
+    shell_cmd = " ".join(shlex.quote(str(x)) for x in (ME, "--ask", chair, question, template))
+    title = " " + question.replace("#", "##") + " "
+    return f"display-popup -E -x C -y C -w 72 -h 7 -T {tmx_quote(title)} {tmx_quote(shell_cmd)}"
 
 
 def ask_popup(chair, question, template):
@@ -2268,17 +3533,16 @@ def ask_popup(chair, question, template):
     except (EOFError, KeyboardInterrupt):
         return 0
     if answer and re.fullmatch(r"[\w.:/@-]+", answer):
-        tmx("send-keys", "-t", chair, "-l", template.replace("%s", answer))
-        tmx("send-keys", "-t", chair, "Enter")
+        send_cmd_now(chair, template.replace("%s", answer))
     elif answer:
         input("  Not a model name (letters, digits, . : / - only). Enter to close. ")
     return 0
 
 
 def new_agent_form(chair, win):
-    """+ add, New agent…: a form in a pop-up in the middle of the screen. Name, LLM, model (every
-    version it can run; one a member runs already is marked and refused), character, soul, rules; then
-    /agent new is typed into the chat box. Ctrl+C or Esc at any question: nothing is made."""
+    """+ add, New agent…: a form in a pop-up in the middle of the screen. Name, LLM, model (persona
+    agents may share a model with an LLM seat), character, soul, rules; then /agent new is sent to
+    the chat box. Ctrl+C or Esc at any question: nothing is made."""
     out = sys.stdout
     taken = {handle_of(a.get("name", "")) for a in read_json(CONF).get("agents", [])} | set(TOOLS)
     taken |= {x.split("=")[1] for x in tmx("show-options", "-wqv", "-t", win, "@council_seated").split(";") if "=" in x}
@@ -2306,20 +3570,18 @@ def new_agent_form(chair, win):
                 ALIAS.get(pick, pick)
             if tool in TOOLS:
                 break
-            out.write(paint("  Pick 1 to 4.\n", "err"))
+            out.write(paint(f"  Pick 1 to {len(tools)}.\n", "err"))
         models = models_for(tool, homes(win).get(tool))
         out.write("\n")
         for i, mdl in enumerate(models, 1):
             who = used.get(canon(mdl))
-            out.write(f"   {i:2} " + (paint(f"{model_label(mdl)}  (@{who} has it)", "note") if who else model_label(mdl))
+            out.write(f"   {i:2} " + (paint(f"{model_label(mdl)}  (@{who} runs it)", "note") if who else model_label(mdl))
                       + "\n")
         while True:
             pick = ask("Model", "its number, a name, or Enter for its LLM's default")
             model = models[int(pick) - 1] if pick.isdigit() and 0 < int(pick) <= len(models) else pick
             if model and not re.fullmatch(r"[\w.:/-]+", model):
                 out.write(paint("  Not a model name.\n", "err"))
-            elif model and used.get(canon(model)):
-                out.write(paint(f"  @{used[canon(model)]} runs {model} already: pick another.\n", "err"))
             else:
                 break
         out.write("\n")
@@ -2342,9 +3604,9 @@ def new_agent_form(chair, win):
             return 0
     except (EOFError, KeyboardInterrupt):
         return 0
-    text = f"/agent new {name} {spec} {character} || {soul} || {rules} || {lean}"
-    tmx("send-keys", "-t", chair, "-l", " ".join(text.split()))
-    tmx("send-keys", "-t", chair, "Enter")
+    clean = lambda s: s.replace(KEY_CMD, "").replace("||", "/")
+    text = f"/agent new {name} {spec} {clean(character)} || {clean(soul)} || {clean(rules)} || {lean}"
+    send_cmd_now(chair, " ".join(text.split()))
     return 0
 
 
@@ -2359,7 +3621,7 @@ def clear_menu(client, target):
     title = f"#[align=centre] Take all {len(seated)} off the table? " + (
         f"({made} you made: deleted, folders kept) " if made else "")
     tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-T", title, "-x", "C", "-y", "C", "--",
-        "Yes, remove everyone", "y", f"send-keys -t '{chair}' -l '/remove all' ; send-keys -t '{chair}' Enter",
+        "Yes, remove everyone", "y", send_cmd(chair, "/remove all"),
         "", "No, keep them", "n", "")
     return 0
 
@@ -2372,17 +3634,17 @@ def one_menu(client, pane):
         return 0
 
     def send(text):
-        return f"send-keys -t '{chair}' -l '{text}' ; send-keys -t '{chair}' Enter"
+        return send_cmd(chair, text)
 
     seated = [x.split("=") for x in tmx("show-options", "-wqv", "-t", pane, "@council_seated").split(";") if x]
     items = []
-    for key, (handle, name, made) in zip("123456789", [x for x in seated if len(x) == 3]):
+    for key, (handle, name, made) in zip("1234567890bc", [x for x in seated if len(x) == 3]):   # a g q n taken
         items += [f"Delete agent @{name} for good" if made == "1" else f"Remove @{name} (+ add brings it back)", key,
                   send(f"/agent del {handle}" if made == "1" else f"/bench {handle}")]
     if not items:
         items += ["-Nobody at the table", "", ""]
     if seated:
-        items += ["Remove everyone…", "a", f"run-shell -b \"'{ME}' --clear-menu '{client}' '{pane}'\""]
+        items += ["Remove everyone…", "a", tmx_run(ME, "--clear-menu", client, pane)]
     items += ["", "Back to one pane per member", "g", send("/view grid"),
               "Close the council", "q", send("/quit"), "", "Cancel", "n", ""]
     tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane, "-T", "#[align=centre] Take who off? ",
@@ -2429,12 +3691,36 @@ def follow(feed, handle, owner, out, fd):
     import select
     pos, since, spun = 0, None, False
     one, thinking = handle == ALL, []      # the one view: everyone's answers, yours on the right
+    events = []
+    resized = [False]
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
+
+    def render_event(e):
+        if e.get("who") == "chair":
+            out.write(bubble("you", e.get("text", ""), "you", right=one))
+        elif e.get("who") == handle:
+            kind = "err" if e.get("problem") else e.get("kind", "agent")
+            out.write(bubble("@" + (e.get("as") or handle) + mark(e), e.get("text", ""), kind, right=True))
+        elif not e.get("problem"):
+            out.write(bubble("@" + (e.get("as") or e.get("who", "?")) + mark(e), e.get("text", ""),
+                             e.get("kind", "agent"), right=False))
+
     while True:
+        if resized[0]:
+            resized[0] = False
+            spun = False
+            out.write("\033[2J\033[3J\033[H")
+            for ev in events:
+                render_event(ev)
         chunk = b""
         try:
-            with open(feed, "rb") as f:
-                f.seek(pos)
-                chunk = f.read()
+            size = os.stat(feed).st_size
+            if size < pos:
+                pos = 0
+            if size > pos:
+                with open(feed, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read()
         except OSError:
             pass
         if chunk:
@@ -2450,7 +3736,8 @@ def follow(feed, handle, owner, out, fd):
                     spun = False
                 t = e.get("t")
                 if t == "reset":
-                    out.write("\033[2J\033[H")
+                    events.clear()
+                    out.write("\033[2J\033[3J\033[H")
                 elif t == "status":
                     running = e.get("who", [])
                     if handle in running or (one and running):
@@ -2458,19 +3745,19 @@ def follow(feed, handle, owner, out, fd):
                         thinking = [(e.get("names") or {}).get(h, h) for h in running]
                     else:
                         since = None
-                elif t == "msg" and e.get("who") == "chair":
-                    out.write(bubble("you", e.get("text", ""), "you", right=one))
-                elif t == "msg" and e.get("who") == handle:
-                    kind = "err" if e.get("problem") else e.get("kind", "agent")
-                    out.write(bubble("@" + (e.get("as") or handle) + mark(e), e.get("text", ""), kind, right=True))
-                    since = None
-                elif t == "msg" and not e.get("problem"):
-                    out.write(bubble("@" + (e.get("as") or e.get("who", "?")) + mark(e), e.get("text", ""), e.get("kind", "agent"),
-                                     right=False))
+                elif t == "msg":
+                    if e.get("who") == "chair" or e.get("who") == handle or not e.get("problem"):
+                        events.append(e)
+                        if len(events) > 500:
+                            events = events[-500:]
+                        render_event(e)
+                        if e.get("who") == handle:
+                            since = None
         if since:
             frame = SPIN[int(time.time() * 10) % len(SPIN)]
-            who = (" ".join("@" + n for n in thinking) + " ") if one else ""
-            out.write("\r\033[K" + paint(f"{frame} {who}thinking  {int(time.time() - since)}s", "note"))
+            cols = shutil.get_terminal_size((80, 20)).columns
+            line = thinking_line(frame, thinking if one else [], int(time.time() - since), cols, indent="", plural=False)
+            out.write("\r\033[K" + paint(line, "note"))
             spun = True
         out.flush()
         try:
@@ -2480,19 +3767,24 @@ def follow(feed, handle, owner, out, fd):
             out.flush()
             time.sleep(1)
             return 0
+        wait = 0.12 if since else 0.3
         try:
-            ready = select.select([fd], [], [], 0.12)[0]
+            ready = select.select([fd], [], [], wait)[0]
         except (OSError, ValueError):
             ready = []
-            time.sleep(0.12)
+            time.sleep(wait)
         if ready:
             try:
                 key = os.read(fd, 16)
             except OSError:
                 key = b""
-            if key[:1] in (b"m", b"M", b"\r", b"\n"):
+            if key in (b"m", b"M", b"\r", b"\n"):
                 me = os.environ.get("TMUX_PANE", "")
-                menu(tmx("display-message", "-p", "-t", me, "#{client_name}"), me)
+                cl = tmx("display-message", "-p", "-t", me, "#{client_name}")
+                if one:
+                    one_menu(cl, me)
+                else:
+                    menu(cl, me)
 
 
 # ---- commands ------------------------------------------------------------------------------------------
@@ -2501,7 +3793,8 @@ def build_members(conf, accts, out=None):
     someone off in one project's council leaves the others alone."""
     seats = conf.get("seats") or {}
     members = []
-    for tool in TOOLS:
+    active = [t for t in TOOLS if t in CORE_TOOLS or t in accts or t in (conf.get("llm") or {})]
+    for tool in active:
         acct, signed, folder = accts.get(tool, (None, False, None))
         st = conf.get("llm", {}).get(tool, {})
         m = Member(TOOLS[tool], tool, account=acct, model=st.get("model"), effort=st.get("effort"), folder=folder)
@@ -2572,6 +3865,58 @@ def command_line(line, meeting, conf, accts):
         print(__doc__.split("\n\n", 1)[1].split("\nMembers only read")[0])
     elif cmd == "new":
         pass                      # the meeting itself is swapped by the caller
+    elif cmd == "bp":
+        roles = [r[0] for r in BP_ROLES]
+        if args and args[0].lower() == "auto":
+            conf.pop("bp_cast", None)
+            save_conf(conf)
+            note("BP speakers: set by seat again.")
+            bp_menu(meeting, os.environ.get("TMUX_PANE", ""))
+        elif args and args[0].lower() == "pick" and len(args) > 1 and args[1].upper() in roles:
+            bp_pick_menu(meeting, os.environ.get("TMUX_PANE", ""), args[1].upper())
+        elif len(args) >= 2 and args[0].upper() in roles:
+            m = meeting.find(args[1].lstrip("@").rstrip(".,"))
+            adj = meeting.adjudicators()
+            if not m or not m.seated or m in adj:
+                note(f"{args[1]} is not at the table to speak (the judge does not speak).")
+                return True
+            now = {r: m2.handle for (r, *_x), m2 in meeting.bp_cast()}
+            cast = dict(conf.get("bp_cast") or now)
+            role, before = args[0].upper(), cast.get(args[0].upper()) or now.get(args[0].upper())
+            for r, h in list(cast.items()):          # it held another role: the two swap
+                if h == m.handle and r != role:
+                    cast[r] = before
+            cast[role] = m.handle
+            conf["bp_cast"] = {r: h for r, h in cast.items() if h}
+            save_conf(conf)
+            note(f"BP: @{m.shown()} speaks as {role}.")
+            bp_menu(meeting, os.environ.get("TMUX_PANE", ""))
+        else:
+            note("BP debate · " + " · ".join(f"{r[0]} @{m.shown()} ({m.runs_on()[0]})" for r, m in meeting.bp_cast())
+                 + " · /bp ROLE @name to change one, /bp auto to set them by seat")
+            bp_menu(meeting, os.environ.get("TMUX_PANE", ""))
+    elif cmd == "format":
+        names = {"forum": "forum", "open": "forum", "1": "forum", "bp": "bp", "debate": "bp", "british": "bp",
+                 "2": "bp", "stake": "stake", "win": "stake", "winstake": "stake", "3": "stake"}
+        cur = meeting.format()
+        want = names.get(args[0].lower().replace("-", "")) if args else FORMATS[(FORMATS.index(cur) + 1) % len(FORMATS)]
+        if not want:
+            note("Formats: forum (Open Forum), bp (British Parliamentary debate), stake (Win Stake). /format NAME")
+            return True
+        conf["format"] = want
+        save_conf(conf)
+        if want == "bp":
+            bp_menu(meeting, os.environ.get("TMUX_PANE", ""))
+        else:
+            rounds_menu(meeting, os.environ.get("TMUX_PANE", ""))
+        adj = meeting.adjudicators()
+        judge = (" Judge: " + " ".join("@" + m.shown() for m in adj) + ".") if adj else (
+            " No judge at the table yet: /agent power NAME judge on, or seat Supra Omnia.")
+        note(f"Format: {FORMAT_SHOWN[want]}. " + {
+            "forum": f"Mode {meeting.mode}; it ends after /rounds.",
+            "bp": "Your next message is the motion; up to 8 speak in BP order, then the judge ranks the benches." + judge,
+            "stake": "Everyone tries to win everyone over for /rounds rounds (at most 12), then votes; the judge "
+                     "announces the winner and sums up the top 3." + judge}[want])
     elif cmd in ("mode", "roast", "order"):
         # /mode alone switches between the two; /roast and /order go straight to one
         want = cmd if cmd != "mode" else (args[0].lower() if args else ("roast" if meeting.mode == "order" else "order"))
@@ -2628,12 +3973,38 @@ def command_line(line, meeting, conf, accts):
                           "@codex)") + ". /names model|llm changes it; @claude still finds it either way.")
         if GRID[0]:
             GRID[0].relabel(meeting)
-    elif cmd == "rounds":
+    elif cmd == "strikes":
+        # /strikes: who has how many; /strikes clear [@name …]: wipe them (all, or those named)
+        got = conf.setdefault("strikes", {})
+        if args and args[0].lower() == "clear":
+            names = [w.lstrip("@").lower() for w in args[1:]]
+            for h in list(got):
+                m = meeting.find(h)
+                if not names or h.lower() in names or (m and m.shown().lower() in names):
+                    got.pop(h, None)
+            save_conf(conf)
+            note("Strikes cleared" + (f" for {', '.join('@' + n for n in names)}." if names else "."))
+        else:
+            shown = [f"@{meeting.find(h).shown() if meeting.find(h) else h} {n}/{STRIKES}" for h, n in got.items() if n]
+            note(("Strikes: " + ", ".join(shown) + "." if shown else "Nobody has a strike.") +
+                 f" At {STRIKES} the member is removed. /strikes clear [@name] wipes them.")
+    elif cmd in ("rounds", "round"):      # /round too (operator, 2026-11-24)
+        if meeting.format() == "stake":
+            try:
+                v = int(args[0])
+                conf["stake_rounds"] = 12 if v == 0 else max(1, min(12, v))
+                save_conf(conf)
+            except (IndexError, ValueError):
+                pass
+            note(f"Win Stake: {meeting.stake_rounds()} round(s), then the vote. /rounds N sets it (1 to 12).")
+            return True
         if meeting.mode == "roast":
             try:
                 meeting.roasts = max(0, min(50, int(args[0])))
             except (IndexError, ValueError):
                 pass
+            conf["roasts"] = meeting.roasts
+            save_conf(conf)
             note("Roast mode: " + ("round after round until Ctrl+C." if not meeting.roasts else
                  f"{meeting.roasts} roast round(s) per message.") + " /rounds N sets it, 0 = until Ctrl+C.")
         else:
@@ -2644,6 +4015,8 @@ def command_line(line, meeting, conf, accts):
                     meeting.rounds = max(0, min(50, int(args[0])))
                 except (IndexError, ValueError):
                     pass
+            conf["rounds"] = meeting.rounds
+            save_conf(conf)
             note("Order mode: everyone answers, then " + (
                 "round the table again and again until Ctrl+C (or everyone passes)." if meeting.rounds == 0 else
                 "no round table (answers only)." if meeting.rounds < 0 else
@@ -2693,6 +4066,11 @@ def command_line(line, meeting, conf, accts):
                     note(f"@{m.shown()} runs {m.runs_on()[0]}, which @{other.shown()} runs already: give it another "
                          f"model first (/model @{m.handle} …) or ✕ @{other.shown()}.")
                     continue
+            if cmd == "seat" and not m.seated:
+                why = check_before_seating(m, meeting.folder)     # one short question: can it answer at all?
+                if why:
+                    note(why)
+                    continue
             m.seated = cmd == "seat"
             if not m.seated:
                 stop_member(m.handle)      # taken off the table: what it was answering stops now
@@ -2723,6 +4101,7 @@ def command_line(line, meeting, conf, accts):
                              and getattr(x, "signed", True) and (x.account or x.made)
                              and (not acct or x.account == acct)), None)
                 if back:
+                    prev_model = back.model
                     back.model = model
                     if back.made:
                         for a in conf["agents"]:
@@ -2730,8 +4109,18 @@ def command_line(line, meeting, conf, accts):
                                 a["model"] = model
                     else:
                         conf.setdefault("llm", {}).setdefault(tool, {})["model"] = model
-                    save_conf(conf)
-                    return command_line(f"/seat {back.handle}", meeting, conf, accts)
+                    res = command_line(f"/seat {back.handle}", meeting, conf, accts)
+                    if not back.seated:      # probe failed or table full: roll back the model change
+                        back.model = prev_model
+                        if back.made:
+                            for a in conf["agents"]:
+                                if a["name"] == back.name:
+                                    a["model"] = prev_model
+                        elif prev_model is None:
+                            (conf.get("llm") or {}).get(tool, {}).pop("model", None)
+                        else:
+                            conf.setdefault("llm", {}).setdefault(tool, {})["model"] = prev_model
+                    return res
                 base = "Agy" if tool == "agy" else TOOLS[tool]
                 n = 2
                 while meeting.find(f"{base}{n}"):
@@ -2746,19 +4135,29 @@ def command_line(line, meeting, conf, accts):
             persona, soul, rules, lean = (persona.split("||") + ["", "", ""])[:4]   # CHARACTER || SOUL || RULES || LEAN
             persona, soul, rules, lean = persona.strip(), soul.strip(), rules.strip(), lean_of(lean) or "free"
             if not spec:
-                note("LLM must be claude, codex, gemini or agy (with @account, :model and :effort if you like, "
-                     "e.g. claude:opus:high).")
+                bare = parse_llm(re.sub(r":\w+$", "", args[2])) if args[2].count(":") >= 2 else None
+                if bare and bare[0] == "gemini":
+                    note("A Gemini agent has no effort of its own: Gemini's effort is one setting for every "
+                         "Gemini (/effort @gemini LEVEL). Leave :effort out.")
+                else:
+                    tool_list = ", ".join(list(TOOLS)[:-1]) + f" or {list(TOOLS)[-1]}"
+                    note(f"LLM must be {tool_list} (with @account, :model and :effort if you like, "
+                         "e.g. claude:opus:high).")
             elif meeting.find(name):
                 note(f"There is a member called {name} already.")
             else:
                 tool, acct, model, effort = spec
-                conf["agents"].append({"name": name, "tool": tool, "account": acct, "model": model, "effort": effort,
-                                       "persona": persona, "soul": soul, "rules": rules, "lean": lean})
-                save_conf(conf)
                 cur = accts.get(tool, (None, False, None))
                 m = Member(name, tool, account=acct or cur[0], model=model, persona=persona, made=True, effort=effort,
                            folder=cur[2] if not acct or acct == cur[0] else None)
                 m.soul, m.rules, m.lean = soul, rules, lean
+                why = check_before_seating(m, meeting.folder)          # one short question: can it answer at all?
+                if why:
+                    note(why)
+                    return True
+                conf["agents"].append({"name": name, "tool": tool, "account": acct, "model": model, "effort": effort,
+                                       "persona": persona, "soul": soul, "rules": rules, "lean": lean})
+                save_conf(conf)
                 meeting.members.append(m)
                 where = ""
                 if persona:
@@ -2789,8 +4188,9 @@ def command_line(line, meeting, conf, accts):
             power, on = args[2].lower(), (args[3].lower() if len(args) > 3 else "on") not in ("off", "no", "0")
             if not m or not m.made or not m.persona:
                 note(f"No agent with a character called {args[1]} (powers are for agents you made).")
-            elif power != "remove":
-                note("The power there is: remove (take a member off the table on its own judgement).")
+            elif power not in ("remove", "judge"):
+                note("The powers there are: remove (strikes, then out) and judge (sits the round out, gives "
+                     "the verdict when it ends).")
             else:
                 m.powers = sorted(set(getattr(m, "powers", [])) | {power}) if on else \
                     [x for x in getattr(m, "powers", []) if x != power]
@@ -2798,9 +4198,13 @@ def command_line(line, meeting, conf, accts):
                     if a["name"] == m.name:
                         a["powers"] = m.powers
                 save_conf(conf)
-                note(f"@{m.shown()} " + ("may now remove members on its own judgement, saying why: an agent is "
-                                         "deleted with its memory wiped, an LLM's seat leaves the table." if on else
-                                         "no longer removes members."))
+                if power == "judge":
+                    note(f"@{m.shown()} " + ("is a judge: it sits each round out and gives its verdict when the "
+                                             "round ends." if on else "takes part in rounds again."))
+                else:
+                    note(f"@{m.shown()} " + (f"may now give strikes on its own judgement, saying why; at {STRIKES} "
+                                             "the member is removed (an agent deleted with its memory wiped, an "
+                                             "LLM's seat off the table)." if on else "no longer gives strikes."))
         elif sub in ("del", "rm", "remove") and len(args) >= 2:
             m = meeting.find(args[1].lstrip("@"))
             if not m or not m.made:
@@ -2830,8 +4234,15 @@ def command_line(line, meeting, conf, accts):
         vals = [w for w in args if not w.startswith("@")]
         if not who or not vals:
             for m in meeting.seated():
-                print(paint(f"  @{m.handle}", m.colour()) + f"  model: {m.model or 'its default'}   effort: " +
-                      (m.effort or "its default" if EFFORTS[m.tool] else "(none: Gemini has only the model)"))
+                if m.tool == "gemini":
+                    got = gemini_effort(m.home, m.runs_on()[0])          # what this member's model gets
+                    eff = (got or ("its default" if not gemini_effort(m.home) else
+                                   f"its default ({m.runs_on()[0]} gets no level)")) + " (one setting for every Gemini)"
+                elif EFFORTS[m.tool]:
+                    eff = m.effort or "its default"
+                else:
+                    eff = f"(none: {TOOLS[m.tool]} has only the model)"
+                print(paint(f"  @{m.handle}", m.colour()) + f"  model: {m.model or 'its default'}   effort: " + eff)
             note(f"/{cmd} @name VALUE sets it (@all for everyone), /{cmd} @name default goes back to the default. "
                  "/models lists the names.")
             return True
@@ -2839,14 +4250,33 @@ def command_line(line, meeting, conf, accts):
         value = None if value.lower() in ("default", "none", "-") else value
         targets = meeting.seated() if any(w.lower() in ("@all", "@everyone") for w in who) else \
             [meeting.find(w[1:].rstrip(".,")) or w for w in who]
+        gemini_done = False
         for m in targets:
             if isinstance(m, str):
                 note(f"No member called {m}.")
                 continue
+            if cmd == "effort" and m.tool == "gemini":
+                # One setting for every Gemini, in Gemini's own settings (afc-gemini-effort), not kept
+                # per member: each turn starts a new Gemini, which reads it
+                level = (value or "default").lower()
+                if level not in EFFORTS["gemini"] + ["default"]:
+                    note(f"@{m.handle}: effort for Gemini is one of {', '.join(EFFORTS['gemini'])}.")
+                    continue
+                if gemini_done:
+                    continue
+                done, why = set_gemini_effort(m.home, level)
+                if not done:
+                    note(f"@{m.handle}: Gemini's effort was not changed: {why}")
+                    continue
+                gemini_done = True          # set once it worked: a member with no known home blocks no other
+                shown = "each model's own" if level == "default" else level
+                note(f"Gemini's effort is one setting for every Gemini: now {shown}. The council's Gemini takes "
+                     "it from its next turn; a Gemini already open in a pane when it starts again (Alt+M there "
+                     "restarts it on its chat).")
+                continue
             if cmd == "effort" and value is not None:
                 if not EFFORTS[m.tool]:
-                    note(f"@{m.handle}: Gemini's command line has no effort setting; its model is the choice "
-                         f"(/model @{m.handle} gemini-4-hydrogen).")
+                    note(f"@{m.handle}: {TOOLS[m.tool]}'s command line has no effort setting; its model is the choice.")
                     continue
                 if value.lower() not in EFFORTS[m.tool]:
                     note(f"@{m.handle}: effort for {TOOLS[m.tool]} is one of {', '.join(EFFORTS[m.tool])}.")
@@ -2908,10 +4338,12 @@ def command_line(line, meeting, conf, accts):
         if GRID[0]:
             GRID[0].relabel(meeting)
     elif cmd == "models":
-        for tool in TOOLS:
+        shown_tools = [t for t in TOOLS if t in CORE_TOOLS or any(m.tool == t for m in meeting.members)]
+        for tool in shown_tools:
             home = next((m.home for m in meeting.members if m.tool == tool and m.home), None)
             print(paint(f"  {TOOLS[tool]}", tool) + ": " + ", ".join(models_for(tool, home)) + "   effort: " +
-                  (", ".join(EFFORTS[tool]) if EFFORTS[tool] else "none"))
+                  (", ".join(EFFORTS[tool]) if EFFORTS[tool] else "none") +
+                  (" (one setting for every Gemini)" if tool == "gemini" else ""))
         note("Any name that LLM's own program takes works too (`agy models` lists Antigravity's).")
     elif cmd == "view":
         want = args[0].lower() if args else ("grid" if conf.get("view") == "one" else "one")
@@ -2931,6 +4363,9 @@ def command_line(line, meeting, conf, accts):
             if GRID[0]:
                 GRID[0].close()
             note("Grid off: every answer in full here.")
+        elif args and args[0].lower() == "refresh":
+            if GRID[0] and FEED["grid"] and GRID[0].me:
+                GRID[0].open(meeting)
         elif GRID[0] is None or not GRID[0].me:
             note("The grid needs tmux: open the council with Alt+K.")
         else:
@@ -2964,7 +4399,11 @@ def pid_cwd(pid):
 
 
 def open_tab(session, pid):
-    """Alt+K: a new tab with the council in the folder of the pane it was pressed in."""
+    """Alt+K: the council about the folder of the pane it was pressed in, as a split in that pane's tab
+    (operator, 2026-11-24: inside its project, not a tab of its own like a newly added project; a
+    council about something else is Alt+Shift+K, which keeps a tab of its own). In a shared tab the
+    council shows everyone's answers in its own pane (no grid; /grid on asks for one). A council open
+    in that tab already is brought to the front instead of a second one."""
     tmux = os.path.join(HOME, ".local/bin/tmux")
     tmux = tmux if os.access(tmux, os.X_OK) else "tmux"
     me = os.path.join(HOME, ".local/bin/afc-council")
@@ -2973,7 +4412,19 @@ def open_tab(session, pid):
         pid = int(pid)
     except (TypeError, ValueError):
         pid = 0
-    subprocess.run([tmux, "new-window"] + target + ["-n", "council", f"{me} --from-pid {pid}"])
+    rows = [r.split() for r in tmx("list-panes", "-a", "-F", "#{pane_pid} #{pane_id} #{window_id}").splitlines()]
+    here = next((r for r in rows if len(r) == 3 and pid and r[0] == str(pid)), None)
+    if here:
+        open_here = [r.split()[0] for r in tmx("list-panes", "-t", here[2], "-F",
+                                               "#{pane_id} #{?#{@council_chat},c,-}").splitlines() if r.endswith(" c")]
+        if open_here:
+            tmx("select-pane", "-t", open_here[0])
+            return 0
+        if tmx("show-options", "-wqv", "-t", here[2], "@council") != "1":
+            subprocess.run([tmux, "split-window", "-fh", "-l", "42%", "-t", here[1],
+                            f"{shlex.quote(me)} --from-pid {pid}"])
+            return 0
+    subprocess.run([tmux, "new-window"] + target + ["-n", "council", f"{shlex.quote(me)} --from-pid {pid}"])
     return 0
 
 
@@ -2986,7 +4437,7 @@ def open_general(session):
     tmux = tmux if os.access(tmux, os.X_OK) else "tmux"
     me = os.path.join(HOME, ".local/bin/afc-council")
     target = [] if not session else ["-t", f"={session}:"]
-    subprocess.run([tmux, "new-window"] + target + ["-n", "council", f"{me} --general"])
+    subprocess.run([tmux, "new-window"] + target + ["-n", "council", f"{shlex.quote(me)} --general"])
     return 0
 
 
@@ -3055,16 +4506,24 @@ def main(argv):
     os.chdir(meeting.folder)
     pane = os.environ.get("TMUX_PANE", "")
     if os.environ.get("TMUX") and pane and TTY:
-        tmx("rename-window", "-t", pane, "council")
+        alone = tmx("display-message", "-p", "-t", pane, "#{window_panes}") == "1"
+        if alone:                     # a tab of its own (Alt+Shift+K); a project's tab keeps its name
+            tmx("rename-window", "-t", pane, "council")
+        tmx("set-option", "-p", "-t", pane, "@council_chat", "1")   # ✕ / Alt+Q here: the council quits
         d = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "afc-council")
         os.makedirs(d, exist_ok=True)
         FEED["path"] = os.path.join(d, f"{os.getpid()}.jsonl")
         open(FEED["path"], "w").close()
         GRID[0] = Grid()
-        # The grid opens by itself in a tab of its own (Alt+K); in a tab you share, /grid on asks for it
-        if conf.get("grid", True) and "--no-grid" not in argv and \
-                tmx("display-message", "-p", "-t", pane, "#{window_panes}") == "1":
+        # The grid opens by itself in a tab of its own (Alt+Shift+K); in a shared project tab (Alt+K),
+        # keep a single split pane unless /grid on or Alt+O asks for it — still set the council header
+        # and window options so + add and Alt+A work right away.
+        if conf.get("grid", True) and "--no-grid" not in argv and alone:
             GRID[0].open(meeting)
+        else:
+            GRID[0].chair_header(meeting)
+            tmx("set-option", "-w", "-t", pane, "@council", "1")
+            GRID[0].relabel(meeting)
     threading.Thread(target=animate, daemon=True).start()
     if TTY:
         threading.Thread(target=refresh_models, daemon=True).start()
@@ -3075,18 +4534,23 @@ def main(argv):
     if FEED["grid"]:
         replay(meeting)
         # The chat box is only for typing: the welcome sits on its note line until the first note
-        BOX["note"] = (remembered or f"Council · {os.path.basename(folder) or folder} · mode {meeting.mode} · "
+        BOX["note"] = (remembered or f"Council · {os.path.basename(folder) or folder} · {FORMAT_SHOWN[meeting.format()]} · mode {meeting.mode} · "
                        "answers in the panes above") + (" · " + outs[0] if outs and not carried else "")
     else:
-        print(paint(f"Council · {os.path.basename(folder) or folder} · mode {meeting.mode}", "chair"))
+        rinfo = (f"8 speakers" if meeting.format() == "bp" else
+                 f"{meeting.stake_rounds()} rounds" if meeting.format() == "stake" else
+                 ("until Ctrl+C" if not meeting.roasts else f"{meeting.roasts}×") if meeting.mode == "roast" else
+                 ("until Ctrl+C" if meeting.rounds == 0 else "answers only" if meeting.rounds < 0 else f"{meeting.rounds}×"))
+        print(paint(f"Council · {os.path.basename(folder) or folder} · {FORMAT_SHOWN[meeting.format()]} · mode {meeting.mode} ({rinfo})", "chair"))
         if remembered:
             note(remembered.capitalize())
         print("  At the table: " + " ".join(paint(m.label(), m.colour()) for m in meeting.seated()))
         for o in outs:
             note(o)
-        note("Tag with @name, /mode order|roast, /model and /effort @name VALUE, /agent new NAME LLM PERSONA, "
-             "/help. Ctrl+C stops a round.")
+        note("Tag with @name, /format, /mode order|roast, /model and /effort @name VALUE, /agent new NAME LLM "
+             "PERSONA, /help. Ctrl+C stops a round.")
         print()
+    format_menu(meeting, pane)
     if TTY:     # a hard crash (readline, a C library) leaves its Python traceback in errors.log
         try:
             import faulthandler
@@ -3109,6 +4573,7 @@ def main(argv):
             TABLE[0].close_session()
         if GRID[0]:
             GRID[0].close()
+            GRID[0].clear_window_opts()
         if FEED["path"]:
             try:
                 os.unlink(FEED["path"])
@@ -3137,6 +4602,37 @@ def chat(meeting, members, conf, accts, folder):
         RL[0] = rl_lib()
         if RL[0]:      # the box redraws itself on a resize, readline's own redraw left out
             signal.signal(signal.SIGWINCH, relayout)
+
+    def sync_grid_ui(had_grid):
+        nonlocal work
+        if had_grid != FEED["grid"]:
+            if FEED["grid"]:
+                work = Worker()
+                WORKER[0] = work
+                BOX["on"] = TTY
+                if BOX["on"]:
+                    RL[0] = rl_lib()
+                    if RL[0]:
+                        signal.signal(signal.SIGWINCH, relayout)
+                    setup_typing()
+                replay(meeting)
+            else:
+                if work:
+                    work.stop()
+                work = WORKER[0] = None
+                BOX["on"] = False
+                if TTY:
+                    signal.signal(signal.SIGWINCH, signal.SIG_DFL)
+                    sys.stdout.write("\033[r\n")
+                    sys.stdout.flush()
+                    setup_typing()
+                if BOX["note"]:
+                    note(BOX["note"])
+        if GRID[0]:
+            GRID[0].chair_header(meeting)
+            if not FEED["grid"]:
+                GRID[0].relabel(meeting)
+
     while True:
         try:
             INPUT["open"] = bool(work)
@@ -3163,26 +4659,87 @@ def chat(meeting, members, conf, accts, folder):
             continue
         finally:
             INPUT["open"] = INPUT["rl"] = False
+        m_cmd = re.search(re.escape(KEY_CMD) + r"(.*?)" + re.escape(KEY_CMD), line)
+        if m_cmd:
+            rest = line[:m_cmd.start()] + line[m_cmd.end():]
+            if rest:
+                PENDING["text"] = rest
+            line = m_cmd.group(1)
         if KEY_NEW in line:              # Alt+T: a new meeting, named by what was typed
             line = ("/new " + line.replace(KEY_NEW, "", 1).strip()).strip()
         for marker, cmd in ((KEY_MODE, "/mode"), (KEY_VIEW, "/view"), (KEY_PERM, "/perm " + {
                 "plan": "edit", "edit": "bypass"}.get(conf.get("perm") or "plan", "plan"))):
-            if marker in line:            # Shift+Tab or Alt+P: do it, and give back what was typed
+            if marker in line:            # Shift+Tab, Alt+O or Alt+P: do it, and give back what was typed
                 PENDING["text"] = line.replace(marker, "", 1)
-                if BOX["on"]:
-                    boxed(command_line, cmd, meeting, conf, accts)
-                else:
-                    command_line(cmd, meeting, conf, accts)
-                if FEED["grid"] and GRID[0]:
-                    GRID[0].chair_header(meeting)
+                had_grid = FEED["grid"]
+                try:
+                    if BOX["on"]:
+                        boxed(command_line, cmd, meeting, conf, accts)
+                    else:
+                        command_line(cmd, meeting, conf, accts)
+                except KeyboardInterrupt:
+                    pass
+                sync_grid_ui(had_grid)
                 line = None
                 break
         if line is None:
             continue
-        line = line.strip()
+        line = attach_images(expand_pastes(line), meeting).replace("\r\n", "\n").replace("\r", "\n").strip()
+        if line.split()[:1] == ["/sim"] or line.lower().startswith("/sim "):
+            parts = line.split(None, 2)
+            if len(parts) < 2:
+                note("Monte Carlo simulation: /sim N [QUESTION] — run N independent trials (1 to 20) in the "
+                     "current format (omit QUESTION to re-run the last message).")
+                continue
+            try:
+                n_trials = int(parts[1])
+            except ValueError:
+                note("First argument must be the number of trials (1 to 20): /sim 5 QUESTION.")
+                continue
+            if n_trials < 1 or n_trials > 20:
+                note("Pick between 1 and 20 trials: /sim N [QUESTION] (max 20 to protect quota).")
+                continue
+            q = parts[2].strip() if len(parts) > 2 else ""
+            if q:
+                base_thread = list(meeting.thread)
+                named = boxed(tags, q, meeting) if BOX["on"] else tags(q, meeting)
+                if named is None:
+                    continue
+                entry = {"who": "chair", "name": "Chair", "text": q, "phase": "chair"}
+                if named:
+                    entry["to"] = [m.handle for m in named]
+                with LOCK:
+                    meeting.thread.append(entry)
+                    emit({"t": "msg", "who": "chair", "text": q, "phase": "chair"})
+                if not TTY and not FEED["grid"]:
+                    show(entry)
+                meeting.name_session(meeting.topic or q)
+                last = named or meeting.seated()
+            else:
+                idx = next((i for i in range(len(meeting.thread) - 1, -1, -1)
+                            if meeting.thread[i].get("who") == "chair"), None)
+                if idx is None:
+                    note("Nothing to simulate yet: /sim N QUESTION (1 to 20 trials).")
+                    continue
+                q = meeting.thread[idx]["text"]
+                base_thread = list(meeting.thread[:idx])
+                last = last if last is not None else meeting.seated()
+            if work:
+                work.sim(meeting, n_trials, q, last, base_thread)
+            else:
+                STOP.clear()
+                meeting.simulate(n_trials, q, last, base_thread=base_thread)
+                if STOP.is_set():
+                    set_status([])
+                    note("Stopped. Completed trials were tallied.")
+            continue
         if line.split()[:1] == ["/retry"] or line.lower().startswith("/retry "):
-            named = tags(line[6:].strip(), meeting) if line[6:].strip() else \
-                [m for m in meeting.seated() if FAILS.get(m.handle)]
+            rest = line[6:].strip()
+            if rest:
+                norm = " ".join(w if w.startswith("@") else "@" + w for w in rest.split())
+                named = tags(norm, meeting)
+            else:
+                named = [m for m in meeting.seated() if FAILS.get(m.handle)]
             if not named:
                 note("Nobody to retry: /retry @name, or it asks the ones that went wrong last.")
                 continue
@@ -3214,11 +4771,20 @@ def chat(meeting, members, conf, accts, folder):
                 continue
             if work:
                 work.stop()
+            old_rounds, old_roasts = meeting.rounds, meeting.roasts
             meeting.save()
             meeting.close_session()
             meeting = Meeting(folder, members, conf)
+            meeting.rounds, meeting.roasts = old_rounds, old_roasts
             TABLE[0] = meeting
+            last = None
+            FAILS.clear()
+            LAST_FAIL.clear()
             n = carry_on(meeting, pick)
+            try:
+                os.chdir(meeting.folder)
+            except OSError:
+                pass
             if FEED["grid"]:
                 replay(meeting)
             msg = f"Carrying on “{fit(meeting.topic or next((e.get('text', '') for e in meeting.thread if e.get('who') == 'chair'), ''), 40)}” ({n} messages)."
@@ -3227,33 +4793,46 @@ def chat(meeting, members, conf, accts, folder):
             else:
                 note(msg)
             continue
-        if line.startswith("/"):
+        if line.startswith("/") and "/" not in line.split()[0][1:]:
             if line.split()[0].lower() in ("/again", "/more"):
                 line = ""
             else:
                 seats = [m.handle for m in meeting.seated()]
                 had_grid = FEED["grid"]
-                if not (boxed(command_line, line, meeting, conf, accts) if BOX["on"] else
-                        command_line(line, meeting, conf, accts)):
+                try:
+                    keep_going = (boxed(command_line, line, meeting, conf, accts) if BOX["on"] else
+                                  command_line(line, meeting, conf, accts))
+                except KeyboardInterrupt:
+                    keep_going = True
+                if not keep_going:
                     break
                 if line.split()[0].lower() == "/new":
                     if work:
                         work.stop()
+                    old_rounds, old_roasts = meeting.rounds, meeting.roasts
                     meeting.save()
                     meeting.close_session()
                     meeting = Meeting(folder, members, conf)
+                    meeting.rounds, meeting.roasts = old_rounds, old_roasts
                     TABLE[0] = meeting
+                    last = None
+                    FAILS.clear()
+                    LAST_FAIL.clear()
                     meeting.topic = line[4:].strip()
+                    format_menu(meeting, os.environ.get("TMUX_PANE", ""), wait=0.5)
                     meeting.open_session()
                     meeting.name_session(meeting.topic)
+                    try:
+                        os.chdir(meeting.folder)
+                    except OSError:
+                        pass
                     with LOCK:
                         emit({"t": "reset"})
                     if BOX["on"]:
                         BOX["note"] = "A new meeting." + (f" Topic: {meeting.topic}" if meeting.topic else "")
                     else:
                         note("A new meeting." + (f" Topic: {meeting.topic}" if meeting.topic else ""))
-                if FEED["grid"] and GRID[0]:
-                    GRID[0].chair_header(meeting)
+                sync_grid_ui(had_grid)
                 if had_grid and FEED["grid"] and GRID[0] and seats != [m.handle for m in meeting.seated()]:
                     GRID[0].open(meeting)          # someone joined or left: the grid is dealt out again
                 continue
@@ -3268,8 +4847,11 @@ def chat(meeting, members, conf, accts, folder):
             named = boxed(tags, line, meeting) if BOX["on"] else tags(line, meeting)
             if named is None:
                 continue
+            entry = {"who": "chair", "name": "Chair", "text": line, "phase": "chair"}
+            if named:
+                entry["to"] = [m.handle for m in named]
             with LOCK:
-                meeting.thread.append({"who": "chair", "name": "Chair", "text": line, "phase": "chair"})
+                meeting.thread.append(entry)
                 emit({"t": "msg", "who": "chair", "text": line, "phase": "chair"})
             meeting.name_session(meeting.topic or line)
             last = named or meeting.seated()
@@ -3314,15 +4896,32 @@ class Worker:
 
     def submit(self, meeting, targets, fresh, directed=()):
         with LOCK:
-            if fresh and meeting.mode == "roast" and ROAST["meeting"] is meeting:
-                # the roast goes on: everyone hears the message (it is in the thread) and answers it
-                # in its next turn; the ones it was addressed to are told it was for them
-                ROAST["directed"].update(m.handle for m in directed)
-                return
+            # A new message always starts a new round for everyone it is for, in roast mode too. (It used
+            # to join a roast already going, but only members still roasting heard it: those already done
+            # never answered, so @all reached two of nine. Operator, 2026-11-24.) The older round starts
+            # no new turns; answers already on their way still arrive.
             GEN[0] += 1
             gen = GEN[0]
         STOP.clear()
         threading.Thread(target=self.run, args=(meeting, targets, fresh, gen), daemon=True).start()
+
+    def sim(self, meeting, n, question, targets, base_thread):
+        """Run a Monte Carlo simulation in the background (Ctrl+C or a newer message stops it)."""
+        with LOCK:
+            GEN[0] += 1
+            gen = GEN[0]
+        STOP.clear()
+
+        def go():
+            try:
+                meeting.simulate(n, question, targets, base_thread=base_thread, gen=gen)
+            except Exception as e:  # noqa: BLE001
+                note(f"Simulation failed: {e}")
+            if STOP.is_set() and gen == GEN[0] and not BUSY.is_set():
+                set_status([])
+                note("Stopped. Completed trials were tallied.")
+                meeting.save()
+        threading.Thread(target=go, daemon=True).start()
 
     def retry(self, meeting, members, task):
         """Ask those members again, alongside whatever is going on (a roast keeps going)."""
@@ -3353,13 +4952,15 @@ class Worker:
             meeting.save()
 
     def stop(self):
-        """Stop every round at work (a new meeting, /quit)."""
+        """Stop every round at work (a new meeting, /quit); escalate to SIGKILL if a child ignores SIGTERM."""
         if BUSY.is_set():
             STOP.set()
             stop_all()
-            for _ in range(100):
+            for i in range(100):
                 if not BUSY.is_set():
                     break
+                if i == 50:
+                    stop_all(signal.SIGKILL)
                 time.sleep(0.05)
 
 

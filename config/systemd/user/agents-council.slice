@@ -1,0 +1,17 @@
+[Unit]
+Description=Capped group for council turns inside the agents group (afc-council)
+
+[Slice]
+# A child of agents.slice (the name does it), so the fleet's total stays what agents.slice says.
+# Parallel council turns (up to 8-10 models starting at once) share this ceiling; CPUWeight=50
+# (half of coding panes' 100) and IOWeight=25 ensure coding panes still win under contention
+# while the fleet total stays capped by agents.slice (350%).
+CPUQuota=300%
+CPUWeight=50
+MemoryHigh=4G
+MemoryMax=5G
+MemorySwapMax=256M
+TasksMax=600
+# Sibling-relative inside agents.slice (normal panes are 100): council disk reads yield 4:1 to
+# coding panes while the whole fleet yields at 30 to the desktop (100).
+IOWeight=25

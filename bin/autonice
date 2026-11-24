@@ -43,6 +43,16 @@ DORDER=()
 declare -A TURN TJOB T_START T_OWNER T_CWD T_FREE T_KILL
 # The tmux the fleet runs on (a client of another version cannot talk to it).
 TMUXBIN="${AUTONICE_TMUX:-$HOME/.local/bin/tmux}"; [ -x "$TMUXBIN" ] || TMUXBIN=tmux
+# Cached rules snapshot + per-pid matched priority so steady processes skip regex + rule reloads.
+LAST_RULES="__unset__"
+declare -A SEEN_ARGS SEEN_PRIO
+
+read_cgroup() {   # read_cgroup <pid> -> sets REPLY to /proc/<pid>/cgroup without forking grep
+    REPLY=""
+    [ -r "/proc/$1/cgroup" ] || return 1
+    IFS= read -r -d '' REPLY < "/proc/$1/cgroup" 2>/dev/null
+    [ -n "$REPLY" ]
+}
 
 seconds() {   # "3h", "90m", "45s" or a bare number of minutes -> seconds
     local n=${1%[smh]} u=${1##*[0-9]}
@@ -71,6 +81,17 @@ load_rules() {
     done < "$RULES"
     COMBINED=$(IFS='|'; echo "${PATS[*]}")
     GCOMBINED=$(IFS='|'; echo "${GPATS[*]}")
+}
+
+maybe_load_rules() {   # reload only when $RULES actually changed (zero forks)
+    local raw=""
+    if [ -f "$RULES" ]; then
+        IFS= read -r -d '' raw < "$RULES" 2>/dev/null
+    fi
+    [ "$raw" = "$LAST_RULES" ] && return 0
+    LAST_RULES=$raw
+    SEEN_ARGS=(); SEEN_PRIO=()
+    load_rules
 }
 
 if [ "$1" = "--status" ]; then
@@ -187,18 +208,26 @@ told_to_quit() {   # a paused job whose owner asked it to stop (SIGHUP/INT/TERM 
 
 save_state() {   # what jobq --status reads
     local pid
-    for pid in "${!HELD_FD[@]}"; do
-        echo "$pid ${HELD_SLOT[$pid]} $(ps -o args= -p "$pid" | cut -c1-100)"
-    done > "$RUN/held"
-    for pid in "${!PAUSED[@]}"; do echo "$pid ${PAUSED[$pid]}"; done > "$RUN/paused"
+    if [ ${#HELD_FD[@]} -gt 0 ]; then
+        for pid in "${!HELD_FD[@]}"; do
+            echo "$pid ${HELD_SLOT[$pid]} $(ps -o args= -p "$pid" | cut -c1-100)"
+        done > "$RUN/held"
+    elif [ ! -e "$RUN/held" ] || [ -s "$RUN/held" ]; then
+        : > "$RUN/held"
+    fi
+    if [ ${#PAUSED[@]} -gt 0 ]; then
+        for pid in "${!PAUSED[@]}"; do echo "$pid ${PAUSED[$pid]}"; done > "$RUN/paused"
+    elif [ ! -e "$RUN/paused" ] || [ -s "$RUN/paused" ]; then
+        : > "$RUN/paused"
+    fi
 }
 
 gate_pass() {
-    local pid ppid uid tty args i a nested start class
+    local pid tty args i idx a nested start class xl
     local -A MATCH=() SEEN=()
     local order=()
-    KIDS=(); PARENT=(); WATCH=(); DUPC=(); DORDER=(); TJOB=()
-    mkdir -p "$RUN"
+    WATCH=(); DUPC=(); DORDER=(); TJOB=()
+    [ -d "$RUN" ] || mkdir -p "$RUN"
 
     # Free the slots of jobs that have ended; forget paused jobs that are gone.
     for pid in "${!HELD_FD[@]}"; do
@@ -209,12 +238,9 @@ gate_pass() {
         [ "$(start_time "$pid")" = "$start" ] || unset 'PAUSED[$pid]'
     done
 
-    # One pass over all processes: build the family tree, note background
-    # (no terminal) processes of ours that match a gate rule, oldest first.
-    while read -r pid ppid uid tty args; do
-        PARENT[$pid]=$ppid; KIDS[$ppid]+="$pid "
-        [ ${#GPATS[@]} -gt 0 ] || continue
-        [[ "$uid" == "$UID" && "$args" =~ $GCOMBINED ]] || continue
+    # Gate matches were pre-filtered by the single ps|awk pass (oldest first, our UID only).
+    for idx in "${!G_PIDS[@]}"; do
+        pid=${G_PIDS[$idx]}; tty=${G_TTYS[$idx]}; args=${G_ARGS[$idx]}
         for i in "${!GPATS[@]}"; do
             if [[ "$args" =~ ${GPATS[$i]} ]]; then
                 # The idle stop watches terminal-started jobs too; the gate only background ones.
@@ -225,7 +251,7 @@ gate_pass() {
                 break
             fi
         done
-    done < <(ps -e -o pid=,ppid=,uid=,tty=,args= --sort=start_time)
+    done
 
     for pid in "${order[@]}"; do
         # Children of a gated job ride on its slot.
@@ -240,7 +266,7 @@ gate_pass() {
         # The express lane (agents-express.slice) has slots of its own ("slots heavy-x N", default 1),
         # so its jobs never wait behind the fleet's, but they are still counted: with no gate at all
         # one tab ran seven browser tests and a 4 GB dev server at once (2026-11-21).
-        xl=""; grep -qs agents-express.slice "/proc/$pid/cgroup" && xl="-x"
+        xl=""; read_cgroup "$pid" && [[ "$REPLY" == *agents-express.slice* ]] && xl="-x"
         SEEN[$pid]=1
         [ -n "${HELD_FD[$pid]}" ] && continue
 
@@ -297,6 +323,10 @@ idle_pass() {
         [ "$(start_time "$pid")" = "${W_START[$pid]}" ] && continue
         unset 'W_START[$pid]' 'W_CPU[$pid]' 'W_ACTIVE[$pid]' 'W_KILL[$pid]'
     done
+    if [ ${#WATCH[@]} -eq 0 ]; then
+        if [ ! -e "$RUN/idle" ] || [ -s "$RUN/idle" ]; then : > "$RUN/idle"; fi
+        return 0
+    fi
     : > "$RUN/idle.new"
     for pid in "${!WATCH[@]}"; do
         # A watched job inside another watched job is part of it.
@@ -459,7 +489,11 @@ turn_pass() {
         [ -n "${TJOB[$pid]}" ] && continue
         unset 'T_START[$pid]' 'T_OWNER[$pid]' 'T_CWD[$pid]' 'T_FREE[$pid]' 'T_KILL[$pid]'
     done
-    [ ${#TURN[@]} -gt 0 ] || { rm -f "$RUN/turn"; return 0; }
+    [ ${#TURN[@]} -gt 0 ] || { [ -e "$RUN/turn" ] && rm -f "$RUN/turn"; return 0; }
+    if [ ${#TJOB[@]} -eq 0 ]; then
+        if [ ! -e "$RUN/turn" ] || [ -s "$RUN/turn" ]; then : > "$RUN/turn"; fi
+        return 0
+    fi
     : > "$RUN/turn.new"
     for pid in "${!TJOB[@]}"; do
         # A job of the class inside another one is part of it.
@@ -532,34 +566,82 @@ if [ -f "$RUN/paused" ]; then
     done < "$RUN/paused"
 fi
 
+declare -A ALIVE_P
+
 while true; do
-    load_rules
-    if [ ${#PATS[@]} -gt 0 ]; then
-        # Pre-filter with one combined regex, then apply the first matching rule.
-        while read -r pid ni args; do
-            [[ "$ni" =~ ^-?[0-9]+$ ]] || continue
-            for i in "${!PATS[@]}"; do
-                if [[ "$args" =~ ${PATS[$i]} ]]; then
+    maybe_load_rules
+    KIDS=(); PARENT=()
+    G_PIDS=(); G_TTYS=(); G_ARGS=()
+    need_tree=0
+    (( ${#HELD_FD[@]} > 0 || ${#PAUSED[@]} > 0 )) && need_tree=1
+    if [ ${#PATS[@]} -gt 0 ] || [ ${#GPATS[@]} -gt 0 ] || [ "$need_tree" -eq 1 ]; then
+        ALIVE_P=()
+        # One ps+awk pass over our processes: pre-filters both priority and gate rules against
+        # args only (skip the "<pid> <ppid> <ni> <tty> " prefix so ^ anchors match bare commands
+        # like "claude" or "agy"), and emits the parent/child tree only when a gate rule matched
+        # or a slot/paused job is live. ENVIRON passes regexes verbatim.
+        while read -r kind f1 f2 rest; do
+            case "$kind" in
+                P)
+                    [[ "$f2" =~ ^-?[0-9]+$ ]] || continue
+                    ALIVE_P[$f1]=1
+                    if [ -n "${SEEN_PRIO[$f1]}" ] && [ "${SEEN_ARGS[$f1]}" = "$rest" ]; then
+                        prio=${SEEN_PRIO[$f1]}
+                    else
+                        prio=""
+                        for i in "${!PATS[@]}"; do
+                            if [[ "$rest" =~ ${PATS[$i]} ]]; then
+                                prio=${PRIOS[$i]}
+                                SEEN_ARGS[$f1]=$rest
+                                SEEN_PRIO[$f1]=$prio
+                                break
+                            fi
+                        done
+                        [ -n "$prio" ] || continue
+                    fi
                     # The express lane (agents-express.slice, see `agents --express`) keeps normal
                     # priority: it is already inside agents.slice, so the hard cap still holds.
-                    if grep -qs agents-express.slice "/proc/$pid/cgroup"; then break; fi
-                    prio=${PRIOS[$i]}
-                    if [ "$ni" -lt "$prio" ]; then
-                        renice -n "$prio" -p "$pid" >/dev/null 2>&1
+                    read_cgroup "$f1" || continue
+                    [[ "$REPLY" == *agents-express.slice* ]] && continue
+                    if [ "$f2" -lt "$prio" ]; then
+                        renice -n "$prio" -p "$f1" >/dev/null 2>&1
                         if [ "$prio" -ge 19 ]; then
-                            ionice -c3 -p "$pid" 2>/dev/null        # disk: idle only
+                            ionice -c3 -p "$f1" 2>/dev/null        # disk: idle only
                         else
-                            ionice -c2 -n7 -p "$pid" 2>/dev/null    # disk: lowest normal
+                            ionice -c2 -n7 -p "$f1" 2>/dev/null    # disk: lowest normal
                         fi
                     fi
                     # Hard cap: move into the capped agents group if not there yet.
-                    if [ -w "$POOL" ] && ! grep -q "/agents.slice/" "/proc/$pid/cgroup" 2>/dev/null; then
-                        echo "$pid" > "$POOL" 2>/dev/null
+                    if [ -w "$POOL" ] && [[ "$REPLY" != */agents.slice/* ]]; then
+                        echo "$f1" > "$POOL" 2>/dev/null
                     fi
-                    break
-                fi
-            done
-        done < <(ps -u "$USER" -o pid=,ni=,args= | grep -E -- "$COMBINED")
+                    ;;
+                G)
+                    G_PIDS+=("$f1"); G_TTYS+=("$f2"); G_ARGS+=("$rest")
+                    ;;
+                T)
+                    PARENT[$f1]=$f2; KIDS[$f2]+="$f1 "
+                    ;;
+            esac
+        done < <(ps -u "$UID" -o pid=,ppid=,ni=,tty=,args= --sort=start_time | \
+            PAT="$COMBINED" GPAT="$GCOMBINED" NT="$need_tree" awk '
+            BEGIN { pat = ENVIRON["PAT"]; gpat = ENVIRON["GPAT"]; nt = ENVIRON["NT"] + 0 }
+            {
+                pid = $1; ppid = $2; ni = $3; tty = $4
+                p_pid[++n] = pid; p_ppid[n] = ppid
+                s = $0
+                sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", s)
+                if (pat != "" && s ~ pat) print "P " pid " " ni " " s
+                if (gpat != "" && s ~ gpat) { gfound = 1; print "G " pid " " tty " " s }
+            }
+            END {
+                if (gfound || nt) {
+                    for (i = 1; i <= n; i++) print "T " p_pid[i] " " p_ppid[i]
+                }
+            }')
+        for pid in "${!SEEN_PRIO[@]}"; do
+            [ -n "${ALIVE_P[$pid]}" ] || unset 'SEEN_PRIO[$pid]' 'SEEN_ARGS[$pid]'
+        done
     fi
     gate_pass
     sleep "$INTERVAL" & wait $!

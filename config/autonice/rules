@@ -15,11 +15,14 @@
 19  vite( .*)? build
 19  (^|/)(cargo|rustc|make|cc1|cc1plus|ld|gcc|g\+\+|clang)( |$)
 19  (^|/)pip3?( |$)
+# Video / TTS / headless browser workers -> lowest CPU + idle-only disk
+19  (^|/)(ffmpeg|ffprobe|piper|whisper)( |$)
+19  ^[^ ]*(chrome|chromium)[^ ]* (.* )?--headless
 
 # --- AI agents and background helpers -> low ---
 10  claude-agent-acp
 10  (^|/)claude( |$)
-10  (^|/)(opencode|codex|gemini|goose)( |$)
+10  (^|/)(opencode|codex|gemini|goose|copilot|agy)( |$)
 # Zed agent panel: Codex, Mistral Vibe, and Gemini when started as gemini.js
 10  codex-acp
 10  vibe-acp
@@ -86,3 +89,8 @@ single dev 10s
 #                         See whose is whose:  autonice --status
 # Remove the line to turn it off.
 turn dev 20s
+
+# The express lane (agents-express.slice, Alt+E / agents --express): its jobs use these slots instead,
+# so they never wait behind the fleet's jobs, but a tab on the lane still cannot run them all at once.
+slots heavy-x 1
+slots dev-x   1

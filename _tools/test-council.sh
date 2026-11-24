@@ -55,6 +55,10 @@ fi
 id="$(date +%s%N)-$tool-$RANDOM"
 printf '%s' "$prompt" > "$L/log/prompt.$id"
 printf '%s\t%s\t%s\n' "$id" "$spec" "$args" >> "$L/log/argv"
+# a model whose plan is spent: the check before a member joins the table must keep it out
+if [[ " $args " == *" quota-test "* || " $args " == *"=quota-test "* ]]; then
+  echo "Error: 429 RESOURCE_EXHAUSTED: You exceeded your current quota" >&2; exit 1
+fi
 start=$(date +%s.%N)
 [[ -f "$L/slow.$tool" ]] && sleep 6.01
 sleep 0.6
@@ -66,10 +70,12 @@ seen=$(sed -n '/^--- The thread so far ---$/,/^--- End of the thread ---$/p' <<<
 reply="$kind from @$who. read: [$seen]"
 [[ -f "$L/pass" ]] && grep -q '^Round table, pass' <<< "$prompt" && reply="Pass."
 # a judge with the remove power takes @codex off the table
-[[ -f "$L/judge" ]] && grep -q "power to take a member off the table" <<< "$prompt" && reply="$reply"$'\n'"Remove: @$(cat "$L/judge") - repeats itself"
+[[ -f "$L/judge" ]] && grep -q "You may give a strike" <<< "$prompt" && reply="$reply"$'\n'"Strike: @$(cat "$L/judge") - repeats itself"
 # an agent asked to keep something: its Remember: line
 [[ -f "$L/remember" ]] && grep -q "lines starting 'Remember:'" <<< "$prompt" && reply="$reply"$'\n'"Remember: $who keeps an eye on cost"
 [[ -f "$L/echo-name" ]] && reply="@$who: $reply"     # an LLM that copies the thread's "@name:" format
+# Win Stake's last round asks for a vote: everyone votes for @claude (Claude itself for @codex)
+if grep -q "Vote: @name" <<< "$prompt"; then v=claude; [[ "$who" == claude ]] && v=codex; reply="$reply"$'\n'"Vote: @$v"; fi
 [[ -f "$L/long" ]] && reply="$reply $(printf 'wordy%.0s ' $(seq 1 60))end"
 # an agent whose project's instructions add a greeting and a footer to every reply
 [[ -f "$L/footer" ]] && reply="My Lord. $reply"$'\n\n'"You: whatever the chair said"$'\n\n'"SITREP · ARMY/MDMP · P1 · Done: x · Open: y · Next: z"
@@ -77,7 +83,8 @@ if [[ -n "$out" ]]; then echo "codex log noise on stdout"; printf '%s\n' "$reply
 EOF
 chmod +x "$T/agents"
 # account folders with settings of their own: what the pane headers show as the defaults
-mkdir -p "$T/ch" "$T/xh"; echo '{"model": "sonnet"}' > "$T/ch/settings.json"
+mkdir -p "$T/ch" "$T/xh" "$T/gh"; echo '{"model": "sonnet"}' > "$T/ch/settings.json"
+# (gh: the Gemini account's home, where /effort @gemini writes Gemini's settings; never this machine's)
 printf 'model = "gpt-test"\nmodel_reasoning_effort = "medium"\n[profiles.x]\nmodel = "not-this"\n' > "$T/xh/config.toml"
 # the Codex account's own list of models (what + add and Alt+M offer)
 # the Claude account's known models (what its menus offer), and Antigravity's list as `agy models` gave it
@@ -86,8 +93,12 @@ mkdir -p "$T/cache/afc-council"
 echo '{"agy": ["gemini-4-neon-low", "gemini-4-neon-high", "gemini-4-neon-xhigh", "claude-opus-5-5-medium", "claude-opus-5-5-high", "gpt-oss-120b-medium"]}' > "$T/cache/afc-council/models.json"
 export XDG_CACHE_HOME="$T/cache" AFC_COUNCIL_NO_REFRESH=1
 echo '{"models": [{"slug": "gpt-6-astra", "visibility": "list"}, {"slug": "gpt-hidden", "visibility": "hide"}, {"slug": "gpt-6-sol", "visibility": "list"}, {"slug": "gpt-test", "visibility": "list"}]}' > "$T/xh/models_cache.json"
-sed -i.bak -e "s|/home/x/.claude\$|$T/ch|" -e "s|/home/x/.codex\$|$T/xh|" "$T/accounts.txt"
+sed -i.bak -e "s|/home/x/.claude\$|$T/ch|" -e "s|/home/x/.codex\$|$T/xh|" -e "s|/home/x/.gemini-a\$|$T/gh|" "$T/accounts.txt"
 export COUNCIL_TEST_DIR="$T" AFC_COUNCIL_AGENTS="$T/agents" AFC_COUNCIL_CONF="$T/council.json"
+# Gemini's effort: this folder's own helper, keeping its level in the test folder (never the machine's)
+export AFC_COUNCIL_GEMINI_EFFORT="$HERE/bin/afc-gemini-effort" AFC_GEMINI_EFFORT_FILE="$T/gemini-effort"
+# the format menu a council offers when it opens would take the keys the checks send
+export AFC_COUNCIL_NO_FORMAT_MENU=1
 # most checks use the LLMs' own names (@claude): a new project's council starts from this /names llm;
 # going by the model (the default) has checks of its own
 echo '{"names": "llm"}' > "$T/council.json"
@@ -155,6 +166,7 @@ is "/rounds 0: round the table again and again (a second pass)" "$(grep -cE '^@(
 has "... the later pass answers what was said since, and may pass" "$(cat $(since) | grep -m1 '^Round table, pass 2:')" 'New points only.*reply with just: Pass\.'
 has "... and it stops when everyone passes" "$out" 'Everyone passed: nothing new at the table'
 has "/rounds 0 is round the table until Ctrl+C" "$(run "/rounds 0")" 'until Ctrl\+C'
+run "/rounds 1" > /dev/null   # /rounds is kept per project: reset so later checks do not run infinite passes
 # names: an LLM goes by the model it runs on (the default; /names llm for the LLM's own name)
 mkdir -p "$T/proj3"; r3() { (cd "$T/proj3" && printf '%s\n' "$@" | env -u TMUX timeout 180 python3 "$COUNCIL" 2>&1); }
 r3 "/names model" > /dev/null
@@ -225,20 +237,34 @@ mkdir -p "$T/proj4/agents"; echo "theirs" > "$T/proj4/agents/x.py"
 (cd "$T/proj4" && printf '%s\n' "/agents" | env -u TMUX timeout 180 python3 "$COUNCIL" > /dev/null 2>&1)
 has "a project with an agents/ of its own keeps it: the council's agents go in council-agents/" "$(ls "$T/proj4/council-agents" 2>/dev/null)" 'skeptic'
 is "... its own agents/ untouched" "$(ls "$T/proj4/agents" | tr '\n' ' ')" "x.py "
-# the remove power: an agent takes a member off the table on its own judgement (benched, never deleted)
+# the remove power: strikes on the agent's own judgement; at 3 the member is removed
 run "/agent new Arbiter claude The final judge of the council" > /dev/null
-has "/agent power NAME remove: the agent may remove members" "$(run "/agent power arbiter remove on")" 'may now remove members'
-echo codex > "$T/judge"; mark; out=$(run "@arbiter rule on it"); rm -f "$T/judge"
-has "... it is told so in its prompt" "$(cat $(since | head -1))" 'power to take a member off the table'
-has "... Remove: @codex (an LLM's own seat): it leaves the table, and the council says why" "$out" '⚖ @arbiter: @codex taken off the table .*\(repeats itself\)'
-has "... its answer shows it" "$out" '⚖ Removed @codex: repeats itself'
+has "/agent power NAME remove: the agent may give strikes" "$(run "/agent power arbiter remove on")" 'may now give strikes'
+echo codex > "$T/judge"; mark; out=$(run "@arbiter rule on it")
+has "... it is told so in its prompt" "$(cat $(since | head -1))" 'You may give a strike'
+has "... Strike: @codex: strike 1 of 3, and the council says why" "$out" '⚖ @arbiter: strike 1 of 3 for @codex \(repeats itself\)\. 2 more'
+has "... its answer shows it" "$out" '⚖ Strike for @codex: repeats itself'
+has "... one strike: @codex is still at the table" "$(run "/agents" | grep -m1 'At the table:')" '@codex'
+has "... /strikes lists it" "$(run "/strikes")" '@codex 1/3'
+mark; out=$(run "@arbiter rule on it" "@arbiter rule on it"); rm -f "$T/judge"
+has "... the prompt shows the strikes so far" "$(cat $(since | head -1))" 'Strikes so far: @codex 1/3'
+has "... the third strike: out" "$out" 'strike 3 of 3 for @codex \(repeats itself\): out'
+has "... an LLM's own seat leaves the table" "$out" '⚖ @arbiter: @codex taken off the table'
 hasnt "... @codex is off the table" "$(run "/agents" | grep -m1 'At the table:')" '@codex'
 run "/seat codex" > /dev/null
 run "/agent new Victim claude A member who talks too much" > /dev/null; echo "- 2026-11-22: something kept" >> "$T/proj/agents/victim/MEMORY.md"
-echo victim > "$T/judge"; out=$(run "@arbiter @victim rule on it"); rm -f "$T/judge"
-has "... Remove: @victim (an agent you made): deleted for good, its memory wiped" "$out" '⚖ @arbiter: @victim removed for good, its memory wiped'
+echo victim > "$T/judge"; out=$(run "@arbiter @victim rule on it" "@arbiter @victim rule on it" "@arbiter @victim rule on it"); rm -f "$T/judge"
+has "... 3 strikes for @victim (an agent you made): deleted for good, its memory wiped" "$out" '⚖ @arbiter: @victim removed for good, its memory wiped'
 is "... its folder is gone, not moved aside" "$(ls -d "$T/proj/agents/victim" "$T/proj/agents/_removed/victim-"* 2>/dev/null | wc -l | tr -d ' ')" 0
 hasnt "... and it is gone from the agents" "$(cat "$T/council.json")" '"name": "Victim"'
+has "/strikes clear wipes them" "$(run "/strikes clear" "/strikes")" 'Nobody has a strike'
+# the judge power: it sits the round out and gives its verdict when the round ends
+has "/agent power NAME judge: a judge" "$(run "/agent power arbiter judge on")" 'is a judge: it sits each round out'
+mark; out=$(run "@claude @arbiter what now?")
+p=$(grep -l 'You are @arbiter' $(since)); is "... it gets one turn in the round, at the end" "$(wc -l <<< "$p" | tr -d ' ')" 1
+has "... a turn to judge the round" "$(cat $p)" 'The round is over\. You are the judge and speak last'
+is "... after the others: its answer comes last" "$(grep -E '^@[a-z0-9-]+$' <<< "$out" | tail -1)" '@arbiter'
+has "... marked as a verdict in the saved thread" "$(cat "$(ls -t "$T"/proj/logs/council/*/thread.md | head -1)")" '@arbiter\*\* \(verdict\)'
 run "/agent del arbiter" > /dev/null
 # an agent's lean: opposition (always against the chair), government (for the chair), free will (the default)
 mark; run "/agent new Minister claude A loyal minister || || || government" "@minister @skeptic your take?" > /dev/null
@@ -260,7 +286,7 @@ has "/lean with no name lists the sides" "$(run "/lean")" 'Sides: .*@codex oppos
 run "/lean @codex free" > /dev/null
 out=$(run "/agent new Skeptic codex again" "/agent new Bad nollm x")
 has "a second member of the same name is refused" "$out" 'There is a member called Skeptic already'
-has "an LLM that does not exist is refused" "$out" 'LLM must be claude, codex, gemini or agy'
+has "an LLM that does not exist is refused" "$out" 'LLM must be claude, codex, gemini, agy, copilot or opencode'
 out=$(run "/bench skeptic" "/agents")
 has "/bench takes it off the table (and that is kept)" "$out" '@skeptic \(Claude, opus\).*\(benched\)'
 out=$(run "/seat skeptic")
@@ -315,7 +341,19 @@ has "... kept, and set back (in the project's own settings)" "$(cat "$T/proj/log
 out=$(run "/model @claude opus" "/effort @codex high" "/effort @gemini high" "/effort @claude bogus" "/model")
 has "/model @claude opus is taken" "$out" '@claude \(opus\): model opus'
 has "/effort @codex high is taken" "$out" '@codex \(high\): effort high'
-has "Gemini has no effort setting, and says what to do instead" "$out" "@gemini: Gemini's command line has no effort setting"
+has "/effort @gemini high: one setting for every Gemini, and the chat says so" "$out" "Gemini's effort is one setting for every Gemini: now high"
+gs=$(cat "$T/gh/.gemini/settings.json" 2>/dev/null)
+has "... written in that Gemini account's settings, where each Gemini reads it when it starts" "$gs" '"level": "high"'
+has "... as a thinking level per model" "$gs" '"thinkingLevel": "HIGH"'
+has "... and kept by the fleet, to be put back if a Gemini drops it" "$(cat "$T/gemini-effort" 2>/dev/null)" '^high$'
+run "/effort @gemini xhigh" >/dev/null
+is "... xhigh: Neon and Hydrogen get XHIGH, Argon, Carbon and 3.8 Flash (which have none) HIGH" "$(python3 -c '
+import json, sys
+o = json.load(open(sys.argv[1]))["modelConfigs"]["customOverrides"]
+print(" ".join(x["match"]["model"] + "=" + x["modelConfig"]["generateContentConfig"]["thinkingConfig"]["thinkingLevel"] for x in o if x.get("afc") == "effort"))' "$T/gh/.gemini/settings.json")" \
+  "gemini-4-neon=XHIGH gemini-4-hydrogen=XHIGH gemini-4-argon=HIGH gemini-4-carbon=HIGH gemini-3.8-flash=HIGH"
+run "/effort @gemini high" >/dev/null
+has "... /model alone shows it as the one setting" "$out" '@gemini  model: its default   effort: high \(one setting for every Gemini\)'
 has "an effort that LLM does not have is refused, with the ones it has" "$out" '@claude: effort for Claude is one of low, medium, high, xhigh, max'
 has "/model alone lists who runs on what" "$out" '@codex  model: its default   effort: high'
 has "... kept for the next meeting" "$(cat "$T/proj/logs/council/settings.json")" '"effort": "high"'
@@ -326,8 +364,54 @@ has "Codex runs at the effort it was given" "$(cat "$T/log/argv")" 'codex:secret
 out=$(run "/agent new Quick claude:sonnet:low Says the first thing that comes to mind" "@quick go")
 has "an agent made with model and effort shows both" "$out" '@quick \(Claude, sonnet, low\) joins the table'
 has "... and runs on them" "$(tail -1 "$T/log/argv")" '--model sonnet --effort low'
-out=$(run "/model @claude default" "/effort @codex default" "/agent del quick")
+out=$(run "/model @claude default" "/effort @codex default" "/effort @gemini default" "/agent del quick")
 has "default goes back to the LLM's own" "$out" '@claude: model back to its default'
+has "... Gemini's effort too: each model's own" "$out" "Gemini's effort is one setting for every Gemini: now each model's own"
+hasnt "... and the fleet's lines leave Gemini's settings" "$(cat "$T/gh/.gemini/settings.json" 2>/dev/null)" '"afc": "effort"'
+has "a Gemini agent cannot carry an effort of its own (it is one setting for every Gemini)" \
+  "$(run "/agent new Fast gemini:gemini-4-argon:low Quick answers")" 'A Gemini agent has no effort of its own'
+# ---- a screenshot pasted into the chat box (Ctrl+V: agents --paste, then attach_images) -------------------
+img="$T/shot.png"; printf '\x89PNG\r\n\x1a\n' > "$img"; : > "$T/log/argv"
+run "@codex @gemini [Image #1: $img (a screenshot from the chair: open this file to see it)] what is on it?" > /dev/null
+has "a pasted screenshot: Codex gets it attached" "$(grep -F 'codex:' "$T/log/argv")" "--image=$img"
+has "... Gemini may read the folder screenshots are kept in" "$(grep -F 'gemini:' "$T/log/argv")" '--include-directories .*afc-council/images'
+has "... and every member sees its path in the thread" "$(cat $(ls -t "$T"/log/prompt.* | head -1))" "\[Image #1: $img"
+# ---- a member is checked before it joins: one short question, run as its turns run ------------------------
+probes_before=$(grep -l 'A quick check before you join' "$T"/log/prompt.* 2>/dev/null | wc -l)
+out=$(run "/agent more codex:quota-test")
+has "+ add checks a seat first: one that cannot answer (its quota spent) is not added, and the chat says why" "$out" 'was not added: its plan or rate limit is spent'
+has "... with what its LLM said" "$out" 'Codex said: .*429 RESOURCE_EXHAUSTED'
+hasnt "... and it is not at the table" "$out" 'joins the table'
+has "... the chat said it was checking while it waited" "$out" 'Checking @.* before it joins'
+probes_after=$(grep -l 'A quick check before you join' "$T"/log/prompt.* 2>/dev/null | wc -l)
+is "... the check was one short question to it" "$(( probes_after - probes_before ))" 1
+has "a seat that answers the check joins as before" "$(run "/agent more codex:gpt-6-sol" "/agent del codex2")" 'joins the table'
+# ---- formats: Open Forum (the modes), British Parliamentary, Win Stake --------------------------------------
+: > "$T/log/argv"
+out=$(run "/format bp" "This house would ban homework")
+has "/format bp: the BP debate, and the chat says how it runs" "$out" 'Format: BP debate'
+has "... the benches are dealt in BP order, from the first seat" "$out" 'BP debate · Opening Government: @[a-z0-9-]+ \(PM\)'
+bp=$(for f in $(ls -tr "$T"/log/prompt.* | tail -8); do grep -oE 'You are the (Prime Minister|Leader of the Opposition|Deputy Prime Minister|Deputy Leader of the Opposition|Member of Government|Member of Opposition|Government Whip|Opposition Whip) \([A-Z]+\)' "$f"; done | grep -oE '\([A-Z]+\)' | tr -d '()' | tr '\n' ' ')
+has "... each speaker is told its role, in BP speaking order" "$bp" '^PM LO( DPM)?'
+out=$(run "/format stake" "Which is better, tea or coffee?")
+has "/format stake: Win Stake" "$out" 'Format: Win Stake'
+has "... a council opens showing its format (BP, kept from the last run)" "$out" 'BP debate · mode'
+has "... everyone plays, then the vote is counted" "$out" '⚖ Votes: @claude [0-9]'
+has "... nobody votes for itself (Claude's vote went to Codex)" "$out" '@codex 1'
+out=$(run "/rounds 5" "/rounds 0" "/rounds 4")
+has "Win Stake has rounds of its own: /rounds 5" "$out" 'Win Stake: 5 round'
+has "... 0 means the most, 12" "$out" 'Win Stake: 12 round'
+is "... kept for the next council here" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("stake_rounds"))' "$T/proj/logs/council/settings.json")" 4
+out=$(run "/format bp" "/bp PM @codex" "/bp")
+has "/bp ROLE @name: that member speaks in that role" "$out" 'BP: @codex speaks as PM'
+has "... /bp lists the speakers with the model each runs on" "$out" 'PM @codex \(gpt-test\)'
+has "... the one that was PM moved to Codex's old role (a swap)" "$out" 'BP debate · PM @codex .* @claude \(sonnet\)'
+out=$(run "/bp auto" "/bp")
+has "/bp auto: by seat again" "$out" 'BP speakers: set by seat again'
+out=$(run "/format" "/format forum")
+has "/format alone steps to the next format" "$out" 'Format: Open Forum'
+has "/format forum: back to the modes, ending after /rounds" "$out" 'ends after /rounds'
+
 
 # ---- roast mode -------------------------------------------------------------------------------------------
 : > "$T/log/timing"; mark
@@ -449,7 +533,33 @@ CL=$(tm list-clients -F '#{client_name}' | head -1)
 has "Alt+K is bound to the council" "$(tm list-keys -T root)" 'M-k .*afc-council --open'
 if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCIL")" ]]; then
   tm send-keys -K -c "$CL" M-k; sleep 3
-  is "Alt+K opens a tab called council" "$(tm list-windows -F '#{window_name}' | grep -c '^council$')" 1
+  # Alt+K: the council about this project opens as a split in the project's own tab (operator, 2026-11-24)
+  is "Alt+K opens the council as a split in the project's tab, not a tab of its own" \
+    "$(tm list-panes -t agents:proj -F '#{@council_chat}' | grep -c '^1$') $(tm list-windows -F '#{window_name}' | grep -c '^council$')" "1 0"
+  is "... the project's tab keeps its name" "$(tm display -p -t agents:proj '#{window_name}' 2>/dev/null)" proj
+  tm send-keys -K -c "$CL" M-k; sleep 1.5
+  is "... Alt+K again brings that council to the front, not a second one" "$(tm list-panes -t agents:proj -F '#{@council_chat}' | grep -c '^1$')" 1
+  out=$(run "/format bp" "@claude quick check" "/format forum")
+  has "direct @claude tag in BP format answers directly instead of refusing" "$out" 'ANSWER from @claude'
+  run "/bench codex" > /dev/null
+  out=$(run "/agent more codex:quota-test")
+  has "benched seat probe failure rolls back its model in settings.json" "$out" 'was not added: its plan or rate limit is spent'
+  hasnt "... broken quota-test model was not left persisted" "$(cat "$T/proj/logs/council/settings.json")" 'quota-test'
+  run "/seat codex" > /dev/null
+  sp=$(tm list-panes -t agents:proj -F '#{pane_id} #{@council_chat}' | awk '$2 == 1 {print $1}')
+  # Alt+O inside a shared-tab council split transitions cleanly into BOX mode (no literal #!#%# leak!)
+  tm select-pane -t "$sp"; tm send-keys -K -c "$CL" M-o; sleep 1.5
+  sbox=$(tm capture-pane -p -t "$sp")
+  hasnt "Alt+O in shared-tab council split switches cleanly into boxed chat (no #!#%# leak)" "$sbox" '#!#%#'
+  has "... drawing the top chat box rule cleanly" "$(sed -n 1p <<< "$sbox")" '^─+$'
+  tm send-keys -t "$sp" '/view grid' Enter; sleep 0.8
+  tm send-keys -t "$sp" '/quit' Enter
+  for _ in $(seq 1 30); do [[ "$(tm display -p -t agents:proj '#{window_panes}')" == 1 ]] && break; sleep 0.3; done
+  is "... /quit closes that split, and the project's tab stays as it was" "$(tm display -p -t agents:proj '#{window_panes}')" 1
+  is "... and clears window @council option on the project tab" "$(tm show-options -wqv -t agents:proj @council)" ""
+  # The grid: a council in a tab of its own (as Alt+Shift+K opens one), here on the project to test it
+  tm new-window -t agents: -n council -c "$T/proj" "$HOME/.local/bin/afc-council --from-pid $(tm display -p -t agents:proj '#{pane_pid}')"; sleep 3
+  is "a council in a tab of its own: the tab is called council" "$(tm list-windows -F '#{window_name}' | grep -c '^council$')" 1
   is "... with the chat box in it, in the folder of the pane it was pressed in" "$(tm display -p -t ':council' '#{pane_current_path}' 2>/dev/null)" "$T/proj"
   has "... the box's header shows the mode it is in" "$(tm show-options -pqv -t ':council' pane-border-format 2>/dev/null)" 'mode: (ORDER|ROAST)'
   cw=$(tm list-windows -F '#{window_id} #{window_name}' | awk '$2 == "council" {print $1}')
@@ -476,7 +586,7 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
     for i in $(seq 1 40); do [[ "$(grid_now)" == "$want" ]] && { sleep 0.5; [[ "$(grid_now)" == "$want" ]] && return 0; }; sleep 0.25; done; return 1; }
   has "a header shows the model and effort its account is set to (Codex: config.toml)" "$(hdr codex)" 'gpt-test · effort medium'
   has "... Claude: its settings.json model, and the default effort" "$(hdr claude)" 'sonnet · effort default'
-  has "... Gemini with none set: default model, and no effort (it has none)" "$(hdr gemini)" '\]default model#\[default\]'
+  has "... Gemini with none set: default model, effort default (one setting for every Gemini)" "$(hdr gemini)" '\]default model · effort default#\[default\]'
   has "... and says how to change them" "$(hdr codex)" 'Alt\+M or m: change'
   tm select-pane -t "$(pane_of codex)"; tm send-keys -K -c "$CL" M-m; sleep 0.8; tm send-keys -K -c "$CL" h; hdr_has codex 'effort high'
   has "Alt+M in a member's pane, h: its effort is now high" "$(hdr codex)" 'gpt-test · effort high'
@@ -487,8 +597,10 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
   has "m in a member's pane opens the same menu: 2 picks its second model" "$(hdr claude)" 'haiku-5-5 · effort default'
   tm send-keys -K -c "$CL" m; sleep 0.8; tm send-keys -K -c "$CL" 0; hdr_has claude 'sonnet · effort default'
   has "... 0 goes back to the default model" "$(hdr claude)" 'sonnet · effort default'
-  tm select-pane -t "$(pane_of gemini)"; tm send-keys -K -c "$CL" M-m; sleep 0.8; tm send-keys -K -c "$CL" h; sleep 0.5; tm send-keys -K -c "$CL" Escape; sleep 1
-  has "Gemini's menu has no effort to pick: h does nothing" "$(hdr gemini)" '\]default model#\[default\]'
+  tm select-pane -t "$(pane_of gemini)"; tm send-keys -K -c "$CL" M-m; sleep 0.8; tm send-keys -K -c "$CL" h; hdr_has gemini 'effort high'
+  has "Alt+M in Gemini's pane, h: Gemini's effort (one for every Gemini) is now high" "$(hdr gemini)" 'default model · effort high'
+  tm send-keys -K -c "$CL" M-m; sleep 0.8; tm send-keys -K -c "$CL" d; hdr_has gemini 'effort default'
+  has "... d: back to each model's own" "$(hdr gemini)" 'default model · effort default'
   tm select-pane -t "$(pane_of codex)"; tm send-keys -K -c "$CL" M-m; sleep 0.8; tm send-keys -K -c "$CL" G; hdr_has codex 'government'
   has "Alt+M, G: its side is government, shown in its header" "$(hdr codex)" 'government'
   tm send-keys -K -c "$CL" M-m; sleep 0.8; tm send-keys -K -c "$CL" F; sleep 1.5
@@ -625,11 +737,240 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
   has "... it says so" "$(tm capture-pane -p -t "$chair")" 'Everyone left the table \(4\)'
   has "... and + add is still on the bar" "$(tm display -p -t "$cw" "$(tm show -gv status-right)")" 'council_add|\+ add'
   for h in claude codex gemini; do tm send-keys -t "$chair" "/seat $h" Enter; sleep 0.6; done
+  panes_are 4
+  # menu command while user has a half-typed draft in the chat box: command runs and draft comes back
+  tm send-keys -t "$chair" -l "half typed draft"; sleep 0.4
+  tm select-pane -t "$(pane_of codex)"; tm send-keys -K -c "$CL" M-m; sleep 0.8; tm send-keys -K -c "$CL" h; hdr_has codex 'effort high'
+  tm select-pane -t "$chair"; sleep 0.6
+  has "menu action while typing preserves the user's draft in the chat box" "$(tm capture-pane -p -t "$chair")" 'half typed draft'
+  tm send-keys -t "$chair" C-u; sleep 0.3
+  # multi-line paste via tmux paste-buffer -p: collapses to a pill (no premature submit, rules stay intact),
+  # survives a menu action mid-draft, and expands verbatim on Enter
+  printf 'paste line one\npaste line two\npaste line three\n' | tm load-buffer -b ptest -
+  tm send-keys -t "$chair" -l "@codex check: "
+  tm paste-buffer -p -d -b ptest -t "$chair"; sleep 0.6
+  pbox=$(tm capture-pane -p -t "$chair")
+  has "multi-line paste collapses into a compact pill in the chat box" "$pbox" '\[Pasted #1 · 3 lines\]'
+  has "... keeping top and bottom rules intact (no box smash)" "$(sed -n 1p <<< "$pbox")" '^─+$'
+  # firing a menu action while the paste pill is in the draft keeps both the pill and its stored content
+  tm select-pane -t "$(pane_of codex)"; tm send-keys -K -c "$CL" M-m; sleep 0.8; tm send-keys -K -c "$CL" h; hdr_has codex 'effort high'
+  tm select-pane -t "$chair"; sleep 0.5
+  tm send-keys -t "$chair" Enter; sleep 3
+  cpane=$(tm capture-pane -p -S - -t "$(pane_of codex)")
+  has "... and expands all 3 lines verbatim even after a menu action" "$cpane" 'paste line one'
+  has "... including line three" "$cpane" 'paste line three'
+  # afc-min refuses to minimise a council pane (keeps grid intact)
+  tm run-shell "$HOME/.local/bin/afc-min hide $(pane_of codex)"; sleep 0.5
+  is "afc-min refuses to minimise a council member pane" "$(tm display -p -t "$cw" '#{window_panes}')" 4
+  tm run-shell "$HOME/.local/bin/afc-min hide $chair"; sleep 0.5
+  is "afc-min refuses to minimise the council chat box" "$(tm display -p -t "$cw" '#{window_panes}')" 4
+  # Ctrl+V (agents --paste) while a member pane is focused redirects to the chat box
+  tm select-pane -t "$(pane_of codex)"; sleep 0.2
+  printf 'single\tline /ok @codex\n' | tm load-buffer -b ptest2 -
+  tm paste-buffer -p -d -b ptest2 -t "$chair"; sleep 0.5
+  has "single-line paste with trailing newline, tab, / and @ stays inline without submitting" "$(tm capture-pane -p -t "$chair")" 'single  line /ok @codex'
+  tm send-keys -t "$chair" C-u; sleep 0.3
   tm send-keys -t "$chair" "/quit" Enter; sleep 2.5
   is "/quit closes the whole council tab, grid and all" "$(tm list-windows -F '#{window_name}' | grep -c '^council$')" 0
 else
   echo "  skip  Alt+K end to end (~/.local/bin/afc-council is not this folder's bin/afc-council)"
 fi
+
+# ---- audit regressions: hooks, permissions, parsing, formatting, retry, roast & draft safety ----------------
+reg=$(python3 - "$COUNCIL" "$T" <<'EOF'
+import json, os, re, runpy, sys, tempfile
+
+g = runpy.run_path(sys.argv[1], run_name="check")
+T = sys.argv[2]
+
+# 0. accounts() treats "not signed in (...)" as signed out
+assert not "not signed in (copilot login)".startswith("signed") and "not signed in (copilot login)".startswith("not signed in")
+
+# 1. child_env strips TMUX/TMUX_PANE and sets AFC_COUNCIL_CHILD + AFC_RULES_SKIP
+os.environ["TMUX"] = "/tmp/fake,1,0"
+os.environ["TMUX_PANE"] = "%99"
+ce = g["child_env"]()
+assert "TMUX" not in ce and "TMUX_PANE" not in ce, f"TMUX leaked: {ce}"
+assert ce.get("AFC_COUNCIL_CHILD") == "1" and ce.get("AFC_RULES_SKIP") == "1", f"flags missing: {ce}"
+
+# 2. command() permissions: claude plan has --permission-mode plan; codex edit disables shell_tool; copilot/opencode work
+M = g["Member"]
+mc = M("Claude", "claude", account="a1")
+argv, _, _ = g["command"](mc, "hi", T, "plan")
+assert "--permission-mode" in argv and "plan" in argv, f"claude plan missing permission-mode: {argv}"
+mx = M("Codex", "codex", account="x1")
+argv, _, out = g["command"](mx, "hi", T, "edit")
+if out and os.path.exists(out): os.unlink(out)
+assert "--disable" in argv and "shell_tool" in argv and 'approval_policy="never"' in argv, f"codex edit unsafe: {argv}"
+mp = M("Copilot", "copilot", account="p1", model="gpt-5.6-sol")
+argv, _, _ = g["command"](mp, "hi", T, "plan")
+assert "copilot:p1" in argv and "--mode" in argv and "plan" in argv, f"copilot plan bad: {argv}"
+mo = M("OpenCode", "opencode", account="o1")
+argv, _, _ = g["command"](mo, "hi", T, "bypass")
+assert "opencode:o1" in argv and "--auto" in argv, f"opencode bypass bad: {argv}"
+
+# 3. read_meeting() & upgrade() handle "# Council on <project>:" and "(round table N)"
+with tempfile.TemporaryDirectory() as d:
+    md = os.path.join(d, "2026-11-21_1734_topic.md")
+    with open(md, "w") as f:
+        f.write("# Council on TokenOps: Fix hooks\n\nStarted 2026-11-21 17:34 in TokenOps. Mode: order.\n\n"
+                "**Chair**: hello\n\n**@opus** (round table 2): second pass\n")
+    topic, started, thread = g["read_meeting"](md)
+    assert topic == "Fix hooks", f"topic mismatch: {topic!r}"
+    assert started == "2026-11-21 17:34", f"started mismatch: {started!r}"
+    assert len(thread) == 2 and thread[1]["phase"] == "table" and thread[1].get("round") == 2, f"thread bad: {thread}"
+    dst = os.path.join(d, "upgraded")
+    os.makedirs(dst)
+    g["upgrade"](d, dst)
+    assert os.path.isfile(os.path.join(dst, "2026-11-21_1734_topic", "thread.md")), "upgrade skipped project header"
+
+# 4. defaults() reads Claude modelSettings.<model>.effortLevel via alias match
+with tempfile.TemporaryDirectory() as ch:
+    with open(os.path.join(ch, "settings.json"), "w") as f:
+        json.dump({"model": "opus", "modelSettings": {"claude-opus-5-5": {"effortLevel": "high"}}}, f)
+    assert g["defaults"]("claude", ch) == ("opus", "high"), f"defaults bad: {g['defaults']('claude', ch)}"
+    assert g["defaults"]("copilot", ch) == (None, None)
+    assert g["defaults"]("opencode", ch) == (None, None)
+
+# 5. cells() / fit() handle wide emoji & CJK correctly
+assert g["cells"]("ab") == 2 and g["cells"]("中文") == 4, "cells width wrong"
+assert g["cells"](g["fit"]("中文测试长字符串", 6)) <= 6, "fit overflowed cell width"
+
+# 6. TTY defaults are bounded (2 rounds, 2 roasts) instead of infinite 0
+g["Meeting"].__init__.__globals__["TTY"] = True
+mt = g["Meeting"](T, [mc], {"mode": "order"})
+assert mt.rounds == 2 and mt.roasts == 2, f"TTY defaults should be 2: {mt.rounds}, {mt.roasts}"
+
+# 7. transcript() notes mid-thread model renames as "@new (formerly @old)"
+mc.model = "haiku"
+mt.thread = [{"who": "chair", "name": "Chair", "text": "hi", "phase": "chair"},
+             {"who": "claude", "as": "opus", "name": "Claude", "text": "hello", "phase": "first"}]
+g["Meeting"].__init__.__globals__["NAMES"]["by"] = "model"
+tr = mt.transcript()
+assert "@haiku (formerly @opus): hello" in tr, f"rename clarity missing: {tr}"
+
+# 8. Remove: regex rejects blockquotes and bullet lists
+rem_re = r"(?im)^[ \t]*\*{0,2}remove\*{0,2}[ \t]*:[ \t]*@?([\w.-]+)[ \t]*(?:[-–—:][ \t]*)?(.*)$"
+assert not re.search(rem_re, "> Remove: @codex - quoted")
+assert not re.search(rem_re, "- Remove: @codex - bullet")
+assert re.search(rem_re, "Remove: @codex - derailing")
+assert re.search(rem_re, "**Remove**: @codex - derailing")
+
+# 9. Pass detection accepts short elaborations, rejects long non-pass text
+pass_ok = lambda s: bool(re.match(r"^\*{0,2}pass\*{0,2}\b", s.strip(), re.I)) and len(s.strip().split()) <= 8
+assert pass_ok("Pass.") and pass_ok("**Pass** — nothing new to add.")
+assert not pass_ok("Pass this flag into the CLI binary and then verify that every test in the suite still passes.")
+
+# 10. argv_clamp guards Linux MAX_ARG_STRLEN (128 KiB) for argv-prompt CLIs (agy/copilot/opencode)
+huge = "A" * 160000
+for m_argv in (M("Agy", "agy", account="a"), M("Copilot", "copilot", account="p"), M("OpenCode", "opencode", account="o")):
+    av, _, _ = g["command"](m_argv, huge, T, "plan")
+    assert all(len(x.encode("utf-8")) <= 105000 for x in av), f"argv exceeded safe limit for {m_argv.tool}"
+
+# 11. opencode/deepseek model slug strips 'opencode' provider family and unseated base seat never steals seated slug
+g["NAMES"]["by"] = "model"
+oc_base = M("OpenCode", "opencode", account=None); oc_base.seated = False
+oc_ds = M("OpenCode2", "opencode", account="o1", model="opencode/deepseek-v4.1-flash-free", made=True)
+tn = g["table_names"]([oc_base, oc_ds])
+assert tn["opencode2"] == "deepseek", f"expected deepseek, got {tn}"
+
+# 12. check_before_seating rejects missing account cleanly (never passes tool:None)
+no_acct = M("OpenCode2", "opencode", account=None, model="opencode/deepseek-v4.1-flash-free", made=True)
+why_na = g["check_before_seating"](no_acct, T)
+assert "has no account" in why_na, f"missing account check failed: {why_na!r}"
+
+# 13. win_stake vote regex handles markdown bold (**Vote:** **@name**) and ignores stale previous rounds
+assert re.findall(r"\bvote\b[^@\n]{0,16}@([\w.-]+)", "**Vote:** **@opus-5.5**", re.I) == ["opus-5.5"]
+
+# 14. read_meeting restores verdict, debate (bp), win stake (stake), and monte carlo (sim) phases from markdown
+with tempfile.TemporaryDirectory() as d:
+    md = os.path.join(d, "2026-11-24_1400_debate.md")
+    with open(md, "w") as f:
+        f.write("# Council on TokenOps: Debate\n\nStarted 2026-11-24 14:00 in TokenOps. Mode: order.\n\n"
+                "**Chair**: motion\n\n**@opus** (debate): [PM] arg\n\n**@argon** (win stake): case\n\n"
+                "**@judge** (verdict): Verdict: OG\n\n**@sim** (monte carlo): Monte Carlo (2/2)\n")
+    _, _, th = g["read_meeting"](md)
+    assert [e["phase"] for e in th] == ["chair", "bp", "stake", "verdict", "sim"], f"phases wrong: {th}"
+
+# 15. thinking_line clamps strictly below pane width (no wrapped endless thinking lines in splits / one view)
+many = ["opus-5.5", "gpt-5.4", "gemini-4-neon", "agy", "deepseek", "copilot", "grok", "supra-omnia"]
+for w in (30, 55, 58, 80):
+    s_plain = g["thinking_line"]("⠋", many, 12, w, indent="  ", plural=True)
+    s_one = g["thinking_line"]("⠋", many, 12, w, indent="", plural=False)
+    assert g["cells"](s_plain) < w and s_plain.endswith("12s"), f"plain wrap at {w}: {s_plain!r} ({g['cells'](s_plain)})"
+    assert g["cells"](s_one) < w and s_one.endswith("12s"), f"one wrap at {w}: {s_one!r} ({g['cells'](s_one)})"
+assert g["thinking_line"]("⠋", [], 3, 40, indent="", plural=False) == "⠋ thinking  3s"
+assert g["thinking_line"]("⠋", ["codex"], 3, 80, indent="", plural=False) == "⠋ @codex thinking  3s"
+
+# 16. Monte Carlo (/sim) outcome parsing & summary across Stake, BP, and Open Forum
+m1, m2, m3 = M("Claude", "claude", account="a"), M("Codex", "codex", account="b"), M("Gemini", "gemini", account="c")
+g["NAMES"]["by"] = "llm"
+mt = g["Meeting"](T, [m1, m2, m3], {"format": "stake"})
+o1 = mt.sim_outcome("stake", [
+    {"who": "claude", "phase": "stake", "text": "Case\nVote: @codex"},
+    {"who": "codex", "phase": "stake", "text": "Case\nVote: @claude"},
+    {"who": "gemini", "phase": "stake", "text": "Case\n**Vote:** **@codex**"},
+], [m1, m2, m3], mt)
+assert o1["label"] == "@codex" and o1["votes"]["codex"] == 2, f"stake sim_outcome failed: {o1}"
+sm = mt.format_sim_summary("stake", 2, "Tea or coffee?", [o1, {"label": "@claude", "votes": {"claude": 2, "codex": 1}, "verdict": ""}])
+assert "Monte Carlo (2/2 trials · Win Stake)" in sm and "Total votes: @claude 3 · @codex 3" in sm, f"stake summary failed: {sm}"
+bp1 = mt.sim_outcome("bp", [{"who": "judge", "phase": "verdict", "text": "Great clash.\nVerdict: OG carries the motion."}], [m1, m2, m3], mt)
+bp2 = mt.sim_outcome("bp", [{"who": "judge", "phase": "verdict", "text": "Verdict: Opposition (OO) wins."}], [m1, m2, m3], mt)
+assert bp1["side"] == "Government" and bp1["bench"] == "OG" and bp2["side"] == "Opposition" and bp2["bench"] == "OO"
+sm_bp = mt.format_sim_summary("bp", 2, "Motion", [bp1, bp2])
+assert "Sides: Government 1/2 (50%) · Opposition 1/2 (50%)" in sm_bp and "Benches: OG 1 · OO 1" in sm_bp, f"bp summary failed: {sm_bp}"
+
+print("REGRESSIONS_OK")
+EOF
+)
+is "audit unit regressions (env, perms, headers, defaults, cells, bounded defaults, rename, regex, argv clamp)" "$reg" "REGRESSIONS_OK"
+BINDIR=$(dirname "$COUNCIL")
+# afc-rules hook is silent/allowed under AFC_COUNCIL_CHILD=1 and AFC_RULES_SKIP=1
+r_hook=$(printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/nonexistent"}}' | AFC_COUNCIL_CHILD=1 python3 "$BINDIR/afc-rules" --hook 2>&1)
+hasnt "afc-rules --hook does not block or inject inside council child runs" "$r_hook" 'deny|block|\[ACF rules\]'
+# agents --mark exits cleanly under AFC_COUNCIL_CHILD=1
+AFC_COUNCIL_CHILD=1 "$BINDIR/agents" --mark busy 2>/dev/null && ok "agents --mark is a no-op inside council child runs" || bad "agents --mark is a no-op inside council child runs" "non-zero exit"
+# /retry works without @ prefix
+: > "$T/log/argv"
+out=$(run "/retry codex")
+has "/retry codex works without @ prefix" "$out" 'Trying again: @codex'
+# /new preserves /rounds setting and resets last targets
+mark
+out=$(run "/rounds 2" "@claude first topic" "/new second topic" "/rounds")
+has "/new preserves /rounds setting" "$out" '2 pass\(es\) round the table'
+# a message starting with a Unix file path (/foo/bar.py) is sent as a message, not treated as an unknown /command
+out=$(run "/tmp/example/app.py please inspect this")
+hasnt "Unix path at start of message is not rejected as unknown /command" "$out" 'No command /tmp'
+has "... and gets answered by the council" "$out" 'ANSWER from @'
+# roast mode exits promptly (does not hang 10 minutes!) when all members fail their initial point
+touch "$T/full"
+t0=$(date +%s)
+out=$(run "/mode roast" "everyone blocked by memory wall")
+dt=$(( $(date +%s) - t0 ))
+rm -f "$T/full"
+run "/mode order" > /dev/null
+if (( dt < 15 )); then ok "roast mode exits promptly when all points fail (${dt}s, no 10-min stall)"; else bad "roast mode exits promptly when all points fail" "took ${dt}s"; fi
+# /sim N Monte Carlo: runs N isolated trials, tallies distribution, and enforces 1..20 bounds
+out=$(run "/sim 0 bad" "/sim 25 too many")
+has "/sim enforces 1..20 trial bounds" "$out" 'between 1 and 20 trials'
+rm -f "$T/log"/prompt.*
+out=$(run "/new" "/format stake" "/rounds 1" "/sim 2 Tea or coffee?")
+has "/sim 2 runs both Monte Carlo trials" "$out" '─── sim 2/2 \(Win Stake\) ───'
+has "... and tallies the Monte Carlo win distribution and total votes" "$out" 'Monte Carlo \(2/2 trials · Win Stake\)'
+has "... including cumulative vote totals across trials" "$out" 'Total votes:'
+# verify trial isolation: no prompt in the second trial leaks trial 1's Win Stake answers in the thread block
+sim_check=$(python3 -c '
+import glob, re, sys
+ps = sorted(glob.glob(sys.argv[1] + "/prompt.*"))
+leaked = 0
+for p in ps:
+    m = re.search(r"--- The thread so far ---(.*?)--- End of the thread ---", open(p).read(), re.S)
+    if m and ("ANSWER from @" in m.group(1) or "Vote: @" in m.group(1)):
+        leaked += 1
+print(f"{len(ps)}:{leaked}")
+' "$T/log")
+is "... each Monte Carlo trial runs isolated (no cross-trial leakage)" "$sim_check" "6:0"
+run "/format forum" "/rounds 1" > /dev/null
 
 # ---- the typing line ------------------------------------------------------------------------------------------
 # A long message typed letter by letter past the pane's edge, and backspaced back across the wrap: the

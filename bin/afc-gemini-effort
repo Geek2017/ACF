@@ -1,0 +1,318 @@
+#!/usr/bin/env -S python3 -I
+"""afc-gemini-effort: how hard every Gemini in the fleet thinks. One setting, like Claude's effort.
+
+  afc-gemini-effort                        the effort now: low, medium, high, xhigh, or default
+  afc-gemini-effort set <level|default>    set it (default takes the fleet's lines out again)
+  afc-gemini-effort show                   what each model is sent
+  afc-gemini-effort ensure                 put the level set last back, if a Gemini dropped it (agents
+                                           runs this before every Gemini start)
+  afc-gemini-effort chat <gemini pid> [id] the chat a running Gemini is on, only when it is certain:
+                                           its id, or "new" when nothing has been said in it yet.
+                                           id: what that Gemini's /stats says (Session ID), checked
+  afc-gemini-effort model <gemini pid> [id] the model that last answered in that chat, and when
+  --home <dir> before any of them          that Gemini home (default: $GEMINI_CLI_HOME, else ~)
+
+Gemini CLI has no effort flag or command. It sends a thinking level per model from its settings
+file (modelConfigs.customOverrides in <home>/.gemini/settings.json), read only when it starts. A
+level set there goes out with every call to that model, also the calls after a tool has run. A
+model alias that carries a level does not: Gemini uses the alias for the first call of each prompt
+only, then the plain model. Both were checked on Gemini CLI 0.71.0 with --fake-responses, which
+prints the request instead of sending it. A per-run settings file is no way round it either: Gemini
+reads a system settings file only from a folder root owns.
+
+The fleet's lines carry "afc": "effort", so lines of your own in customOverrides are left alone.
+Levels (Gemini API docs, 2026-11-24): Neon and Hydrogen take low, medium, high, xhigh (high when
+nothing is sent); Argon, Carbon and 3.8 Flash take low, medium, high (medium when nothing is sent),
+so xhigh gives them high. Other models are not touched.
+
+Who follows a change: the council's Gemini seats and afc-chat start a new Gemini every turn, so
+their next turn. A Gemini already running keeps its level until it starts again: Alt+M restarts the
+pane's Gemini on its chat (agents --gemini-restart), using `chat` here to know which chat that is.
+"""
+import datetime, glob, json, os, sys, tempfile
+
+LEVELS = ["low", "medium", "high", "xhigh"]
+MODELS = {   # model: the levels it takes, lowest first
+    "gemini-4-neon": ["low", "medium", "high", "xhigh"],
+    "gemini-4-hydrogen": ["low", "medium", "high", "xhigh"],
+    "gemini-4-argon": ["low", "medium", "high"],
+    "gemini-4-carbon": ["low", "medium", "high"],
+    "gemini-3.8-flash": ["low", "medium", "high"],
+}
+OWN_DEFAULT = {"gemini-4-neon": "high", "gemini-4-hydrogen": "high", "gemini-4-argon": "medium",
+               "gemini-4-carbon": "medium", "gemini-3.8-flash": "high (Gemini CLI's own setting for 3.8 Flash)"}
+TAG = "effort"
+# The level chosen last, kept by the fleet: `ensure` writes it back when a Gemini has dropped the lines
+OWN = os.environ.get("AFC_GEMINI_EFFORT_FILE") or os.path.expanduser("~/.config/agents/gemini-effort")
+
+
+def fit(level, takes):
+    """The level a model gets: the one asked for, or the highest it takes below that."""
+    if level in takes:
+        return level
+    below = [lv for lv in takes if LEVELS.index(lv) < LEVELS.index(level)]
+    return below[-1] if below else takes[0]
+
+
+def settings_path(home):
+    return os.path.join(home, ".gemini", "settings.json")
+
+
+def load(home):
+    p = settings_path(home)
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+    except ValueError:
+        raise SystemExit(f"{p} is not plain JSON (comments?); nothing was changed")
+    if not isinstance(d, dict):
+        raise SystemExit(f"{p} does not hold a JSON object; nothing was changed")
+    return d
+
+
+def ours(o):
+    return isinstance(o, dict) and o.get("afc") == TAG
+
+
+def current(settings):
+    asked = {o.get("level") for o in (settings.get("modelConfigs") or {}).get("customOverrides") or [] if ours(o)}
+    asked.discard(None)
+    if not asked:
+        return "default"
+    return asked.pop() if len(asked) == 1 else "mixed"
+
+
+def save(home, settings):
+    """Write the file in one step, keeping its mode; through a link to the file it points at."""
+    p = os.path.realpath(settings_path(home))
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    mode = os.stat(p).st_mode & 0o777 if os.path.exists(p) else 0o600
+    fd, tmp = tempfile.mkstemp(prefix=".settings.", suffix=".json", dir=os.path.dirname(p))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def set_level(home, level):
+    s = load(home)
+    mc = s.get("modelConfigs")
+    if not isinstance(mc, dict):
+        mc = {}
+    keep = [o for o in mc.get("customOverrides") or [] if not ours(o)]
+    if level != "default":
+        for model, takes in MODELS.items():
+            keep.append({"match": {"model": model},
+                         "modelConfig": {"generateContentConfig": {"thinkingConfig": {"thinkingLevel": fit(level, takes).upper()}}},
+                         "afc": TAG, "level": level})
+    if keep:
+        mc["customOverrides"] = keep
+    else:
+        mc.pop("customOverrides", None)
+    if mc:
+        s["modelConfigs"] = mc
+    else:
+        s.pop("modelConfigs", None)
+    save(home, s)
+
+
+# ---- which chat a running Gemini is on -------------------------------------------------------
+
+def proc_args(pid):
+    with open(f"/proc/{pid}/cmdline", "rb") as f:
+        return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+
+
+def proc_start(pid):
+    """When the process started, in seconds since the epoch."""
+    with open(f"/proc/{pid}/stat") as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    with open("/proc/stat") as f:
+        btime = next(int(line.split()[1]) for line in f if line.startswith("btime "))
+    return btime + int(fields[19]) / os.sysconf("SC_CLK_TCK")
+
+
+def arg_after(args, *names):
+    for i, a in enumerate(args):
+        for n in names:
+            if a == n and i + 1 < len(args):
+                return args[i + 1]
+            if a.startswith(n + "="):
+                return a[len(n) + 1:]
+    return ""
+
+
+def iso(t):
+    try:
+        return datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def chats(home, cwd):
+    """(path, first record) of each chat Gemini keeps for that folder (not the helpers' own chats)."""
+    out = []
+    for root in glob.glob(os.path.join(home, ".gemini", "tmp", "*", ".project_root")):
+        try:
+            with open(root) as f:
+                if os.path.realpath(f.read().strip()) != cwd:
+                    continue
+        except OSError:
+            continue
+        for path in glob.glob(os.path.join(os.path.dirname(root), "chats", "session-*.jsonl")):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    first = json.loads(f.readline())
+            except (OSError, ValueError):
+                continue
+            if isinstance(first, dict) and first.get("sessionId") and first.get("kind") != "subagent":
+                out.append((path, first))
+    return out
+
+
+UUID = "0123456789abcdef-"
+
+
+def is_uuid(s):
+    return len(s) == 36 and all(c in UUID for c in s.lower())
+
+
+def chat_of(home, pid, said=""):
+    """(chat id, file) of the Gemini process pid; ("", "") unless it is certain. said: the Session ID
+    that Gemini's own /stats shows, which is exact (it follows /clear and a chat reopened inside
+    Gemini); the file is "" when that chat has none yet. Without it, the chat is worked out from the
+    process: the id it was started on, else the chat whose file it wrote when it started."""
+    cwd = os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+    have = chats(home, cwd)
+    if said:
+        # Taken only with its chat file, written since this Gemini started (a resumed chat is written
+        # again when it opens): an id misread from the screen never reopens or replaces a chat
+        if not is_uuid(said):
+            return "", ""
+        began = proc_start(pid)
+        for p, c in have:
+            if c["sessionId"] == said and os.path.getmtime(p) >= began - 5:
+                return said, p
+        return "", ""
+    args = proc_args(pid)
+    began = proc_start(pid)
+    named = arg_after(args, "--resume", "-r") or arg_after(args, "--session-id")
+    if named and is_uuid(named):
+        fits = [(p, c) for p, c in have if c["sessionId"] == named]
+    elif named:                         # "latest" or a list number: the chat it reopened, if only one fits
+        fits = [(p, c) for p, c in have
+                if (iso(c.get("startTime")) or 0) < began - 2 and os.path.getmtime(p) >= began - 2]
+    else:
+        # A new chat: Gemini writes its file when it starts, so its start time is the process's, give
+        # or take the seconds Gemini takes to start (it starts itself again with more memory first).
+        fits = [(p, c) for p, c in have if began - 2 <= (iso(c.get("startTime")) or 0) <= began + 60]
+    if len(fits) != 1:
+        return "", ""
+    path = fits[0][0]
+    # Another chat of this folder written after it, while this Gemini ran, may be this Gemini's own
+    # (/clear or a chat reopened inside it): then it is not certain.
+    mine = os.path.getmtime(path)
+    if any(os.path.getmtime(p) > mine and os.path.getmtime(p) >= began for p, _ in have if p != path):
+        return "", ""
+    return fits[0][1]["sessionId"], path
+
+
+def said_anything(path):
+    """Whether a chat file holds a message from you or Gemini (only such a chat can be reopened)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"type"' in line:
+                    try:
+                        if json.loads(line).get("type") in ("user", "gemini"):
+                            return True
+                    except (ValueError, AttributeError):
+                        continue
+    except OSError:
+        pass
+    return False
+
+
+def last_model(path):
+    """(model, when) of the last reply in a chat file."""
+    model, when = "", 0
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"model"' not in line:
+                continue
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(m, dict) and m.get("type") == "gemini" and m.get("model"):
+                model, when = m["model"], iso(m.get("timestamp")) or when
+    return model, int(when)
+
+
+def main(argv):
+    home = os.environ.get("GEMINI_CLI_HOME") or os.path.expanduser("~")
+    if argv[:1] == ["--home"] and len(argv) > 1:
+        home, argv = argv[1], argv[2:]
+    cmd = argv[0] if argv else ""
+    if cmd == "":
+        print(current(load(home)))
+    elif cmd == "set" and len(argv) == 2 and argv[1] in LEVELS + ["default"]:
+        set_level(home, argv[1])
+        try:                                   # the level the fleet keeps, for `ensure`
+            os.makedirs(os.path.dirname(OWN), exist_ok=True)
+            with open(OWN, "w") as f:
+                f.write(argv[1] + "\n")
+        except OSError:
+            pass
+        print(current(load(home)))
+    elif cmd == "ensure" and len(argv) == 1:
+        # Run before every Gemini start (agents' tool_run): a Gemini that saves any setting writes back
+        # the copy it read when it started, which can drop the fleet's lines; this puts them back
+        try:
+            with open(OWN) as f:
+                want = f.read().strip()
+        except OSError:
+            return 0
+        if want in LEVELS + ["default"] and current(load(home)) != want:
+            set_level(home, want)
+    elif cmd == "show" and len(argv) == 1:
+        s = load(home)
+        now = current(s)
+        print(f"Gemini effort: {now}  ({settings_path(home)})")
+        for model, takes in MODELS.items():
+            if now in LEVELS:
+                print(f"  {model:<18} thinkingLevel {fit(now, takes).upper()}")
+            else:
+                print(f"  {model:<18} no level sent: the model's own, {OWN_DEFAULT[model]}")
+    elif cmd in ("chat", "model") and len(argv) in (2, 3) and argv[1].isdigit():
+        try:
+            chat, path = chat_of(home, int(argv[1]), argv[2] if len(argv) == 3 else "")
+        except (OSError, StopIteration, IndexError, ValueError):
+            return 1
+        if not chat:
+            return 1
+        if cmd == "chat":
+            print(chat if path and said_anything(path) else "new")
+        else:
+            model, when = last_model(path) if path else ("", 0)
+            if not model:
+                return 1
+            print(f"{model}\t{when}")
+    else:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

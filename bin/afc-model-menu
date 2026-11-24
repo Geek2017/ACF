@@ -1,32 +1,75 @@
 #!/usr/bin/env bash
-# afc-model-menu: the Alt+M pop-up. Pick the model (and, for Claude, the effort) of the agent in the
-# focused pane from a tmux menu that floats over the pane, instead of the agent's own picker.
+# afc-model-menu: the Alt+M pop-up. Pick the model and the effort of the agent in the focused pane
+# from a tmux menu in the middle of the screen, instead of the agent's own picker.
 #   Claude  types  /model <id>  or  /effort <level>
 #           (Claude's own picker is a tall menu inside the chat and leaves empty rows when it closes.)
-#   Gemini  types  /model set <id>
-#           (Gemini CLI 0.66 does not list Argon or Carbon in its picker, but takes any name this
-#           way. Checked 2026-11-13 with the API-key account: gemini-4-argon, gemini-4-carbon and
-#           gemini-4-hydrogen all answer, and the chat record shows the chosen model replied.)
-# Other agents (Codex, Antigravity) keep their own pickers; the pop-up says so.
+#   Gemini  types  /model set <id>  (noted on the pane as @gemini_model, so a restart keeps it)
+#           (Gemini CLI 0.71 lists these only through modelDefinitions in ~/.gemini/settings.json,
+#           and /model set refuses a name it does not list. Checked 2026-11-13 with the API-key
+#           account: gemini-4-argon, gemini-4-carbon and gemini-4-hydrogen all answer, and the chat
+#           record shows the chosen model replied; gemini-4-neon (paid tier only) answered a --model
+#           run on 2026-11-24, CLI 0.71.0.)
+#           Effort: Gemini has no effort command. afc-gemini-effort sets one thinking level for every
+#           Gemini in its settings, which a running Gemini reads only when it starts, so the Gemini in
+#           this pane then starts again on its chat (agents --gemini-restart); afc-chat panes and the
+#           council take it at their next turn.
+# Other agents (Antigravity, Codex, Copilot, OpenCode) and plain shells get Alt+M itself, passed on:
+# Antigravity has a use of its own for it.
 # Usage: afc-model-menu <client> <pane id> <pane pid>   (bound to M-m in ~/.tmux.conf; runs inside tmux)
-# To add a model, add a line to the list for its tool below: label, key, id.
+#        afc-model-menu --gemini-model|--gemini-effort <client> <pane id> <pane pid> <id|level>
+#                                                       (what the Gemini menu's items run)
+# To add a model, add a line to the list for its tool below: label, key, id (for Gemini, also to
+# MODELS in afc-gemini-effort, so it gets the effort).
 # -M on the menus: items can be clicked with the mouse as well as picked by key.
+me="$HOME/.local/bin/afc-model-menu"
+case "${1:-}" in
+  --gemini-model)
+    client=${2:?}; pane=${3:?}; id=${5:?}
+    # Never type into Gemini while it works or asks something: the Enter would answer its question
+    scr=$(tmux capture-pane -p -t "$pane" 2>/dev/null)
+    if [[ "$scr" == *"esc to cancel"* ]] || grep -qE 'Allow once|Action Required|Action required|Allow execution of|Apply this change|Ready to start implementation' <<< "$scr"; then
+      tmux display-message -c "$client" -d 6000 "Gemini is working or asking something: pick the model when it is done."; exit 0
+    fi
+    tmux set -p -t "$pane" @gemini_model "$id" \; set -p -t "$pane" @gemini_model_at "$(date +%s)"
+    # Type the command, pause, then press Enter. Without the pause Gemini takes the Enter as part of
+    # the typed burst and leaves the command sitting in its prompt, unsent.
+    tmux send-keys -t "$pane" -l "/model set $id"; sleep 0.5; tmux send-keys -t "$pane" Enter
+    exit 0 ;;
+  --gemini-effort)
+    client=${2:?}; pane=${3:?}; pid=${4:?}; level=${5:?}
+    if ! out=$("$HOME/.local/bin/afc-gemini-effort" set "$level" 2>&1); then
+      tmux display-message -c "$client" -d 7000 "Gemini effort not changed: $out"; exit 0
+    fi
+    said=$level; [[ "$level" == default ]] && said="each model's own"
+    how=$("$HOME/.local/bin/agents" --gemini-restart "$pane" "$pid" 2>&1 | tail -1)
+    tmux display-message -c "$client" -d 8000 "Gemini effort: $said, for every Gemini (new ones and the council at once). $how"
+    exit 0 ;;
+esac
 client=${1:?usage: afc-model-menu <client> <pane id> <pane pid>}
 pane=${2:?}
 pid=${3:?}
-# A council member's pane (afc-council's grid, Alt+K) has its own menu: that member's model and effort
+# A council pane (afc-council's grid, Alt+K) has its own menus
+if [[ -n "$(tmux show-options -pqv -t "$pane" @council_one 2>/dev/null)" ]]; then
+  exec "$HOME/.local/bin/afc-council" --one-menu "$client" "$pane"
+fi
 if [[ -n "$(tmux show-options -pqv -t "$pane" @council_member 2>/dev/null)" ]]; then
   exec "$HOME/.local/bin/afc-council" --menu "$client" "$pane"
+fi
+if [[ -n "$(tmux show-options -pqv -t "$pane" @council_chat 2>/dev/null)" ]]; then
+  tmux display-message -c "$client" -d 3000 "Focus a member's pane for Alt+M, or type /model @name MODEL here."
+  exit 0
 fi
 who=$("$HOME/.local/bin/agents" --who "$pid" 2>/dev/null | head -1)
 
 # Type the command, pause, then press Enter. Without the pause Gemini takes the Enter as part of
 # the typed burst and leaves the command sitting in its prompt, unsent.
 type_it() { printf "send-keys -t '%s' -l '%s' ; run-shell -d 0.5 ; send-keys -t '%s' Enter" "$pane" "$1" "$pane"; }
+# A Gemini item: runs this script again, in the background, with what was picked
+pick() { printf "run-shell -b \"%s %s '%s' '%s' '%s' %s\"" "$me" "$1" "$client" "$pane" "$pid" "$2"; }
 
 case "${who%% *}" in
   claude)
-    tmux display-menu -M -c "$client" -t "$pane" -T "#[align=centre] Claude model / effort " -x P -y P \
+    tmux display-menu -M -c "$client" -t "$pane" -T "#[align=centre] Claude model / effort " -x C -y C \
       "Opus 5.5"      1 "$(type_it '/model claude-opus-5-5')" \
       "Fable 5.2"     2 "$(type_it '/model claude-fable-5-2')" \
       "Sonnet 5.5"    3 "$(type_it '/model claude-sonnet-5-5')" \
@@ -39,13 +82,26 @@ case "${who%% *}" in
       "Effort xhigh"  x "$(type_it '/effort xhigh')"
     ;;
   gemini)
-    tmux display-menu -M -c "$client" -t "$pane" -T "#[align=centre] Gemini model " -x P -y P \
-      "Gemini 4 Argon"     a "$(type_it '/model set gemini-4-argon')" \
-      "Gemini 4 Carbon"    c "$(type_it '/model set gemini-4-carbon')" \
-      "Gemini 4 Hydrogen"  h "$(type_it '/model set gemini-4-hydrogen')" \
-      "Gemini 3.8 Flash"   f "$(type_it '/model set gemini-3.8-flash')"
+    # The keys match Claude's menu: numbers for the models, l m h x for the effort. ● marks the
+    # effort set now. Argon, Carbon and 3.8 Flash have no xhigh: they get high.
+    now=$("$HOME/.local/bin/afc-gemini-effort" 2>/dev/null || echo default)
+    on() { if [[ "$now" == "$1" ]]; then printf '● '; else printf '  '; fi; }
+    tmux display-menu -M -c "$client" -t "$pane" -T "#[align=centre] Gemini model / effort " -x C -y C \
+      "Gemini 4 Neon"      1 "$(pick --gemini-model gemini-4-neon)" \
+      "Gemini 4 Argon"     2 "$(pick --gemini-model gemini-4-argon)" \
+      "Gemini 4 Carbon"    3 "$(pick --gemini-model gemini-4-carbon)" \
+      "Gemini 4 Hydrogen"  4 "$(pick --gemini-model gemini-4-hydrogen)" \
+      "Gemini 3.8 Flash"   5 "$(pick --gemini-model gemini-3.8-flash)" \
+      "" \
+      "$(on low)Effort low"                  l "$(pick --gemini-effort low)" \
+      "$(on medium)Effort medium"            m "$(pick --gemini-effort medium)" \
+      "$(on high)Effort high"                h "$(pick --gemini-effort high)" \
+      "$(on xhigh)Effort xhigh"              x "$(pick --gemini-effort xhigh)" \
+      "$(on default)Effort: each model's own" d "$(pick --gemini-effort default)"
     ;;
   *)
-    tmux display-message -c "$client" -d 3000 "Alt+M has model lists for Claude and Gemini panes only; use this agent's own /model."
+    # Antigravity uses Alt+M itself, and other agents may too: the fleet has no menu for them, so
+    # the key goes on to the pane as if the fleet had not bound it (operator, 2026-11-24)
+    tmux send-keys -t "$pane" M-m
     ;;
 esac

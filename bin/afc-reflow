@@ -28,6 +28,8 @@ if [[ "${1:-}" == --note-all ]]; then
 fi
 
 win=${1:?usage: afc-reflow <window id> | --note-all}
+# Council tabs handle their own resize via SIGWINCH (never send Ctrl+L to the chat box or guard-minimise member panes).
+[[ -n "$(t show-options -wqv -t "$win" @council 2>/dev/null)" ]] && exit 0
 
 # At most two runs per tab: one at work and one waiting for it. Every layout change and resize
 # starts a run, and a slow tmux server used to let them stack up without limit (2026-11-21, see

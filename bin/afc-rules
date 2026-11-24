@@ -639,6 +639,8 @@ def log_findings(P, tool, chat, found, sent):
 
 def hook(tool, event):
     raw = sys.stdin.read()
+    if os.environ.get("AFC_RULES_SKIP") == "1" or os.environ.get("AFC_COUNCIL_CHILD") == "1":
+        return allow(tool)
     try:
         data = json.loads(raw) if raw.strip() else {}
     except ValueError:

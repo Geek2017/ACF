@@ -267,7 +267,7 @@ def guard(win):
     sharing out would still leave a split too small, minimise the one furthest out and look again."""
     import fcntl
     sock = info(win, "#{socket_path}") or ""
-    if not sock or info(win, "#{session_name}") == STASH:
+    if not sock or info(win, "#{session_name}") == STASH or info(win, "#{@council}") == "1":
         return 0
     lock = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
                         "afc-even-guard" + (sock + win).replace("/", "_").replace("@", "_") + ".lock")

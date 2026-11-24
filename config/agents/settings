@@ -18,5 +18,8 @@
 #cpu-wall 90          # no agent added by hand (split, agents --add) once the machine's CPU is this busy
                       # (C: in the bottom bar); agents coming back after a restart are let through; 0 = no wall
 #splash on            # the logo's animation (5 s) in the middle of the screen before the fleet window opens (afc-splash)
-#claude-view classic  # how Claude draws its chat: classic = every command shown, the tmux scrollbar has the chat;
-                      # compact = a turn's steps folded into one line (Claude's focus view), the chat scrolls inside Claude
+#view classic         # how agents draw their chat: classic = native CLIs + tmux scrollbar;
+                      # compact = Claude focus view (fullscreen, steps folded);
+                      # unified = provider-agnostic ACF CLI UI (afc-chat: task checklist + 1-line bash bar
+                      # across Claude, Codex, Gemini and Antigravity, keeping tmux scrollback/scrollbar)
+#claude-view classic  # legacy alias for view (used when view is unset)

@@ -66,6 +66,10 @@ restore() {  # <pane id> <window to fall back on>
 case "${1:-}" in
   hide)
     pane=${2:?pane id}
+    if [[ -n "$(t show-options -pqv -t "$pane" @council_member 2>/dev/null)$(t show-options -pqv -t "$pane" @council_chat 2>/dev/null)" ]]; then
+      say "Council panes stay in the council grid (✕ removes a member, Alt+O switches to one view)."
+      exit 0
+    fi
     read -r wid np wname <<< "$(t display-message -p -t "$pane" '#{window_id} #{window_panes} #{window_name}')"
     if (( ${np:-1} < 2 )); then
       say "This is the tab's only pane, so there is nothing to minimise. Alt+Z zooms a pane, Alt+Q closes it."

@@ -1,0 +1,2563 @@
+#!/usr/bin/env python3
+"""afc-chat: provider-agnostic unified CLI UI for Agentic CLI Fleet (ACF).
+
+Runs Claude Code, Codex, Gemini CLI or Antigravity (agy) behind one clean terminal
+interface so every inference provider renders the exact same workflow:
+
+  - Short task checklist box (when the agent creates steps / todos / task.md)
+  - 1-line live running bash / tool indicator underneath (with elapsed time & tokens)
+  - Collapsed 1-line step summary when the turn finishes (Ctrl+O or /steps to expand)
+  - Clean final response inline (keeping tmux's scrollback, thin scrollbar and mouse copy)
+
+Usage:
+  afc-chat [--tool claude|codex|gemini|agy] [--account NAME] [--mode auto|plan|bypass]
+           [--resume ID | --continue] [--model ID] [--effort LEVEL]
+           [--checklist auto|on|off] [--prompt TEXT] [--once TEXT] [--wait SECONDS]
+  afc-chat claude|codex|gemini|agy [options...]
+
+Slash commands inside the chat:
+  /steps [N|full]              expand the bash/tool steps & outputs of the last turn (or turn N)
+  /tasks                       show the current task checklist
+  /mode [auto|plan|bypass]     show or change permission mode (Shift+Tab cycles)
+  /model [set] <id>            show or change model (also works with Alt+M)
+  /effort <level>              show or change reasoning effort (claude, codex, agy)
+  /provider <tool> [account]   switch inference provider in this pane
+  /checklist [auto|on|off]     control checklist prompting (auto = native, on = nudge)
+  /new  | /clear               start a fresh conversation
+  /native                      hand off to this provider's native interactive CLI on the same chat
+  /help                        show commands and shortcuts
+  /quit                        exit (or Ctrl+D)
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import dataclasses
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import termios
+import threading
+import time
+import tty
+import unicodedata
+
+try:
+    import readline
+except ImportError:  # pragma: no cover
+    readline = None
+
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, ".local", "bin")
+AGENTS = os.environ.get("AFC_AGENTS") or (
+    os.path.join(BIN, "agents") if os.access(os.path.join(BIN, "agents"), os.X_OK) else "agents"
+)
+RT = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+STATE_DIR = os.path.join(RT, "afc-chat")
+PANES_DIR = os.path.join(RT, "afc-panes")
+
+TOOLS = ("claude", "codex", "gemini", "agy", "copilot", "opencode")
+TOOL_LABELS = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "gemini": "Gemini",
+    "agy": "Antigravity",
+    "copilot": "Copilot",
+    "opencode": "OpenCode",
+}
+TOOL_ALIASES = {
+    "claude": "claude",
+    "anthropic": "claude",
+    "codex": "codex",
+    "openai": "codex",
+    "gpt": "codex",
+    "gemini": "gemini",
+    "google": "gemini",
+    "agy": "agy",
+    "antigravity": "agy",
+    "copilot": "copilot",
+    "github": "copilot",
+    "gh": "copilot",
+    "opencode": "opencode",
+    "cloudflare": "opencode",
+}
+MODES = ("auto", "plan", "bypass")
+SPIN = "✳✶✻✽✢"
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
+CHECKBOX_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[([ xX/~-])\]\s+(.+?)\s*$")
+
+# Tokyo Night-inspired 256-color palette (works on Linux, macOS Terminal, WSL, SSH)
+C = {
+    "accent": "38;5;111",      # #7aa2f7 blue
+    "coral": "38;5;209",       # warm coral for active task header (✳)
+    "purple": "38;5;141",      # #bb9af7 purple
+    "green": "38;5;114",       # #9ece6a green
+    "amber": "38;5;179",       # #e0af68 amber
+    "red": "38;5;203",         # #f7768e red
+    "cyan": "38;5;116",        # #73daca teal/cyan
+    "text": "38;5;252",        # light foreground
+    "white": "1;97",           # bold bright white
+    "strike": "9;38;5;244",    # strikethrough muted grey (completed tasks)
+    "dim": "38;5;244",         # muted grey
+    "faint": "38;5;240",       # subtle grey
+    "border": "38;5;239",      # rules / tree connector
+    "code": "38;5;117",        # inline code
+    "claude": "38;5;173",
+    "codex": "38;5;114",
+    "gemini": "38;5;75",
+    "agy": "38;5;141",
+    "copilot": "38;5;117",
+    "opencode": "38;5;216",
+}
+
+TTY_OUT = sys.stdout.isatty()
+TTY_IN = sys.stdin.isatty()
+
+# Key macro markers for GNU readline (same proven pattern as afc-council)
+KEY_STEPS = "#!#O#"
+KEY_TASKS = "#!#T#"
+KEY_MODE = "#!#M#"
+
+CHECKLIST_HINT = (
+    "[ACF UI hint: For any multi-step work, maintain a concise task checklist using your "
+    "task/todo/plan tool (or task.md) as you progress so the user can follow your steps.]\n\n"
+)
+
+
+# ---- text width & ANSI helpers ---------------------------------------------------------------
+
+def paint(text: str, color: str) -> str:
+    if not TTY_OUT or not color:
+        return text
+    code = C.get(color, color)
+    return f"\033[{code}m{text}\033[0m"
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text or "")
+
+
+def char_cells(ch: str) -> int:
+    if unicodedata.combining(ch):
+        return 0
+    if ch in ("\r", "\n"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def cells(text: str) -> int:
+    return sum(char_cells(ch) for ch in strip_ansi(text))
+
+
+def truncate_cells(text: str, max_cells: int, ellipsis: str = "…") -> str:
+    text = " ".join(strip_ansi(text).split())
+    if max_cells <= 0:
+        return ""
+    if cells(text) <= max_cells:
+        return text
+    ell_w = cells(ellipsis)
+    limit = max(0, max_cells - ell_w)
+    out = []
+    used = 0
+    for ch in text:
+        w = char_cells(ch)
+        if used + w > limit:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out).rstrip() + (ellipsis if max_cells >= ell_w else "")
+
+
+def wrap_cells(text: str, max_cells: int) -> list[str]:
+    text = " ".join(strip_ansi(text).split())
+    if max_cells <= 4 or cells(text) <= max_cells:
+        return [text]
+    words = text.split(" ")
+    lines: list[str] = []
+    cur = ""
+    cur_w = 0
+    for word in words:
+        w = cells(word)
+        if not cur:
+            if w <= max_cells:
+                cur, cur_w = word, w
+            else:
+                lines.append(truncate_cells(word, max_cells))
+        elif cur_w + 1 + w <= max_cells:
+            cur += " " + word
+            cur_w += 1 + w
+        else:
+            lines.append(cur)
+            if w <= max_cells:
+                cur, cur_w = word, w
+            else:
+                lines.append(truncate_cells(word, max_cells))
+                cur, cur_w = "", 0
+    if cur:
+        lines.append(cur)
+    return lines or [""]
+
+
+def fmt_dur(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s >= 3600:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    if s >= 60:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s}s"
+
+
+def fmt_tokens(n: int) -> str:
+    if n <= 0:
+        return ""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k" if n < 100_000 else f"{round(n / 1000)}k"
+    return str(n)
+
+
+def term_size() -> tuple[int, int]:
+    sz = shutil.get_terminal_size((100, 30))
+    return max(36, sz.columns), max(10, sz.lines)
+
+
+def strip_shell_wrapper(cmd: str) -> str:
+    """Turn '/bin/bash -lc \"git status\"' into 'git status' for clean 1-line display."""
+    s = (cmd or "").strip()
+    m = re.match(r"^(?:/usr)?/bin/(?:ba|z|da)?sh\s+-[a-z]*c\s+(.*)$", s, re.DOTALL)
+    if m:
+        inner = m.group(1).strip()
+        if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in ("'", '"'):
+            inner = inner[1:-1]
+        return inner.strip()
+    return s
+
+
+def first_line(text: str) -> str:
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if s:
+            return s
+    return ""
+
+
+def short_path(path: str, cwd: str) -> str:
+    if not path:
+        return ""
+    try:
+        ap = os.path.abspath(path)
+        ac = os.path.abspath(cwd)
+        if ap == ac:
+            return "."
+        if ap.startswith(ac + os.sep):
+            return ap[len(ac) + 1:]
+        if ap.startswith(HOME + os.sep):
+            return "~/" + ap[len(HOME) + 1:]
+        return path
+    except Exception:
+        return path
+
+
+def parse_markdown_checklist(text: str) -> list[tuple[str, str]]:
+    """Extract [(subject, status), ...] from markdown checkboxes (- [ ], - [/], - [x])."""
+    items: list[tuple[str, str]] = []
+    for raw in (text or "").splitlines():
+        m = CHECKBOX_RE.match(raw)
+        if not m:
+            continue
+        mark, subj = m.group(1), m.group(2).strip()
+        if not subj:
+            continue
+        if mark in ("x", "X"):
+            st = "completed"
+        elif mark in ("/", "~", "-"):
+            st = "in_progress"
+        else:
+            st = "pending"
+        items.append((subj, st))
+    return items
+
+
+# ---- normalized event & state model ----------------------------------------------------------
+
+@dataclasses.dataclass
+class ChecklistItem:
+    id: str
+    subject: str
+    status: str = "pending"   # pending | in_progress | completed
+    active_form: str = ""     # optional gerund ("Fetching Amazon catalog data")
+
+
+@dataclasses.dataclass
+class ToolStep:
+    id: str
+    kind: str                 # bash | read | edit | search | web | agent | tool
+    name: str
+    summary: str              # exact 1-line command/path for /steps & Ctrl+O
+    detail: str = ""          # full command / args
+    label: str = ""           # clean human-readable task verb (never raw bash spam)
+    started_at: float = 0.0
+    ended_at: float = 0.0
+    ok: bool | None = None
+    output: str = ""
+
+
+@dataclasses.dataclass
+class TurnRecord:
+    index: int
+    prompt: str
+    started_at: float
+    ended_at: float = 0.0
+    steps: list[ToolStep] = dataclasses.field(default_factory=list)
+    checklist: list[ChecklistItem] = dataclasses.field(default_factory=list)
+    reply: str = ""
+    tokens: int = 0
+    cost_usd: float = 0.0
+    error: str = ""
+    interrupted: bool = False
+
+
+class TurnState:
+    """Thread-safe mutable state for the currently executing turn."""
+
+    def __init__(self, cwd: str, prior_checklist: list[ChecklistItem] | None = None,
+                 prompt: str = "", auto_tasks: bool = True):
+        self.lock = threading.Lock()
+        self.cwd = cwd
+        self.started_at = time.monotonic()
+        self.checklist: list[ChecklistItem] = []
+        self._native_checklist: bool = False
+        self._auto_tasks: bool = auto_tasks
+        self._auto_counts: dict[str, int] = {}
+        self._task_seq = 0
+        self._pending_task_creates: dict[str, str] = {}   # tool_use_id -> local item id
+        if prior_checklist:
+            # Keep unfinished native items from prior turn if any; otherwise start clean
+            if any(it.status != "completed" for it in prior_checklist):
+                self.checklist = [dataclasses.replace(it) for it in prior_checklist]
+                self._task_seq = len(self.checklist)
+                self._native_checklist = True
+
+        self.steps: list[ToolStep] = []
+        self._steps_by_id: dict[str, ToolStep] = {}
+        self.active_step_id: str | None = None
+        self.status_text: str = "Thinking…"
+        self.tokens: int = 0
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
+        self.cost_usd: float = 0.0
+        self.session_id: str = ""
+        self.model: str = ""
+        self.reply_chunks: list[str] = []
+        self.final_reply: str = ""
+        self.error: str = ""
+        self.interrupted: bool = False
+        self.expanded: bool = False
+        self.dirty: bool = True
+
+    def _switch_to_native(self) -> None:
+        if not self._native_checklist:
+            self.checklist = []
+            self._task_seq = 0
+            self._auto_counts.clear()
+            self._native_checklist = True
+
+    def set_session(self, sid: str = "", model: str = "") -> None:
+        with self.lock:
+            if sid:
+                self.session_id = sid
+            if model:
+                self.model = model
+
+    def set_status(self, text: str) -> None:
+        with self.lock:
+            if text and text != self.status_text:
+                self.status_text = text
+                self.dirty = True
+
+    def add_tokens(self, total: int = 0, inp: int = 0, out: int = 0, cost: float = 0.0, absolute: bool = True) -> None:
+        with self.lock:
+            if inp > 0:
+                self.input_tokens = max(self.input_tokens, inp) if absolute else self.input_tokens + inp
+            if out > 0:
+                self.output_tokens = max(self.output_tokens, out) if absolute else self.output_tokens + out
+            if total > 0:
+                self.tokens = max(self.tokens, total) if absolute else self.tokens + total
+            elif self.input_tokens or self.output_tokens:
+                self.tokens = max(self.tokens, self.input_tokens + self.output_tokens)
+            if cost > 0:
+                self.cost_usd = max(self.cost_usd, cost)
+            self.dirty = True
+
+    def task_create(self, subject: str, status: str = "pending", task_id: str = "",
+                    tool_use_id: str = "", active_form: str = "") -> None:
+        subj = " ".join((subject or "").split())
+        if not subj:
+            return
+        with self.lock:
+            self._switch_to_native()
+            self._task_seq += 1
+            tid = str(task_id or self._task_seq)
+            item = ChecklistItem(
+                id=tid,
+                subject=subj,
+                status=self._norm_status(status),
+                active_form=" ".join((active_form or "").split()),
+            )
+            self.checklist.append(item)
+            if tool_use_id:
+                self._pending_task_creates[tool_use_id] = tid
+            self.dirty = True
+
+    def task_bind_id(self, tool_use_id: str, real_id: str) -> None:
+        if not tool_use_id or not real_id:
+            return
+        with self.lock:
+            old_id = self._pending_task_creates.pop(tool_use_id, None)
+            if not old_id:
+                return
+            for it in self.checklist:
+                if it.id == old_id:
+                    it.id = str(real_id)
+                    break
+
+    def task_update(self, task_id: str, status: str = "", subject: str = "", active_form: str = "") -> None:
+        tid = str(task_id or "").lstrip("#")
+        with self.lock:
+            target = None
+            for it in self.checklist:
+                if it.id == tid:
+                    target = it
+                    break
+            if target is None and tid.isdigit():
+                idx = int(tid) - 1
+                if 0 <= idx < len(self.checklist):
+                    target = self.checklist[idx]
+            if target is not None:
+                if status:
+                    ns = self._norm_status(status)
+                    if ns == "deleted":
+                        self.checklist.remove(target)
+                    else:
+                        target.status = ns
+                if subject:
+                    target.subject = " ".join(subject.split())
+                if active_form:
+                    target.active_form = " ".join(active_form.split())
+                self.dirty = True
+
+    def replace_checklist(self, items: list[tuple]) -> None:
+        if not items:
+            return
+        with self.lock:
+            self._switch_to_native()
+            out: list[ChecklistItem] = []
+            for i, row in enumerate(items):
+                subj = row[0] if len(row) >= 1 else ""
+                st = row[1] if len(row) >= 2 else "pending"
+                af = row[2] if len(row) >= 3 else ""
+                if subj and subj.strip():
+                    out.append(ChecklistItem(
+                        id=str(i + 1),
+                        subject=" ".join(subj.split()),
+                        status=self._norm_status(st),
+                        active_form=" ".join((af or "").split()),
+                    ))
+            # If the provider only distinguishes completed/pending (e.g. Codex todo_list),
+            # highlight the first pending item as in_progress so the live view stays clear.
+            if out and not any(it.status == "in_progress" for it in out):
+                for it in out:
+                    if it.status == "pending":
+                        it.status = "in_progress"
+                        break
+            self.checklist = out
+            self._task_seq = len(self.checklist)
+            self.dirty = True
+
+    def finalize_checklist(self, ok: bool = True) -> None:
+        """At turn end, mark auto-synthesized steps completed so the settled tree is clean."""
+        with self.lock:
+            if not self._native_checklist and self.checklist and ok:
+                for it in self.checklist:
+                    it.status = "completed"
+                self.dirty = True
+
+    @staticmethod
+    def _norm_status(status: str) -> str:
+        s = (status or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if s in ("completed", "done", "complete", "finished", "success", "true"):
+            return "completed"
+        if s in ("in_progress", "active", "running", "working", "current", "doing"):
+            return "in_progress"
+        if s in ("deleted", "cancelled", "canceled", "removed"):
+            return "deleted"
+        return "pending"
+
+    def _record_auto_task(self, label: str) -> None:
+        """Maintain a clean, deduplicated human-readable checklist when the provider hasn't emitted todos."""
+        if self._native_checklist or not self._auto_tasks or not label:
+            return
+        base = " ".join(label.split())
+        # Mark earlier active auto-steps completed unless we're updating the same phase
+        if self.checklist and self.checklist[-1].subject.split(" (")[0] == base:
+            n = self._auto_counts.get(base, 1) + 1
+            self._auto_counts[base] = n
+            self.checklist[-1].subject = f"{base} ({n})"
+            self.checklist[-1].status = "in_progress"
+            return
+        for it in self.checklist:
+            if it.status == "in_progress":
+                it.status = "completed"
+        # Replace initial single "Analyze request" placeholder once real work starts if > 5 items
+        self._task_seq += 1
+        self._auto_counts[base] = 1
+        self.checklist.append(ChecklistItem(id=f"a{self._task_seq}", subject=base, status="in_progress"))
+        if len(self.checklist) > 6:
+            # Keep first completed + most recent 5 so the tree always stays compact
+            self.checklist = self.checklist[-6:]
+
+    def tool_start(self, step_id: str, kind: str, name: str, summary: str,
+                   detail: str = "", label: str = "") -> None:
+        now = time.monotonic()
+        clean_label = (label or "").strip() or human_generic_label(kind, name)
+        with self.lock:
+            if step_id in self._steps_by_id:
+                st = self._steps_by_id[step_id]
+                if summary:
+                    st.summary = summary
+                if detail:
+                    st.detail = detail
+                if clean_label:
+                    st.label = clean_label
+            else:
+                st = ToolStep(
+                    id=step_id,
+                    kind=kind,
+                    name=name,
+                    summary=summary or name,
+                    detail=detail or summary or name,
+                    label=clean_label,
+                    started_at=now,
+                )
+                self.steps.append(st)
+                self._steps_by_id[step_id] = st
+            self.active_step_id = step_id
+            self.status_text = st.label
+            self._record_auto_task(st.label)
+            self.dirty = True
+
+    def tool_end(self, step_id: str, ok: bool = True, output: str = "", duration: float | None = None) -> None:
+        now = time.monotonic()
+        with self.lock:
+            st = self._steps_by_id.get(step_id)
+            if st is None and self.active_step_id:
+                st = self._steps_by_id.get(self.active_step_id)
+            if st is not None:
+                st.ok = ok
+                if duration is not None and duration >= 0:
+                    st.ended_at = st.started_at + duration
+                else:
+                    st.ended_at = now
+                if output:
+                    st.output = output
+            if self.active_step_id == step_id:
+                self.active_step_id = None
+                self.status_text = "Thinking…"
+            self.dirty = True
+
+    def append_reply(self, text: str, replace: bool = False) -> None:
+        if text is None:
+            return
+        with self.lock:
+            if replace:
+                self.reply_chunks = [text]
+            else:
+                self.reply_chunks.append(text)
+
+    def set_final_reply(self, text: str) -> None:
+        if text:
+            with self.lock:
+                self.final_reply = text
+
+    def set_error(self, err: str) -> None:
+        if err:
+            with self.lock:
+                self.error = err
+                self.dirty = True
+
+    def toggle_expand(self) -> bool:
+        with self.lock:
+            self.expanded = not self.expanded
+            self.dirty = True
+            return self.expanded
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            active = self._steps_by_id.get(self.active_step_id) if self.active_step_id else None
+            return {
+                "elapsed": time.monotonic() - self.started_at,
+                "checklist": [dataclasses.replace(it) for it in self.checklist],
+                "steps": [dataclasses.replace(st) for st in self.steps],
+                "active": dataclasses.replace(active) if active else None,
+                "status_text": self.status_text,
+                "tokens": self.tokens,
+                "cost_usd": self.cost_usd,
+                "expanded": self.expanded,
+                "error": self.error,
+            }
+
+    def reply_text(self) -> str:
+        with self.lock:
+            streamed = "".join(self.reply_chunks).strip()
+            final = self.final_reply.strip()
+            return final or streamed
+
+    def summarize_steps(self) -> str:
+        with self.lock:
+            steps = list(self.steps)
+        if not steps:
+            return ""
+        counts = collections.Counter(s.kind for s in steps)
+        failed = sum(1 for s in steps if s.ok is False)
+        parts: list[str] = []
+
+        def plural(n: int, sing: str, plur: str) -> str:
+            return f"{n} {sing if n == 1 else plur}"
+
+        if counts["bash"]:
+            parts.append(f"ran {plural(counts['bash'], 'shell command', 'shell commands')}")
+        if counts["read"]:
+            parts.append(f"read {plural(counts['read'], 'file', 'files')}")
+        if counts["edit"]:
+            parts.append(f"edited {plural(counts['edit'], 'file', 'files')}")
+        if counts["search"]:
+            parts.append(f"searched {plural(counts['search'], 'time', 'times')}")
+        if counts["web"]:
+            parts.append(f"{plural(counts['web'], 'web lookup', 'web lookups')}")
+        if counts["agent"]:
+            parts.append(f"{plural(counts['agent'], 'subagent', 'subagents')}")
+        if counts["tool"]:
+            parts.append(f"called {plural(counts['tool'], 'tool', 'tools')}")
+        if not parts:
+            return ""
+        text = ", ".join(parts)
+        text = text[0].upper() + text[1:]
+        if failed:
+            text += f" · {failed} failed"
+        return text
+
+
+# ---- tool classification helpers -------------------------------------------------------------
+
+def human_generic_label(kind: str, name: str = "") -> str:
+    return {
+        "bash": "Running shell command",
+        "read": "Reading files",
+        "edit": "Editing files",
+        "search": "Searching codebase",
+        "web": "Searching web",
+        "agent": "Running subagent",
+    }.get(kind, f"Using {name}" if name else "Working")
+
+
+def human_bash_label(cmd: str, description: str = "") -> str:
+    """Turn a raw shell command into a clean 2-5 word human-readable step label (never raw bash spam)."""
+    desc = first_line(description)
+    if desc and not desc.startswith(("$", "cd ", "bash ", "/bin/")):
+        return truncate_cells(desc, 52)
+    low = (cmd or "").lower()
+    if re.search(r"\b(pytest|jest|vitest|mocha|rspec|go test|cargo test|npm test|pnpm test|yarn test|test-[a-z0-9_-]+\.sh)\b", low):
+        return "Running tests"
+    if re.search(r"\b(npm run build|pnpm build|yarn build|next build|vite build|tsc|webpack|cargo build|go build|make)\b", low):
+        return "Building project"
+    if re.search(r"\b(eslint|ruff|flake8|mypy|pyright|py_compile|shellcheck|lint|prettier|biome)\b", low):
+        return "Checking code & lint"
+    if re.search(r"\bgit\s+(status|diff|log|show|branch|rev-parse)\b", low):
+        return "Checking git status"
+    if re.search(r"\bgit\s+(commit|push|pull|fetch|checkout|switch|merge|rebase|add)\b", low):
+        return "Updating git repository"
+    if re.search(r"\b(grep|rg|ugrep|ripgrep|ag|ack|find|fd)\b", low):
+        return "Searching codebase"
+    if re.search(r"\b(curl|wget|http|gh\s+|fetch)\b", low):
+        return "Fetching remote data"
+    if re.search(r"\b(npm|pnpm|yarn|pip|pip3|uv|cargo|apt|brew)\s+(install|add|update|sync|i)\b", low):
+        return "Installing dependencies"
+    if re.search(r"\b(ls|cat|head|tail|sed|awk|wc|stat|file|tree|du|df)\b", low):
+        return "Inspecting files"
+    if re.search(r"\b(psql|mysql|sqlite3|mongosh|redis-cli|prisma|drizzle)\b", low):
+        return "Querying database"
+    if re.search(r"\b(docker|kubectl|systemctl|tmux|ps|top|ss|lsof)\b", low):
+        return "Checking services & processes"
+    if re.search(r"\b(python|python3|node|tsx|ts-node|bun|deno|bash|sh)\b", low):
+        return "Running script"
+    return "Running shell command"
+
+
+def classify_tool(name: str, params: dict, cwd: str) -> tuple[str, str, str, str]:
+    """Return (kind, exact 1-line summary for /steps, full detail, clean human label for live UI)."""
+    low = (name or "").lower()
+    p = params if isinstance(params, dict) else {}
+
+    # Shell / bash commands
+    if low in ("bash", "run_command", "run_shell_command", "shell", "command_execution", "execute_command"):
+        cmd = strip_shell_wrapper(
+            str(p.get("command") or p.get("CommandLine") or p.get("cmd") or p.get("script") or "")
+        )
+        desc = str(p.get("description") or p.get("toolSummary") or "")
+        one = first_line(cmd) or desc or name
+        return "bash", f"$ {one}", cmd or one, human_bash_label(cmd, desc)
+
+    # File reads
+    if low in ("read", "read_file", "view_file", "read_file_content"):
+        path = short_path(str(p.get("file_path") or p.get("Path") or p.get("path") or p.get("AbsolutePath") or ""), cwd)
+        base = os.path.basename(path.rstrip("/")) if path else ""
+        return "read", f"Read {path}" if path else "Read file", path or name, (f"Reading {base}" if base else "Reading files")
+
+    # File edits / writes
+    if low in ("edit", "write", "multiedit", "notebookedit", "edit_file", "write_file",
+               "write_to_file", "replace", "replace_file_content", "multi_replace_file_content",
+               "sed_file", "file_change"):
+        path = short_path(str(p.get("file_path") or p.get("Path") or p.get("path") or p.get("TargetFile") or ""), cwd)
+        base = os.path.basename(path.rstrip("/")) if path else ""
+        verb = "Write" if "write" in low else "Edit"
+        gerund = "Writing" if "write" in low else "Editing"
+        return "edit", f"{verb} {path}" if path else f"{verb} file", path or name, (f"{gerund} {base}" if base else f"{gerund} files")
+
+    # Search / listing
+    if low in ("grep", "glob", "grep_search", "find_by_name", "list_dir", "list_directory", "ls"):
+        q = str(p.get("pattern") or p.get("Query") or p.get("query") or p.get("Pattern") or p.get("path") or p.get("DirectoryPath") or "")
+        q = short_path(q, cwd) if q.startswith("/") else q
+        return "search", f"Search {q}" if q else "Search files", q or name, "Searching codebase"
+
+    # Web
+    if low in ("websearch", "webfetch", "search_web", "google_web_search", "web_search", "read_url_content"):
+        q = str(p.get("query") or p.get("url") or p.get("Url") or "")
+        return "web", f"Web {q}" if q else "Web lookup", q or name, "Searching web"
+
+    # Subagents / workflows
+    if low in ("agent", "task", "invoke_subagent", "run_workflow"):
+        desc = str(p.get("description") or p.get("Role") or p.get("Description") or p.get("prompt") or "")
+        lbl = truncate_cells(first_line(desc), 48) if desc else "Running subagent"
+        return "agent", f"Agent: {first_line(desc)}" if desc else "Subagent", desc or name, lbl
+
+    # Generic / MCP tool
+    label = name
+    if label.startswith("mcp__"):
+        parts = label.split("__")
+        label = parts[-1] if parts else label
+    arg_hint = ""
+    for k in ("query", "path", "url", "command", "name", "id"):
+        if p.get(k):
+            arg_hint = first_line(str(p[k]))
+            break
+    summary = f"{label} {arg_hint}".strip() if arg_hint else label
+    clean_lbl = f"Running {label.replace('_', ' ')}"
+    return "tool", summary, json.dumps(p, ensure_ascii=False)[:400] if p else name, clean_lbl
+
+
+def is_task_md(path: str) -> bool:
+    return bool(path) and os.path.basename(path.rstrip("/")) == "task.md"
+
+
+def load_task_md(path: str) -> list[tuple[str, str]]:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return parse_markdown_checklist(f.read())
+    except OSError:
+        return []
+
+
+# ---- provider adapters -----------------------------------------------------------------------
+
+class BaseAdapter:
+    tool: str = ""
+
+    def __init__(self, account: str = "", mode: str = "auto", model: str = "", effort: str = ""):
+        self.account = account
+        self.mode = mode if mode in MODES else "auto"
+        self.model = model
+        self.effort = effort
+
+    def _base_cmd(self) -> list[str]:
+        """Launch via `agents --as` when an account is named, else the tool binary directly."""
+        override = os.environ.get(f"AGENTS_{self.tool.upper()}")
+        if self.account and os.environ.get("AFC_DIRECT") != "1" and (os.path.exists(AGENTS) or shutil.which(AGENTS)):
+            who = self.account if self.tool == "claude" else f"{self.tool}:{self.account}"
+            return [AGENTS, "--as", who]
+        if override:
+            return [override]
+        return [self.tool]
+
+    def build_turn(self, prompt: str, session_id: str, cwd: str, continue_last: bool = False) -> tuple[list[str], str, dict[str, str]]:
+        raise NotImplementedError
+
+    def feed_line(self, line: str, state: TurnState) -> None:
+        raise NotImplementedError
+
+    def native_argv(self, session_id: str, continue_last: bool = False) -> list[str]:
+        raise NotImplementedError
+
+
+class ClaudeAdapter(BaseAdapter):
+    tool = "claude"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tool_names: dict[str, str] = {}
+
+    def build_turn(self, prompt: str, session_id: str, cwd: str, continue_last: bool = False):
+        argv = self._base_cmd() + [
+            "-p",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--allow-dangerously-skip-permissions",
+        ]
+        if self.mode == "bypass":
+            argv += ["--permission-mode", "bypassPermissions"]
+        elif self.mode == "plan":
+            argv += ["--permission-mode", "plan"]
+        else:
+            argv += ["--permission-mode", "auto"]
+        if session_id:
+            argv += ["--resume", session_id]
+        elif continue_last:
+            argv += ["--continue"]
+        if self.model:
+            argv += ["--model", self.model]
+        if self.effort:
+            argv += ["--effort", self.effort]
+        argv.append(prompt)
+        env = dict(os.environ)
+        env["CLAUDE_CODE_ENABLE_TODO_TOOLS"] = "1"
+        return argv, "", env
+
+    def feed_line(self, line: str, state: TurnState) -> None:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(d, dict):
+            return
+        typ = d.get("type")
+        sid = d.get("session_id") or ""
+        if sid:
+            state.set_session(sid=sid)
+
+        if typ == "system":
+            sub = d.get("subtype")
+            if sub == "init":
+                state.set_session(sid=sid, model=d.get("model") or "")
+            elif sub == "thinking_tokens":
+                est = int(d.get("estimated_tokens") or 0)
+                if est > 0:
+                    state.add_tokens(total=est, absolute=True)
+                state.set_status("Thinking…")
+            return
+
+        if typ == "assistant":
+            msg = d.get("message") or {}
+            if msg.get("model"):
+                state.set_session(model=msg["model"])
+            usage = msg.get("usage") or {}
+            if usage:
+                inp = (int(usage.get("input_tokens") or 0)
+                       + int(usage.get("cache_creation_input_tokens") or 0)
+                       + int(usage.get("cache_read_input_tokens") or 0))
+                out = int(usage.get("output_tokens") or 0)
+                state.add_tokens(inp=inp, out=out, absolute=True)
+            for blk in msg.get("content") or []:
+                if not isinstance(blk, dict):
+                    continue
+                btype = blk.get("type")
+                if btype == "thinking":
+                    state.set_status("Thinking…")
+                elif btype == "tool_use":
+                    tid = str(blk.get("id") or f"c-{len(state.steps) + 1}")
+                    name = str(blk.get("name") or "tool")
+                    inp_obj = blk.get("input") or {}
+                    self._tool_names[tid] = name
+                    if name == "TaskCreate":
+                        state.task_create(
+                            subject=str(inp_obj.get("subject") or inp_obj.get("description") or ""),
+                            status="pending",
+                            tool_use_id=tid,
+                            active_form=str(inp_obj.get("activeForm") or ""),
+                        )
+                    elif name == "TaskUpdate":
+                        state.task_update(
+                            task_id=str(inp_obj.get("taskId") or ""),
+                            status=str(inp_obj.get("status") or ""),
+                            subject=str(inp_obj.get("subject") or ""),
+                            active_form=str(inp_obj.get("activeForm") or ""),
+                        )
+                    elif name == "TodoWrite":
+                        todos = inp_obj.get("todos") or []
+                        parsed = [
+                            (str(t.get("content") or t.get("subject") or ""),
+                             str(t.get("status") or "pending"),
+                             str(t.get("activeForm") or ""))
+                            for t in todos if isinstance(t, dict)
+                        ]
+                        state.replace_checklist(parsed)
+                    elif name in ("ToolSearch", "TaskList", "TaskGet"):
+                        state.set_status("Preparing tools…")
+                    else:
+                        kind, summary, detail, lbl = classify_tool(name, inp_obj, state.cwd)
+                        state.tool_start(tid, kind, name, summary, detail, label=lbl)
+                elif btype == "text":
+                    txt = blk.get("text") or ""
+                    if txt:
+                        state.append_reply(txt, replace=True)
+            return
+
+        if typ == "user":
+            msg = d.get("message") or {}
+            tur = d.get("tool_use_result")
+            for blk in msg.get("content") or []:
+                if not isinstance(blk, dict) or blk.get("type") != "tool_result":
+                    continue
+                tid = str(blk.get("tool_use_id") or "")
+                tname = self._tool_names.get(tid, "")
+                if tname == "TaskCreate":
+                    real_id = ""
+                    if isinstance(tur, dict) and isinstance(tur.get("task"), dict):
+                        real_id = str(tur["task"].get("id") or "")
+                    if not real_id:
+                        m = re.search(r"Task #(\d+)", str(blk.get("content") or ""))
+                        if m:
+                            real_id = m.group(1)
+                    if real_id:
+                        state.task_bind_id(tid, real_id)
+                    continue
+                if tname in ("TaskUpdate", "TodoWrite", "ToolSearch", "TaskList", "TaskGet"):
+                    continue
+                is_err = bool(blk.get("is_error"))
+                out_text = ""
+                if isinstance(tur, dict) and ("stdout" in tur or "stderr" in tur):
+                    out_text = (str(tur.get("stdout") or "") + ("\n" + str(tur["stderr"]) if tur.get("stderr") else "")).strip()
+                else:
+                    c = blk.get("content")
+                    if isinstance(c, str):
+                        out_text = c
+                    elif isinstance(c, list):
+                        out_text = "\n".join(str(x.get("text") or "") for x in c if isinstance(x, dict))
+                state.tool_end(tid, ok=not is_err, output=out_text)
+            return
+
+        if typ == "result" or ("stop_reason" in d and "usage" in d and "type" not in d):
+            if d.get("is_error"):
+                state.set_error(str(d.get("result") or "Claude returned an error"))
+            elif d.get("result"):
+                state.set_final_reply(str(d["result"]))
+            usage = d.get("usage") or {}
+            inp = (int(usage.get("input_tokens") or 0)
+                   + int(usage.get("cache_creation_input_tokens") or 0)
+                   + int(usage.get("cache_read_input_tokens") or 0))
+            out = int(usage.get("output_tokens") or 0)
+            cost = float(d.get("total_cost_usd") or 0.0)
+            state.add_tokens(inp=inp, out=out, cost=cost, absolute=True)
+
+    def native_argv(self, session_id: str, continue_last: bool = False) -> list[str]:
+        argv = self._base_cmd() + ["--allow-dangerously-skip-permissions"]
+        if self.mode == "plan":
+            argv += ["--permission-mode", "plan"]
+        elif self.mode == "bypass":
+            argv += ["--permission-mode", "bypassPermissions"]
+        if session_id:
+            argv += ["--resume", session_id]
+        elif continue_last:
+            argv += ["--continue"]
+        return argv
+
+
+class CodexAdapter(BaseAdapter):
+    tool = "codex"
+
+    def build_turn(self, prompt: str, session_id: str, cwd: str, continue_last: bool = False):
+        mode_args: list[str]
+        if self.mode == "bypass":
+            mode_args = ["--dangerously-bypass-approvals-and-sandbox"]
+        elif self.mode == "plan":
+            mode_args = ["-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"']
+        else:
+            mode_args = ["-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"']
+
+        common = ["--json", "--skip-git-repo-check"] + mode_args
+        if self.model:
+            common += ["-m", self.model]
+        if self.effort:
+            common += ["-c", f'model_reasoning_effort="{self.effort}"']
+
+        if session_id:
+            argv = self._base_cmd() + ["exec", "resume"] + common + [session_id, "-"]
+        elif continue_last:
+            argv = self._base_cmd() + ["exec", "resume", "--last"] + common + ["-"]
+        else:
+            argv = self._base_cmd() + ["exec"] + common + ["-"]
+        return argv, prompt, dict(os.environ)
+
+    def feed_line(self, line: str, state: TurnState) -> None:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(d, dict):
+            return
+        typ = d.get("type")
+
+        if typ == "thread.started":
+            state.set_session(sid=str(d.get("thread_id") or ""))
+            return
+        if typ == "turn.started":
+            state.set_status("Thinking…")
+            return
+        if typ in ("item.started", "item.updated", "item.completed"):
+            item = d.get("item") or {}
+            itype = item.get("type")
+            iid = str(item.get("id") or f"x-{len(state.steps) + 1}")
+            done = (typ == "item.completed")
+
+            if itype == "command_execution":
+                cmd = strip_shell_wrapper(str(item.get("command") or ""))
+                summary = f"$ {first_line(cmd) or 'command'}"
+                lbl = human_bash_label(cmd)
+                if not done:
+                    state.tool_start(iid, "bash", "command_execution", summary, cmd, label=lbl)
+                else:
+                    if iid not in state._steps_by_id:
+                        state.tool_start(iid, "bash", "command_execution", summary, cmd, label=lbl)
+                    rc = item.get("exit_code")
+                    ok = (rc == 0) if rc is not None else (item.get("status") != "failed")
+                    state.tool_end(iid, ok=ok, output=str(item.get("aggregated_output") or ""))
+            elif itype == "file_change":
+                changes = item.get("changes") or []
+                paths = [short_path(str(c.get("path") or ""), state.cwd) for c in changes if isinstance(c, dict) and c.get("path")]
+                summary = f"Edit {', '.join(paths[:3])}" if paths else "Edit files"
+                lbl = f"Editing {os.path.basename(paths[0])}" if len(paths) == 1 else "Editing files"
+                if not done:
+                    state.tool_start(iid, "edit", "file_change", summary, "\n".join(paths), label=lbl)
+                else:
+                    if iid not in state._steps_by_id:
+                        state.tool_start(iid, "edit", "file_change", summary, "\n".join(paths), label=lbl)
+                    state.tool_end(iid, ok=(item.get("status") != "failed"), output="\n".join(paths))
+            elif itype == "mcp_tool_call":
+                server = str(item.get("server") or "mcp")
+                tname = str(item.get("tool") or "tool")
+                summary = f"{server}:{tname}"
+                lbl = f"Running {tname.replace('_', ' ')}"
+                if not done:
+                    state.tool_start(iid, "tool", tname, summary, json.dumps(item.get("arguments") or {}), label=lbl)
+                else:
+                    if iid not in state._steps_by_id:
+                        state.tool_start(iid, "tool", tname, summary, label=lbl)
+                    ok = item.get("status") != "failed" and not item.get("error")
+                    out = str(item.get("result") or item.get("error") or "")
+                    state.tool_end(iid, ok=ok, output=out)
+            elif itype == "web_search":
+                q = str(item.get("query") or "")
+                summary = f"Web {q}".strip()
+                if not done:
+                    state.tool_start(iid, "web", "web_search", summary, q, label="Searching web")
+                else:
+                    if iid not in state._steps_by_id:
+                        state.tool_start(iid, "web", "web_search", summary, q, label="Searching web")
+                    state.tool_end(iid, ok=True)
+            elif itype == "todo_list":
+                raw_items = item.get("items") or []
+                parsed = [
+                    (str(x.get("text") or ""), "completed" if x.get("completed") else "pending")
+                    for x in raw_items if isinstance(x, dict) and x.get("text")
+                ]
+                state.replace_checklist(parsed)
+            elif itype == "reasoning":
+                txt = first_line(str(item.get("text") or ""))
+                state.set_status(f"Thinking: {txt}" if txt else "Thinking…")
+            elif itype == "agent_message":
+                txt = str(item.get("text") or "")
+                if txt:
+                    checks = parse_markdown_checklist(txt)
+                    if checks:
+                        state.replace_checklist(checks)
+                    state.append_reply(txt, replace=True)
+            elif itype == "error":
+                state.set_error(str(item.get("message") or "Codex error"))
+            return
+
+        if typ == "turn.completed":
+            usage = d.get("usage") or {}
+            inp = int(usage.get("input_tokens") or 0)
+            out = int(usage.get("output_tokens") or 0)
+            state.add_tokens(inp=inp, out=out, absolute=True)
+            return
+
+        if typ in ("turn.failed", "error"):
+            err = d.get("error")
+            msg = err.get("message") if isinstance(err, dict) else (d.get("message") or str(err or "Codex turn failed"))
+            state.set_error(str(msg))
+
+    def native_argv(self, session_id: str, continue_last: bool = False) -> list[str]:
+        argv = self._base_cmd()
+        if session_id:
+            argv += ["resume", session_id]
+        elif continue_last:
+            argv += ["resume", "--last"]
+        if self.mode == "plan":
+            argv += ["--sandbox", "read-only"]
+        elif self.mode == "bypass":
+            argv += ["--dangerously-bypass-approvals-and-sandbox"]
+        return argv
+
+
+class GeminiAdapter(BaseAdapter):
+    tool = "gemini"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tool_names: dict[str, str] = {}
+
+    def build_turn(self, prompt: str, session_id: str, cwd: str, continue_last: bool = False):
+        ap = {"bypass": "yolo", "plan": "plan"}.get(self.mode, "auto_edit")
+        argv = self._base_cmd() + ["--skip-trust", "--approval-mode", ap, "-o", "stream-json"]
+        if session_id:
+            argv += ["-r", session_id]
+        elif continue_last:
+            argv += ["-r", "latest"]
+        if self.model:
+            argv += ["-m", self.model]
+        argv += ["-p", prompt]
+        return argv, "", dict(os.environ)
+
+    def feed_line(self, line: str, state: TurnState) -> None:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(d, dict):
+            return
+        typ = d.get("type")
+
+        if typ == "init":
+            state.set_session(sid=str(d.get("session_id") or ""), model=str(d.get("model") or ""))
+            return
+
+        if typ == "tool_use":
+            tid = str(d.get("tool_id") or f"g-{len(state.steps) + 1}")
+            name = str(d.get("tool_name") or "tool")
+            params = d.get("parameters") or {}
+            self._tool_names[tid] = name
+            if name == "write_todos":
+                todos = params.get("todos") or []
+                parsed = [
+                    (str(t.get("description") or t.get("content") or t.get("title") or ""), str(t.get("status") or "pending"))
+                    for t in todos if isinstance(t, dict)
+                ]
+                state.replace_checklist(parsed)
+                return
+            kind, summary, detail, lbl = classify_tool(name, params, state.cwd)
+            state.tool_start(tid, kind, name, summary, detail, label=lbl)
+            return
+
+        if typ == "tool_result":
+            tid = str(d.get("tool_id") or "")
+            if self._tool_names.get(tid) == "write_todos":
+                return
+            ok = d.get("status") != "error"
+            out = str(d.get("output") or "")
+            if not ok and isinstance(d.get("error"), dict):
+                out = str(d["error"].get("message") or out)
+            state.tool_end(tid, ok=ok, output=out)
+            return
+
+        if typ == "message":
+            if d.get("role") == "assistant":
+                content = str(d.get("content") or "")
+                if content:
+                    state.append_reply(content, replace=not bool(d.get("delta")))
+            return
+
+        if typ == "error":
+            state.set_error(str(d.get("message") or d.get("error") or "Gemini error"))
+            return
+
+        if typ == "result":
+            stats = d.get("stats") or {}
+            total = int(stats.get("total_tokens") or 0)
+            inp = int(stats.get("input_tokens") or 0)
+            out = int(stats.get("output_tokens") or 0)
+            state.add_tokens(total=total, inp=inp, out=out, absolute=True)
+            if d.get("status") == "error":
+                err = d.get("error")
+                msg = err.get("message") if isinstance(err, dict) else str(err or "Gemini failed")
+                state.set_error(str(msg))
+
+    def native_argv(self, session_id: str, continue_last: bool = False) -> list[str]:
+        argv = self._base_cmd()
+        if self.mode == "plan":
+            argv += ["--approval-mode", "plan"]
+        elif self.mode == "bypass":
+            argv += ["--approval-mode", "yolo"]
+        if session_id:
+            argv += ["-r", session_id]
+        elif continue_last:
+            argv += ["-r", "latest"]
+        return argv
+
+
+class AgyAdapter(BaseAdapter):
+    tool = "agy"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._task_files: dict[str, str] = {}
+
+    def build_turn(self, prompt: str, session_id: str, cwd: str, continue_last: bool = False):
+        argv = self._base_cmd() + ["--output-format", "stream-json"]
+        if self.mode == "bypass":
+            argv += ["--dangerously-skip-permissions"]
+        elif self.mode == "plan":
+            argv += ["--mode", "plan"]
+        else:
+            argv += ["--mode", "auto"]
+        if session_id:
+            argv += ["--conversation", session_id]
+        elif continue_last:
+            argv += ["--continue"]
+        if self.model:
+            argv += ["--model", self.model]
+            if self.effort and not re.search(r"-(minimal|low|medium|high|xhigh|max)$", self.model):
+                argv += ["--effort", self.effort]
+        elif self.effort:
+            argv += ["--effort", self.effort]
+        argv += ["-p", prompt]
+        return argv, "", dict(os.environ)
+
+    def feed_line(self, line: str, state: TurnState) -> None:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(d, dict):
+            return
+        ev = d.get("event")
+
+        if ev == "init":
+            state.set_session(sid=str(d.get("conversation_id") or ""))
+            return
+
+        if ev == "step_update":
+            su = d.get("step_update") or {}
+            sid = str(su.get("conversation_id") or "")
+            if sid:
+                state.set_session(sid=sid)
+            stype = su.get("step_type")
+            st_state = str(su.get("state") or "")
+            step_id = f"a-{su.get('step_index', len(state.steps))}"
+
+            if stype == "tool":
+                tname = str(su.get("tool_name") or "tool")
+                tinfo = su.get("tool_info") or {}
+                params = tinfo.get("parameters") or {}
+                path = str(params.get("Path") or params.get("path") or params.get("TargetFile") or "")
+                if is_task_md(path):
+                    self._task_files[step_id] = path
+                    if st_state == "DONE":
+                        parsed = load_task_md(path)
+                        if parsed:
+                            state.replace_checklist(parsed)
+                    else:
+                        state.set_status("Updating task list…")
+                    return
+                if st_state == "ACTIVE":
+                    kind, summary, detail, lbl = classify_tool(tname, params, state.cwd)
+                    state.tool_start(step_id, kind, tname, summary, detail, label=lbl)
+                elif st_state in ("DONE", "ERROR", "FAILED"):
+                    if step_id not in state._steps_by_id:
+                        kind, summary, detail, lbl = classify_tool(tname, params, state.cwd)
+                        state.tool_start(step_id, kind, tname, summary, detail, label=lbl)
+                    out = str(tinfo.get("output") or tinfo.get("error") or "")
+                    ok = st_state == "DONE" and not tinfo.get("error")
+                    if ok and "Command exited with code " in out:
+                        m = re.search(r"Command exited with code (\d+)", out)
+                        if m and int(m.group(1)) != 0:
+                            ok = False
+                    dur = su.get("duration_seconds")
+                    state.tool_end(step_id, ok=ok, output=out, duration=float(dur) if dur is not None else None)
+            elif stype == "agent_response":
+                usage = su.get("usage") or {}
+                if usage:
+                    state.add_tokens(
+                        total=int(usage.get("total_tokens") or 0),
+                        inp=int(usage.get("input_tokens") or 0),
+                        out=int(usage.get("output_tokens") or 0),
+                        absolute=False,
+                    )
+                delta = su.get("text_delta")
+                if delta:
+                    state.append_reply(str(delta), replace=False)
+                elif st_state == "ACTIVE":
+                    state.set_status("Thinking…")
+            return
+
+        if ev == "result":
+            res = d.get("result") or {}
+            if res.get("conversation_id"):
+                state.set_session(sid=str(res["conversation_id"]))
+            usage = res.get("usage") or {}
+            if usage:
+                state.add_tokens(
+                    total=int(usage.get("total_tokens") or 0),
+                    inp=int(usage.get("input_tokens") or 0),
+                    out=int(usage.get("output_tokens") or 0),
+                    absolute=True,
+                )
+            if str(res.get("status") or "").upper() not in ("", "SUCCESS", "OK"):
+                state.set_error(str(res.get("error") or res.get("response") or f"Antigravity status: {res.get('status')}"))
+            elif res.get("response"):
+                state.set_final_reply(str(res["response"]))
+
+    def native_argv(self, session_id: str, continue_last: bool = False) -> list[str]:
+        argv = self._base_cmd()
+        if self.mode == "plan":
+            argv += ["--mode", "plan"]
+        elif self.mode == "bypass":
+            argv += ["--dangerously-skip-permissions"]
+        if session_id:
+            argv += ["--conversation", session_id]
+        elif continue_last:
+            argv += ["--continue"]
+        return argv
+
+
+class CopilotAdapter(BaseAdapter):
+    tool = "copilot"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tool_names: dict[str, str] = {}
+
+    def build_turn(self, prompt: str, session_id: str, cwd: str, continue_last: bool = False):
+        argv = self._base_cmd() + ["--output-format", "json", "--stream", "on"]
+        if self.mode == "bypass":
+            argv += ["--allow-all"]
+        elif self.mode == "plan":
+            argv += ["--mode", "plan"]
+        else:
+            argv += ["--mode", "autopilot", "--allow-all-tools"]
+        if session_id:
+            argv += [f"--resume={session_id}"]
+        elif continue_last:
+            argv += ["--resume"]
+        if self.model:
+            argv += ["--model", self.model]
+        argv += ["-p", prompt]
+        return argv, "", dict(os.environ)
+
+    def feed_line(self, line: str, state: TurnState) -> None:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(d, dict):
+            return
+        typ = str(d.get("type") or "")
+        data = d.get("data") if isinstance(d.get("data"), dict) else d
+        sid = str(d.get("sessionId") or d.get("session_id") or data.get("sessionId") or "")
+        if sid:
+            state.set_session(sid=sid)
+
+        if typ in ("session.start", "session.resume", "init"):
+            state.set_session(sid=sid, model=str(data.get("model") or data.get("selectedModel") or ""))
+            return
+        if typ == "tool.execution_start":
+            tid = str(data.get("toolCallId") or data.get("id") or f"cp-{len(state.steps) + 1}")
+            name = str(data.get("toolName") or data.get("name") or "tool")
+            params = data.get("arguments") or data.get("input") or {}
+            if isinstance(params, str):
+                try:
+                    params = json.loads(params)
+                except Exception:
+                    params = {"command": params}
+            self._tool_names[tid] = name
+            if name.lower() in ("update_todo", "todowrite", "write_todos"):
+                todos = params.get("todos") or params.get("items") or []
+                if isinstance(todos, str):
+                    parsed = parse_markdown_checklist(todos)
+                else:
+                    parsed = [
+                        (str(t.get("content") or t.get("title") or t.get("text") or ""), str(t.get("status") or "pending"))
+                        for t in todos if isinstance(t, dict)
+                    ]
+                state.replace_checklist(parsed)
+                return
+            kind, summary, detail, lbl = classify_tool(name, params, state.cwd)
+            state.tool_start(tid, kind, name, summary, detail, label=lbl)
+            return
+        if typ == "tool.execution_complete":
+            tid = str(data.get("toolCallId") or data.get("id") or "")
+            if self._tool_names.get(tid, "").lower() in ("update_todo", "todowrite", "write_todos"):
+                return
+            ok = bool(data.get("success", True)) and not data.get("error")
+            res = data.get("result")
+            out = res.get("content") if isinstance(res, dict) else str(res or data.get("output") or data.get("error") or "")
+            state.tool_end(tid, ok=ok, output=str(out or ""))
+            return
+        if typ == "assistant.message_delta":
+            delta = str(data.get("deltaContent") or data.get("content") or "")
+            if delta:
+                state.append_reply(delta, replace=False)
+            return
+        if typ == "assistant.message":
+            content = str(data.get("content") or "")
+            if content:
+                checks = parse_markdown_checklist(content)
+                if checks:
+                    state.replace_checklist(checks)
+                state.append_reply(content, replace=True)
+            return
+        if typ == "result":
+            usage = d.get("usage") or data.get("usage") or {}
+            inp = int(usage.get("inputTokens") or usage.get("input_tokens") or 0)
+            out = int(usage.get("outputTokens") or usage.get("output_tokens") or 0)
+            state.add_tokens(inp=inp, out=out, absolute=True)
+            if d.get("exitCode") not in (None, 0):
+                state.set_error(str(d.get("error") or f"Copilot exited with code {d.get('exitCode')}"))
+            return
+        if typ in ("session.error", "error"):
+            state.set_error(str(data.get("message") or d.get("message") or "Copilot error"))
+
+    def native_argv(self, session_id: str, continue_last: bool = False) -> list[str]:
+        argv = self._base_cmd()
+        if self.mode == "plan":
+            argv += ["--mode", "plan"]
+        elif self.mode == "bypass":
+            argv += ["--allow-all"]
+        if session_id:
+            argv += [f"--resume={session_id}"]
+        elif continue_last:
+            argv += ["--resume"]
+        return argv
+
+
+class OpenCodeAdapter(BaseAdapter):
+    tool = "opencode"
+
+    def build_turn(self, prompt: str, session_id: str, cwd: str, continue_last: bool = False):
+        argv = self._base_cmd() + ["run", "--standalone", "--format", "json"]
+        if self.mode in ("bypass", "auto"):
+            argv += ["--auto"]
+        if session_id:
+            argv += ["--session", session_id]
+        elif continue_last:
+            argv += ["--continue"]
+        if self.model:
+            argv += ["--model", self.model]
+        argv.append(prompt)
+        return argv, "", dict(os.environ)
+
+    def feed_line(self, line: str, state: TurnState) -> None:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(d, dict):
+            return
+        sid = str(d.get("sessionID") or d.get("session_id") or "")
+        if sid:
+            state.set_session(sid=sid)
+        typ = str(d.get("type") or "")
+        part = d.get("part") if isinstance(d.get("part"), dict) else {}
+
+        if typ == "step_start":
+            state.set_status("Thinking…")
+            return
+        if typ == "tool_use":
+            tname = str(part.get("tool") or d.get("tool") or "tool")
+            tid = str(part.get("callID") or part.get("id") or f"oc-{len(state.steps) + 1}")
+            st = part.get("state") if isinstance(part.get("state"), dict) else {}
+            params = st.get("input") if isinstance(st.get("input"), dict) else {}
+            status = str(st.get("status") or "")
+            if tname.lower() in ("todowrite", "write_todos"):
+                todos = params.get("todos") or []
+                parsed = [
+                    (str(t.get("content") or t.get("subject") or ""), str(t.get("status") or "pending"))
+                    for t in todos if isinstance(t, dict)
+                ]
+                state.replace_checklist(parsed)
+                return
+            kind, summary, detail, lbl = classify_tool(tname, params, state.cwd)
+            if status in ("pending", "running", ""):
+                state.tool_start(tid, kind, tname, summary, detail, label=lbl)
+            else:
+                if tid not in state._steps_by_id:
+                    state.tool_start(tid, kind, tname, summary, detail, label=lbl)
+                ok = status != "error" and not st.get("error")
+                out = str(st.get("output") or st.get("error") or "")
+                state.tool_end(tid, ok=ok, output=out)
+            return
+        if typ == "text":
+            txt = str(part.get("text") or d.get("text") or "")
+            if txt:
+                checks = parse_markdown_checklist(txt)
+                if checks:
+                    state.replace_checklist(checks)
+                state.append_reply(txt, replace=False)
+            return
+        if typ == "step_finish":
+            toks = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+            inp = int(toks.get("input") or 0) + int((toks.get("cache") or {}).get("read") or 0)
+            out = int(toks.get("output") or 0) + int(toks.get("reasoning") or 0)
+            cost = float(part.get("cost") or 0.0)
+            state.add_tokens(inp=inp, out=out, cost=cost, absolute=False)
+            return
+        if typ == "error":
+            err = d.get("error")
+            msg = err.get("message") if isinstance(err, dict) else str(err or d.get("message") or "OpenCode error")
+            state.set_error(msg)
+
+    def native_argv(self, session_id: str, continue_last: bool = False) -> list[str]:
+        argv = self._base_cmd() + ["--standalone"]
+        if self.mode == "bypass":
+            argv += ["--auto"]
+        if session_id:
+            argv += ["--session", session_id]
+        elif continue_last:
+            argv += ["--continue"]
+        return argv
+
+
+ADAPTERS = {
+    "claude": ClaudeAdapter,
+    "codex": CodexAdapter,
+    "gemini": GeminiAdapter,
+    "agy": AgyAdapter,
+    "copilot": CopilotAdapter,
+    "opencode": OpenCodeAdapter,
+}
+
+
+# ---- live inline renderer --------------------------------------------------------------------
+
+def render_task_tree(items: list[ChecklistItem], cols: int, final: bool = False) -> list[str]:
+    """Render the clean `└ ✓ / ■ / □` task tree (monochrome 1-cell glyphs so Alacritty never
+    renders wide color emoji that collide with the task text; 1 line per task)."""
+    if not items:
+        return []
+    out: list[str] = []
+    avail = max(16, cols - 10)
+    for i, it in enumerate(items):
+        lead = "    " + paint("└", "border") + " " if i == 0 else "      "
+        text = truncate_cells(it.subject, avail)
+        if it.status == "completed":
+            icon = paint("✓", "green")
+            styled = paint(text, "strike")
+        elif it.status == "in_progress":
+            icon = paint("■", "coral" if not final else "accent")
+            styled = paint(text, "white")
+        else:
+            icon = paint("□", "dim")
+            styled = paint(text, "text")
+        out.append(f"{lead}{icon} {styled}")
+    return out
+
+
+# Backward-compatible alias for /tasks
+def render_checklist_box(items: list[ChecklistItem], cols: int, spin_char: str = "✳", final: bool = False) -> list[str]:
+    return render_task_tree(items, cols, final=final)
+
+
+class LiveUI:
+    """Renders ONLY the clean 1-line active status + `└` task checklist inline (no raw bash dump)."""
+
+    def __init__(self, state: TurnState):
+        self.state = state
+        self._drawn = 0
+        self._tick = 0
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not TTY_OUT:
+            return
+        self._render()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(0.15):
+            self._tick += 1
+            self._render()
+
+    @staticmethod
+    def _headline(snap: dict) -> str:
+        # 1. Prefer the active checklist task (activeForm if set, else subject)
+        for it in snap["checklist"]:
+            if it.status == "in_progress":
+                txt = it.active_form or it.subject
+                return txt if txt.endswith("…") else f"{txt}…"
+        # 2. Else the clean human verb of the active tool (NEVER raw `$ cd ... && grep ...`)
+        active: ToolStep | None = snap["active"]
+        if active is not None and active.label:
+            txt = active.label
+            return txt if txt.endswith("…") else f"{txt}…"
+        # 3. Fallback status
+        txt = snap["status_text"] or "Thinking…"
+        return txt if txt.endswith("…") else f"{txt}…"
+
+    def _build_lines(self) -> list[str]:
+        cols, rows = term_size()
+        snap = self.state.snapshot()
+        spin = SPIN[self._tick % len(SPIN)]
+        lines: list[str] = []
+
+        # Line 1: `  ✳ <active task>… (2m 59s · ↓ 13.9k tokens)`
+        meta_parts = [fmt_dur(snap["elapsed"])]
+        tok = fmt_tokens(snap["tokens"])
+        if tok:
+            meta_parts.append(f"↓ {tok} tokens")
+        meta = f" ({' · '.join(meta_parts)})"
+        hint = "  ctrl+o fold" if snap["expanded"] else "  ctrl+o steps"
+        full_right = meta + hint
+        use_right = full_right if cells(full_right) < cols - 24 else meta
+        avail = max(14, cols - 5 - cells(use_right))
+        headline = truncate_cells(self._headline(snap), avail)
+        lines.append(f"  {paint(spin, 'coral')} {paint(headline, 'coral')}{paint(use_right, 'dim')}")
+
+        # Underneath: ONLY the clean `└ ✔ / ◼ / ◻` task tree
+        if snap["checklist"]:
+            lines.extend(render_task_tree(snap["checklist"], cols, final=False))
+
+        # Only if the user explicitly presses Ctrl+O: reveal raw bash/tool steps & output tail
+        if snap["expanded"] and snap["steps"]:
+            max_extra = max(4, min(14, rows - len(lines) - 4))
+            extra: list[str] = []
+            for st in snap["steps"][-6:]:
+                if st.ok is True:
+                    mark = paint("✓", "green")
+                elif st.ok is False:
+                    mark = paint("✗", "red")
+                else:
+                    mark = paint(spin, "amber")
+                dur = f" ({st.ended_at - st.started_at:.1f}s)" if st.ended_at > st.started_at else ""
+                s = truncate_cells(st.summary, cols - 12 - len(dur))
+                extra.append(f"      {mark} {paint(s, 'text')}{paint(dur, 'faint')}")
+                if st.output:
+                    tail = [ln.rstrip() for ln in strip_ansi(st.output).splitlines() if ln.strip()][-3:]
+                    for tl in tail:
+                        extra.append("        " + paint(truncate_cells(tl, cols - 10), "faint"))
+            lines.extend(extra[-max_extra:])
+
+        cap = max(2, rows - 2)
+        if len(lines) > cap:
+            lines = lines[:cap]
+        return lines
+
+    def _render(self) -> None:
+        if not TTY_OUT:
+            return
+        with self._lock:
+            if self._stop.is_set():
+                return
+            lines = self._build_lines()
+            buf = []
+            if self._drawn > 0:
+                buf.append(f"\033[{self._drawn}A")
+            buf.append("\r\033[J")
+            for ln in lines:
+                buf.append(ln + "\n")
+            sys.stdout.write("".join(buf))
+            sys.stdout.flush()
+            self._drawn = len(lines)
+
+    def clear_and_stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        if not TTY_OUT:
+            return
+        with self._lock:
+            if self._drawn > 0:
+                sys.stdout.write(f"\033[{self._drawn}A\r\033[J")
+                sys.stdout.flush()
+                self._drawn = 0
+
+
+# ---- clean inline markdown formatter ---------------------------------------------------------
+
+def format_markdown(text: str, cols: int) -> str:
+    """Light, readable ANSI markdown formatting that stays clean under afc-copy."""
+    if not text:
+        return ""
+    out: list[str] = []
+    in_code = False
+    for raw in text.replace("\r\n", "\n").splitlines():
+        s = raw.rstrip()
+        if s.lstrip().startswith("```"):
+            lang = s.lstrip()[3:].strip()
+            in_code = not in_code
+            if in_code:
+                hdr = f"── {lang} " if lang else "── "
+                out.append("  " + paint(hdr + "─" * max(4, min(cols - 8, 60) - len(hdr)), "border"))
+            else:
+                out.append("  " + paint("─" * max(8, min(cols - 8, 60)), "border"))
+            continue
+        if in_code:
+            out.append("  " + paint("│ ", "border") + paint(s, "code"))
+            continue
+        # Headings
+        hm = re.match(r"^(#{1,3})\s+(.*)$", s)
+        if hm:
+            out.append("  " + paint(hm.group(2), "white"))
+            continue
+        # Inline bold and code
+        line = s
+        if TTY_OUT:
+            line = re.sub(r"`([^`]+)`", lambda m: paint(m.group(1), "code"), line)
+            line = re.sub(r"\*\*([^*]+)\*\*", lambda m: paint(m.group(1), "white"), line)
+        out.append("  " + line if line else "")
+    return "\n".join(out)
+
+
+# ---- fleet integration helpers ---------------------------------------------------------------
+
+def mark_fleet(state_name: str) -> None:
+    """Update ACF tmux tab signals (underline when busy, blink/notify when done)."""
+    if not os.environ.get("TMUX_PANE"):
+        return
+    try:
+        subprocess.run(
+            [AGENTS, "--mark", state_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def pane_num() -> str:
+    p = os.environ.get("TMUX_PANE") or ""
+    return p.lstrip("%") if p.startswith("%") else ""
+
+
+class SessionController:
+    def __init__(
+        self,
+        tool: str,
+        account: str,
+        mode: str,
+        model: str,
+        effort: str,
+        session_id: str,
+        continue_last: bool,
+        checklist_mode: str,
+        cwd: str,
+    ):
+        self.tool = tool
+        self.account = account
+        self.mode = mode if mode in MODES else "auto"
+        self.model = model
+        self.effort = effort
+        self.session_id = session_id
+        self.continue_last = continue_last
+        self.checklist_mode = checklist_mode
+        self.cwd = cwd
+        self.turns: list[TurnRecord] = []
+        self.last_checklist: list[ChecklistItem] = []
+        self.total_tokens = 0
+        self.total_cost = 0.0
+        self.busy = False
+        self.state_file = os.path.join(STATE_DIR, f"{os.getpid()}.json")
+        self._pending_draft = ""
+        self._pastes: dict[str, str] = {}
+        self._paste_seq = 0
+        self._paste_cb = None
+        self._orig_termios = None
+
+    def _bind_paste(self) -> None:
+        if not readline or "libedit" in (readline.__doc__ or ""):
+            return
+        try:
+            import ctypes
+            lib = ctypes.CDLL(readline.__file__)
+            lib.rl_read_key.argtypes = []
+            lib.rl_read_key.restype = ctypes.c_int
+            lib.rl_insert_text.argtypes = [ctypes.c_char_p]
+            lib.rl_insert_text.restype = ctypes.c_int
+            cb_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int)
+            lib.rl_bind_keyseq.argtypes = [ctypes.c_char_p, cb_type]
+            lib.rl_bind_keyseq.restype = ctypes.c_int
+        except Exception:
+            return
+
+        def on_paste(count, key):
+            buf = bytearray()
+            end = b"\x1b[201~"
+            while len(buf) < 524288:
+                c = lib.rl_read_key()
+                if c < 0:
+                    break
+                buf.append(c & 0xFF)
+                if buf.endswith(end):
+                    del buf[-len(end):]
+                    break
+            text = buf.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+            if not text:
+                return 0
+            if "\n" in text or len(text) > 300:
+                self._paste_seq += 1
+                n = text.count("\n") + 1
+                tag = f"[Pasted #{self._paste_seq} · {n} lines]" if "\n" in text else f"[Pasted #{self._paste_seq} · {len(text)} chars]"
+                self._pastes[tag] = text
+                while len(self._pastes) > 20:
+                    self._pastes.pop(next(iter(self._pastes)))
+                lib.rl_insert_text(tag.encode("utf-8"))
+            else:
+                clean = "".join("  " if ch == "\t" else (ch if 32 <= ord(ch) != 127 else "") for ch in text)
+                if clean:
+                    lib.rl_insert_text(clean.encode("utf-8"))
+            return 0
+
+        self._paste_cb = cb_type(on_paste)
+        lib.rl_bind_keyseq(b"\x1b[200~", self._paste_cb)
+
+    def _expand_pastes(self, text: str) -> str:
+        for tag, content in list(self._pastes.items()):
+            if tag in text:
+                text = text.replace(tag, content)
+        return text
+
+    def make_adapter(self) -> BaseAdapter:
+        cls = ADAPTERS[self.tool]
+        return cls(account=self.account, mode=self.mode, model=self.model, effort=self.effort)
+
+    def save_runtime_state(self) -> None:
+        """Write atomic metadata for agents --who / layout_save / afc-agent-info / afc-bar."""
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            data = {
+                "pid": os.getpid(),
+                "tool": self.tool,
+                "account": self.account,
+                "mode": self.mode,
+                "model": self.model,
+                "effort": self.effort,
+                "session_id": self.session_id,
+                "cwd": self.cwd,
+                "tokens": self.total_tokens,
+                "cost_usd": round(self.total_cost, 4),
+                "busy": self.busy,
+                "updated_at": int(time.time()),
+            }
+            tmp = f"{self.state_file}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.state_file)
+        except OSError:
+            pass
+
+        # Also update afc-panes/<pane> for Claude panes so afc-bar shows live model/tokens/cost
+        pn = pane_num()
+        if self.tool == "claude" and pn and (self.model or self.total_tokens):
+            try:
+                os.makedirs(PANES_DIR, exist_ok=True)
+                tok = fmt_tokens(self.total_tokens)
+                cost = f"${self.total_cost:.2f}" if self.total_cost >= 0.005 else ""
+                tfield = " ".join(x for x in (tok, cost) if x)
+                tmp = os.path.join(PANES_DIR, f"{pn}.tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(f"{self.model}|{self.effort}||{tfield}\n")
+                os.replace(tmp, os.path.join(PANES_DIR, pn))
+            except OSError:
+                pass
+
+    def cleanup_runtime_state(self) -> None:
+        try:
+            os.unlink(self.state_file)
+        except OSError:
+            pass
+
+    def disable_vdiscard(self) -> None:
+        """Allow Ctrl+O to reach Python instead of being swallowed by tty VDISCARD."""
+        if not TTY_IN:
+            return
+        try:
+            self._orig_termios = termios.tcgetattr(sys.stdin.fileno())
+            attrs = termios.tcgetattr(sys.stdin.fileno())
+            if hasattr(termios, "VDISCARD"):
+                attrs[6][termios.VDISCARD] = b"\x00"
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
+        except Exception:
+            self._orig_termios = None
+
+    def restore_termios(self) -> None:
+        if self._orig_termios is not None and TTY_IN:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._orig_termios)
+            except Exception:
+                pass
+
+    def print_banner(self) -> None:
+        cols, _ = term_size()
+        rule = paint("─" * cols, "border")
+        who = paint(TOOL_LABELS.get(self.tool, self.tool), self.tool)
+        acct = f" ({self.account})" if self.account else ""
+        mode_col = {"bypass": "red", "plan": "cyan"}.get(self.mode, "green")
+        mode_tag = paint(self.mode, mode_col)
+        model_tag = f" · {paint(self.model, 'purple')}" if self.model else ""
+        sess_tag = f" · chat {self.session_id[:8]}" if self.session_id else ""
+        cwd_short = short_path(self.cwd, HOME)
+        if not cwd_short.startswith("~"):
+            cwd_short = self.cwd
+        print(rule)
+        print(f"  {paint('ACF', 'accent')} · {who}{paint(acct, 'dim')} · {mode_tag}{model_tag}{paint(sess_tag, 'faint')}")
+        print(f"  {paint(truncate_cells(cwd_short, cols - 34), 'dim')}  {paint('ctrl+o steps · shift+tab mode · /native · /help', 'faint')}")
+        print(rule, flush=True)
+
+    def print_help(self) -> None:
+        print(paint("  Commands:", "white"))
+        cmds = [
+            ("/steps [N|full]", "expand bash & tool steps of the last turn (or turn N, or full output)"),
+            ("/tasks", "show the current task checklist"),
+            ("/mode [auto|plan|bypass]", "show or switch permission mode (Shift+Tab cycles)"),
+            ("/model [set] <id>", "show or set model (Alt+M also works)"),
+            ("/effort <level>", "show or set reasoning effort (low|medium|high|xhigh|max)"),
+            ("/provider <tool> [acct]", "switch provider: claude, codex, gemini, or agy"),
+            ("/checklist [auto|on|off]", "auto = native checklists, on = nudge multi-step checklists"),
+            ("/new  (or /clear)", "start a fresh chat session"),
+            ("/native", "drop into this provider's native CLI on the same session"),
+            ("/quit  (or Ctrl+D)", "exit afc-chat"),
+        ]
+        for k, desc in cmds:
+            print(f"    {paint(f'{k:<26}', 'accent')} {paint(desc, 'dim')}")
+        print(paint("  Shortcuts:", "white"))
+        print(f"    {paint('Ctrl+O', 'accent'):<36} expand/fold steps (live during a turn or at prompt)")
+        print(f"    {paint('Ctrl+T', 'accent'):<36} show current task checklist")
+        print(f"    {paint('Shift+Tab', 'accent'):<36} cycle permission mode (auto -> plan -> bypass)")
+        print(f"    {paint('Ctrl+C', 'accent'):<36} interrupt a running turn without leaving the chat", flush=True)
+
+    def print_tasks(self) -> None:
+        cols, _ = term_size()
+        if not self.last_checklist:
+            print(paint("  No active task checklist yet.", "dim"), flush=True)
+            return
+        for ln in render_checklist_box(self.last_checklist, cols, final=True):
+            print(ln)
+        sys.stdout.flush()
+
+    def print_steps(self, arg: str = "") -> None:
+        if not self.turns:
+            print(paint("  No turns recorded yet.", "dim"), flush=True)
+            return
+        full = "full" in arg.lower().split()
+        idx_tok = next((w for w in arg.split() if w.isdigit()), "")
+        turn = self.turns[int(idx_tok) - 1] if idx_tok and 1 <= int(idx_tok) <= len(self.turns) else self.turns[-1]
+        cols, _ = term_size()
+        if not turn.steps:
+            print(paint(f"  Turn #{turn.index}: no tool or bash commands were run.", "dim"), flush=True)
+            return
+        print(paint(f"  ── Turn #{turn.index} steps ({len(turn.steps)}) " + "─" * max(4, min(cols - 28, 56)), "border"))
+        for i, st in enumerate(turn.steps, 1):
+            mark = paint("✓", "green") if st.ok is not False else paint("✗", "red")
+            dur = f"{st.ended_at - st.started_at:.1f}s" if st.ended_at > st.started_at else ""
+            hdr = f"  {i:>2}. {mark} {paint(st.summary, 'cyan' if st.kind == 'bash' else 'text')}"
+            if dur:
+                hdr += " " + paint(f"({dur})", "faint")
+            print(hdr)
+            if st.kind == "bash" and st.detail and "\n" in st.detail:
+                for cl in st.detail.splitlines()[: (20 if full else 4)]:
+                    print("      " + paint(cl, "code"))
+            if st.output:
+                lines = strip_ansi(st.output).splitlines()
+                limit = 200 if full else 8
+                shown = lines[:limit]
+                for ol in shown:
+                    print("      " + paint(ol if full else truncate_cells(ol, cols - 8), "dim"))
+                if len(lines) > limit:
+                    print("      " + paint(f"… ({len(lines) - limit} more lines; use '/steps full')", "faint"))
+        print(paint("  " + "─" * max(10, min(cols - 4, 72)), "border"), flush=True)
+
+    def exec_native(self) -> None:
+        """Replace this process with the provider's native interactive CLI on the same session."""
+        adapter = self.make_adapter()
+        argv = adapter.native_argv(self.session_id, continue_last=self.continue_last and not self.session_id)
+        self.cleanup_runtime_state()
+        self.restore_termios()
+        mark_fleet("end")
+        print(paint(f"  Handing off to native {TOOL_LABELS.get(self.tool, self.tool)}…", "dim"), flush=True)
+        os.execvp(argv[0], argv)
+
+    def handle_slash(self, line: str) -> bool:
+        """Handle a /command. Returns False to exit the chat loop."""
+        parts = line.strip().split()
+        cmd = parts[0].lower()
+        rest = line.strip()[len(parts[0]):].strip()
+
+        if cmd in ("/quit", "/exit", "/q"):
+            return False
+        if cmd in ("/help", "/?"):
+            self.print_help()
+            return True
+        if cmd == "/steps":
+            self.print_steps(rest)
+            return True
+        if cmd == "/tasks":
+            self.print_tasks()
+            return True
+        if cmd in ("/new", "/clear"):
+            self.session_id = ""
+            self.continue_last = False
+            self.last_checklist = []
+            self.total_tokens = 0
+            self.total_cost = 0.0
+            self.save_runtime_state()
+            print(paint("  Started a fresh chat session.", "green"), flush=True)
+            return True
+        if cmd == "/mode":
+            if not rest:
+                print(f"  Permission mode: {paint(self.mode, 'accent')} (choices: auto, plan, bypass)", flush=True)
+                return True
+            want = rest.lower().split()[0]
+            if want in ("normal", "accept-edits", "accept_edits", "edit"):
+                want = "auto"
+            if want not in MODES:
+                print(paint(f"  Unknown mode '{want}'. Use: auto, plan, or bypass.", "red"), flush=True)
+                return True
+            self.mode = want
+            self.save_runtime_state()
+            print(f"  Permission mode is now {paint(self.mode, 'accent')}.", flush=True)
+            return True
+        if cmd == "/model":
+            if not rest:
+                print(f"  Model: {paint(self.model or '(provider default)', 'purple')}", flush=True)
+                return True
+            toks = rest.split()
+            if toks[0].lower() == "set" and len(toks) >= 2:
+                toks = toks[1:]
+            want = " ".join(toks)
+            if want.lower() in ("default", "reset", "auto", "-"):
+                self.model = ""
+                print(paint("  Model reset to provider default.", "purple"), flush=True)
+            else:
+                self.model = want
+                print(f"  Model is now {paint(self.model, 'purple')} (applies on next turn).", flush=True)
+            self.save_runtime_state()
+            return True
+        if cmd == "/effort":
+            if not rest:
+                print(f"  Effort: {paint(self.effort or '(provider default)', 'purple')}", flush=True)
+                return True
+            want = rest.lower().split()[0]
+            if want in ("default", "reset", "-"):
+                self.effort = ""
+            elif want in ("minimal", "low", "medium", "high", "xhigh", "max"):
+                self.effort = want
+            else:
+                print(paint("  Effort must be: low, medium, high, xhigh, max, or default.", "red"), flush=True)
+                return True
+            self.save_runtime_state()
+            print(f"  Effort is now {paint(self.effort or 'default', 'purple')}.", flush=True)
+            return True
+        if cmd == "/provider":
+            if not rest:
+                print(f"  Provider: {paint(self.tool, self.tool)}"
+                      f"{' (' + self.account + ')' if self.account else ''}  (choices: claude, codex, gemini, agy, copilot, opencode)", flush=True)
+                return True
+            toks = rest.split()
+            want = TOOL_ALIASES.get(toks[0].lower())
+            if not want:
+                print(paint("  Unknown provider. Use: claude, codex, gemini, agy, copilot, or opencode.", "red"), flush=True)
+                return True
+            new_acct = toks[1] if len(toks) >= 2 else ""
+            self.tool = want
+            self.account = new_acct
+            self.session_id = ""
+            self.continue_last = False
+            self.model = ""
+            self.effort = ""
+            self.last_checklist = []
+            self.total_tokens = 0
+            self.total_cost = 0.0
+            self.save_runtime_state()
+            print(f"  Switched to {paint(TOOL_LABELS[want], want)}"
+                  f"{' (' + new_acct + ')' if new_acct else ''} (fresh chat).", flush=True)
+            return True
+        if cmd == "/checklist":
+            if not rest:
+                print(f"  Checklist mode: {paint(self.checklist_mode, 'accent')} (auto | on | off)", flush=True)
+                return True
+            want = rest.lower().split()[0]
+            if want not in ("auto", "on", "off"):
+                print(paint("  Use: /checklist auto | on | off", "red"), flush=True)
+                return True
+            self.checklist_mode = want
+            print(f"  Checklist mode is now {paint(want, 'accent')}.", flush=True)
+            return True
+        if cmd == "/native":
+            self.exec_native()
+            return False
+
+        print(paint(f"  Unknown command '{cmd}'. Type /help for commands, or /native for {TOOL_LABELS[self.tool]}'s own slash commands.", "amber"), flush=True)
+        return True
+
+    def run_turn(self, prompt: str) -> TurnRecord:
+        adapter = self.make_adapter()
+        send_prompt = prompt
+        if self.checklist_mode == "on":
+            send_prompt = CHECKLIST_HINT + prompt
+
+        argv, stdin_text, env = adapter.build_turn(
+            send_prompt,
+            session_id=self.session_id,
+            cwd=self.cwd,
+            continue_last=self.continue_last and not self.session_id,
+        )
+
+        state = TurnState(
+            cwd=self.cwd,
+            prior_checklist=self.last_checklist,
+            prompt=prompt,
+            auto_tasks=(self.checklist_mode != "off"),
+        )
+        state.model = self.model
+        state.session_id = self.session_id
+
+        self.busy = True
+        self.save_runtime_state()
+        mark_fleet("busy")
+
+        ui = LiveUI(state)
+        ui.start()
+
+        stderr_lines: list[str] = []
+        proc: subprocess.Popen | None = None
+        orig_tty = None
+
+        def drain_stderr(pipe) -> None:
+            try:
+                for ln in pipe:
+                    stderr_lines.append(ln)
+                    if len(stderr_lines) > 80:
+                        stderr_lines.pop(0)
+            except Exception:
+                pass
+
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=self.cwd,
+                env=env,
+                stdin=subprocess.PIPE if stdin_text else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+            if stdin_text and proc.stdin:
+                try:
+                    proc.stdin.write(stdin_text)
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+            err_thread = threading.Thread(target=drain_stderr, args=(proc.stderr,), daemon=True)
+            err_thread.start()
+
+            # Read stdout JSONL on a worker thread so main thread can watch Ctrl+O / Ctrl+C live
+            def read_stdout() -> None:
+                assert proc is not None and proc.stdout is not None
+                for raw in proc.stdout:
+                    ln = raw.strip()
+                    if not ln:
+                        continue
+                    adapter.feed_line(ln, state)
+
+            out_thread = threading.Thread(target=read_stdout, daemon=True)
+            out_thread.start()
+
+            if TTY_IN:
+                fd = sys.stdin.fileno()
+                orig_tty = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+                # Disable VDISCARD and keep ISIG off so we handle Ctrl+C and Ctrl+O cleanly
+                cbreak_attrs = termios.tcgetattr(fd)
+                cbreak_attrs[3] &= ~termios.ISIG
+                if hasattr(termios, "VDISCARD"):
+                    cbreak_attrs[6][termios.VDISCARD] = b"\x00"
+                termios.tcsetattr(fd, termios.TCSANOW, cbreak_attrs)
+
+            while out_thread.is_alive():
+                if TTY_IN:
+                    r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    if r:
+                        ch = os.read(sys.stdin.fileno(), 1)
+                        if ch == b"\x03":          # Ctrl+C: interrupt turn cleanly
+                            state.interrupted = True
+                            self._stop_proc(proc)
+                            break
+                        elif ch == b"\x0f":        # Ctrl+O: toggle live expansion
+                            state.toggle_expand()
+                            ui._render()
+                else:
+                    out_thread.join(timeout=0.1)
+
+            out_thread.join(timeout=1.0)
+            proc.wait(timeout=3.0)
+            err_thread.join(timeout=0.5)
+        except KeyboardInterrupt:
+            state.interrupted = True
+            if proc is not None:
+                self._stop_proc(proc)
+        except OSError as e:
+            state.set_error(f"Could not start {argv[0]}: {e}")
+        finally:
+            if orig_tty is not None and TTY_IN:
+                try:
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, orig_tty)
+                except Exception:
+                    pass
+            ui.clear_and_stop()
+            self.busy = False
+            mark_fleet("done")
+
+        # Update persistent session metadata
+        if state.session_id:
+            self.session_id = state.session_id
+            self.continue_last = False
+        if state.model and not self.model:
+            self.model = state.model
+        if state.tokens > 0:
+            self.total_tokens = state.tokens
+        if state.cost_usd > 0:
+            self.total_cost += state.cost_usd
+        if state.checklist:
+            self.last_checklist = [dataclasses.replace(it) for it in state.checklist]
+
+        reply = state.reply_text()
+        err = state.error
+        if not err and not state.interrupted and proc is not None and proc.returncode not in (0, None) and not reply:
+            err_tail = " ".join(strip_ansi("".join(stderr_lines)).split())
+            err = err_tail[:300] or f"{TOOL_LABELS[self.tool]} exited with code {proc.returncode}"
+
+        state.finalize_checklist(ok=(not err and not state.interrupted))
+        if state.checklist:
+            self.last_checklist = [dataclasses.replace(it) for it in state.checklist]
+
+        rec = TurnRecord(
+            index=len(self.turns) + 1,
+            prompt=prompt,
+            started_at=state.started_at,
+            ended_at=time.monotonic(),
+            steps=list(state.steps),
+            checklist=list(state.checklist),
+            reply=reply,
+            tokens=state.tokens,
+            cost_usd=state.cost_usd,
+            error=err,
+            interrupted=state.interrupted,
+        )
+        self.turns.append(rec)
+        self.save_runtime_state()
+        self._render_settled_turn(rec, state.summarize_steps())
+        return rec
+
+    @staticmethod
+    def _stop_proc(proc: subprocess.Popen) -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGINT)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1.5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def _render_settled_turn(self, rec: TurnRecord, step_summary: str) -> None:
+        cols, _ = term_size()
+        # 1. Clean 1-line header + `└ ✔ / ◼ / ◻` task tree (zero raw bash spam)
+        dur = fmt_dur(rec.ended_at - rec.started_at)
+        tok = fmt_tokens(rec.tokens)
+        meta = " · ".join(x for x in (dur, f"↓ {tok} tokens" if tok else "") if x)
+        if rec.interrupted:
+            print(f"  {paint('■', 'amber')} {paint('Interrupted', 'amber')} {paint(f'({meta})', 'dim')}")
+        elif step_summary:
+            failed = any(s.ok is False for s in rec.steps)
+            dot = paint("✳", "red" if failed else "coral")
+            hint = "  ctrl+o or /steps" if TTY_OUT else ""
+            print(f"  {dot} {paint(step_summary, 'dim')} {paint(f'({meta}){hint}', 'faint')}")
+        elif meta:
+            print(f"  {paint('✳', 'coral')} {paint(f'Done ({meta})', 'dim')}")
+
+        if rec.checklist and self.checklist_mode != "off":
+            for ln in render_task_tree(rec.checklist, cols, final=True):
+                print(ln)
+
+        # 2. Clean formatted reply or error
+        if rec.reply:
+            print()
+            print(format_markdown(rec.reply, cols))
+        if rec.error:
+            print()
+            print(f"  {paint('✗ ' + rec.error, 'red')}")
+        print(flush=True)
+
+    # ---- interactive readline loop -----------------------------------------------------------
+
+    def _setup_readline(self) -> None:
+        if not readline or not TTY_IN:
+            return
+        commands = ["/steps", "/tasks", "/mode", "/model", "/effort", "/provider",
+                    "/checklist", "/new", "/clear", "/native", "/help", "/quit"]
+
+        def completer(text, state_idx):
+            if readline.get_begidx() == 0 and text.startswith("/"):
+                matches = [c + " " for c in commands if c.startswith(text.lower())]
+                return matches[state_idx] if state_idx < len(matches) else None
+            if text.startswith("@"):
+                rel = text[1:]
+                base_dir = os.path.dirname(rel)
+                prefix = os.path.basename(rel)
+                search_dir = os.path.join(self.cwd, base_dir) if base_dir else self.cwd
+                try:
+                    entries = sorted(os.listdir(search_dir))
+                except OSError:
+                    entries = []
+                matches = []
+                for name in entries:
+                    if name.startswith(".") and not prefix.startswith("."):
+                        continue
+                    if not name.startswith(prefix):
+                        continue
+                    full = os.path.join(search_dir, name)
+                    cand = os.path.join(base_dir, name) if base_dir else name
+                    matches.append("@" + cand + ("/" if os.path.isdir(full) else " "))
+                return matches[state_idx] if state_idx < len(matches) else None
+            return None
+
+        readline.set_completer(completer)
+        readline.set_completer_delims(" \t\n")
+        hist_file = os.path.join(HOME, ".local", "state", "afc", "chat-history")
+        try:
+            os.makedirs(os.path.dirname(hist_file), exist_ok=True)
+            if os.path.exists(hist_file):
+                readline.read_history_file(hist_file)
+            readline.set_history_length(500)
+        except OSError:
+            pass
+        self._hist_file = hist_file
+
+        def pre_input():
+            if self._pending_draft:
+                readline.insert_text(self._pending_draft)
+                self._pending_draft = ""
+                readline.redisplay()
+
+        readline.set_pre_input_hook(pre_input)
+
+        if "libedit" in (readline.__doc__ or ""):
+            readline.parse_and_bind("bind ^I rl_complete")
+            return
+        readline.parse_and_bind("tab: complete")
+        readline.parse_and_bind("set bell-style none")
+        readline.parse_and_bind("set enable-bracketed-paste on")
+        self._bind_paste()
+        for k, fn in (
+            ("\\e[1~", "beginning-of-line"), ("\\e[4~", "end-of-line"), ("\\e[3~", "delete-char"),
+            ("\\e[7~", "beginning-of-line"), ("\\e[8~", "end-of-line"),
+            ("\\e[H", "beginning-of-line"), ("\\e[F", "end-of-line"),
+            ("\\eOH", "beginning-of-line"), ("\\eOF", "end-of-line"),
+        ):
+            readline.parse_and_bind(f'"{k}": {fn}')
+        readline.parse_and_bind(f'"\\C-o": "\\C-a{KEY_STEPS}\\C-m"')
+        readline.parse_and_bind(f'"\\C-t": "\\C-a{KEY_TASKS}\\C-m"')
+        readline.parse_and_bind(f'"\\e[Z": "\\C-a{KEY_MODE}\\C-m"')
+
+    def run_interactive(self, initial_prompt: str = "") -> int:
+        self.disable_vdiscard()
+        self._setup_readline()
+        self.save_runtime_state()
+        try:
+            self.print_banner()
+            if initial_prompt:
+                print(f"  {paint('❯', 'accent')} {initial_prompt}\n", flush=True)
+                self.run_turn(initial_prompt)
+
+            prompt_str = f"\001\033[{C['accent']}m\002  ❯ \001\033[0m\002" if TTY_OUT else "> "
+            while True:
+                cols, _ = term_size()
+                if TTY_OUT:
+                    rule = paint("─" * cols, "border")
+                    mode_col = {"bypass": "red", "plan": "cyan"}.get(self.mode, "green")
+                    left_meta = (
+                        f"  {paint('▸ ' + self.mode, mode_col)}"
+                        f"{paint(' · ', 'faint')}{paint(TOOL_LABELS.get(self.tool, self.tool), self.tool)}"
+                        + (paint(f" ({self.account})", "dim") if self.account else "")
+                        + (paint(f" · {self.model}", "purple") if self.model else "")
+                    )
+                    right_hint = "shift+tab mode · ctrl+o steps · /help"
+                    if cells(left_meta) + cells(right_hint) + 4 <= cols:
+                        footer = left_meta + "   " + paint(right_hint, "faint")
+                    else:
+                        footer = left_meta
+                    # Framed prompt box: top rule, typing row, bottom rule, status bar; cursor back on typing row
+                    sys.stdout.write(rule + "\n\n" + rule + "\n" + footer + "\033[2A\r")
+                    sys.stdout.flush()
+                try:
+                    raw = input(prompt_str)
+                except EOFError:
+                    if TTY_OUT:
+                        sys.stdout.write("\r\033[J\n")
+                        sys.stdout.flush()
+                    else:
+                        print()
+                    return 0
+                except KeyboardInterrupt:
+                    if TTY_OUT:
+                        sys.stdout.write("\r\033[J\n")
+                        sys.stdout.flush()
+                    else:
+                        print()
+                    continue
+                if TTY_OUT:
+                    sys.stdout.write("\r\033[J")
+                    sys.stdout.flush()
+
+                # Handle shortcut macros without losing the user's typed draft
+                if raw.startswith(KEY_STEPS):
+                    self._pending_draft = raw[len(KEY_STEPS):]
+                    self.print_steps()
+                    continue
+                if raw.startswith(KEY_TASKS):
+                    self._pending_draft = raw[len(KEY_TASKS):]
+                    self.print_tasks()
+                    continue
+                if raw.startswith(KEY_MODE):
+                    self._pending_draft = raw[len(KEY_MODE):]
+                    self.mode = MODES[(MODES.index(self.mode) + 1) % len(MODES)]
+                    self.save_runtime_state()
+                    print(f"  Permission mode: {paint(self.mode, 'accent')}", flush=True)
+                    continue
+
+                text = self._expand_pastes(raw).replace("\r\n", "\n").replace("\r", "\n").strip()
+                if not text:
+                    if TTY_OUT:
+                        sys.stdout.write("\033[2A\r\033[J")
+                        sys.stdout.flush()
+                    continue
+                if text.startswith("/") and "/" not in text.split()[0][1:]:
+                    if not self.handle_slash(text):
+                        return 0
+                    continue
+                print(flush=True)
+                self.run_turn(text)
+        finally:
+            if readline and getattr(self, "_hist_file", ""):
+                try:
+                    readline.write_history_file(self._hist_file)
+                except OSError:
+                    pass
+            self.cleanup_runtime_state()
+            self.restore_termios()
+            mark_fleet("end")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="afc-chat",
+        description="Unified provider-agnostic CLI UI for Claude Code, Codex, Gemini CLI, and Antigravity.",
+    )
+    p.add_argument("positional_tool", nargs="?", default="", help="Optional provider: claude|codex|gemini|agy|copilot|opencode")
+    p.add_argument("--tool", "-t", default="", help="Provider: claude|codex|gemini|agy|copilot|opencode (default: claude)")
+    p.add_argument("--account", "-a", default="", help="Fleet account name for this provider")
+    p.add_argument("--mode", "-m", default="auto", choices=["auto", "normal", "plan", "bypass"],
+                   help="Permission mode (default: auto)")
+    p.add_argument("--model", default="", help="Model override")
+    p.add_argument("--effort", default="", help="Reasoning effort override")
+    p.add_argument("--resume", default="", help="Resume a specific session / conversation ID")
+    p.add_argument("--continue", dest="continue_last", action="store_true",
+                   help="Continue the folder's latest session")
+    p.add_argument("--checklist", default="auto", choices=["auto", "on", "off"],
+                   help="Checklist mode (default: auto)")
+    p.add_argument("--prompt", default="", help="Send an initial prompt then stay interactive")
+    p.add_argument("--once", default="", help="Run a single prompt non-interactively and exit")
+    p.add_argument("--wait", type=int, default=0, help="Pause N seconds before starting (fleet restart stagger)")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    raw_tool = (args.tool or args.positional_tool or "claude").lower()
+    tool = TOOL_ALIASES.get(raw_tool)
+    if not tool:
+        sys.stderr.write(f"afc-chat: unknown tool '{raw_tool}' (use: claude, codex, gemini, agy)\n")
+        return 2
+    mode = "auto" if args.mode == "normal" else args.mode
+    if args.wait > 0:
+        try:
+            print(f"Starts in {args.wait} s (Enter to start now)…", flush=True)
+            if TTY_IN:
+                r, _, _ = select.select([sys.stdin], [], [], args.wait)
+                if r:
+                    sys.stdin.readline()
+            else:
+                time.sleep(args.wait)
+        except KeyboardInterrupt:
+            pass
+
+    ctl = SessionController(
+        tool=tool,
+        account=args.account,
+        mode=mode,
+        model=args.model,
+        effort=args.effort,
+        session_id=args.resume,
+        continue_last=args.continue_last,
+        checklist_mode=args.checklist,
+        cwd=os.getcwd(),
+    )
+
+    if args.once:
+        ctl.save_runtime_state()
+        try:
+            rec = ctl.run_turn(args.once)
+            return 1 if rec.error and not rec.reply else 0
+        finally:
+            ctl.cleanup_runtime_state()
+
+    if not TTY_IN and not args.prompt:
+        piped = sys.stdin.read().strip()
+        if not piped:
+            return 0
+        ctl.save_runtime_state()
+        try:
+            rec = ctl.run_turn(piped)
+            return 1 if rec.error and not rec.reply else 0
+        finally:
+            ctl.cleanup_runtime_state()
+
+    return ctl.run_interactive(initial_prompt=args.prompt)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

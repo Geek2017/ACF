@@ -8,12 +8,12 @@
 
 No tool's sign-in is read and no extra provider API is called; the numbers come from each tool itself:
   Codex        `codex app-server`, its own account/rateLimits/read call (experimental in Codex): about 2s, no turn or
-               session. It runs when Codex has done work since the last read (at most every 15s) and otherwise every 5
-               minutes, only while a Codex pane is focused. If it cannot answer, the rate_limits Codex writes into its
-               session logs on every turn are used, and a log newer than the last read wins.
+               session. It runs at most every 5 minutes (LLM_USAGE_ACTIVE_TTL), only while a Codex pane is focused.
+               Between refreshes (or if it cannot answer), the rate_limits Codex writes into its session logs on
+               every turn are read directly, and a log newer than the last read wins.
   Antigravity  `agy -p /usage --output-format json`, its scripted quota command: 0 tokens, about 3s, no conversation
-               or history. It runs when agy has done work since the last read (at most every 15s) and otherwise every
-               5 minutes, only while an agy pane is focused. Any /usage panel open in a fleet pane is also read,
+               or history. It runs at most every 5 minutes (LLM_USAGE_ACTIVE_TTL), only while an agy pane is focused.
+               Any /usage panel open in a fleet pane is also read,
                without pressing keys. agy's quota service gives sessions different answers at the same moment, some
                behind. Used quota only rises until a window resets, so the highest used value per window is kept.
 Never blocks: the last answer is printed and refreshed in the background.
@@ -25,7 +25,8 @@ HOME = os.path.expanduser("~")
 CFG = f"{HOME}/.config/agents"
 CACHE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp", "llm-usage")
 IDLE_TTL = int(os.environ.get("LLM_USAGE_AGY_TTL", "300"))
-ACTIVE_TTL = 15    # seconds between reads while agy is doing work
+ACTIVE_TTL = int(os.environ.get("LLM_USAGE_ACTIVE_TTL", "300"))    # seconds between background reads while active
+LOCK_TTL = 30      # max in-flight refresh time before a stale lock expires
 ROLLOVER = 1800    # a reset time this far from the stored one is a different window
 WARN = 80          # same "!" threshold as claude-usage
 TMUX_ENV = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
@@ -149,7 +150,7 @@ def codex(acct, refreshing=False):
     last_log = os.path.getmtime(logs[0]) if logs else 0
     age = now - os.path.getmtime(stamp) if os.path.exists(stamp) else None
     due = age is None or age >= IDLE_TTL or (last_log > os.path.getmtime(stamp) and age >= ACTIVE_TTL)
-    locked = os.path.exists(lock) and now - os.path.getmtime(lock) < ACTIVE_TTL
+    locked = os.path.exists(lock) and now - os.path.getmtime(lock) < LOCK_TTL
     if due and not locked:
         open(lock, "w").close()
         subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "--refresh", f"codex {acct}"],
@@ -346,7 +347,7 @@ def agy(acct, refreshing=False):
     except OSError:
         failed = False
     due = age is None or age >= IDLE_TTL or (worked and age >= ACTIVE_TTL and not failed)
-    locked = os.path.exists(lock) and now - os.path.getmtime(lock) < ACTIVE_TTL
+    locked = os.path.exists(lock) and now - os.path.getmtime(lock) < LOCK_TTL
     if due and not locked:
         open(lock, "w").close()
         subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "--refresh", f"agy {acct}"],
