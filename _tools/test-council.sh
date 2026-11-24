@@ -1143,6 +1143,14 @@ try:
 finally:
     g["Meeting"].round = orig_round
 
+# 22. tmux.conf status-bar user range names must stay <=15 chars (tmux truncates range=user|NAME at 15 chars!)
+_tc_path = os.path.join(os.path.dirname(os.path.dirname(COUNCIL)), "tmux", "tmux.conf")
+if os.path.isfile(_tc_path):
+    _tc_txt = open(_tc_path).read()
+    _ranges = re.findall(r"range=user\|([A-Za-z0-9_-]+)", _tc_txt)
+    assert _ranges and all(len(r) <= 15 for r in _ranges), f"tmux range name >15 chars: {[(r, len(r)) for r in _ranges]}"
+    assert "council_cfg" in _tc_txt and "council_settings" not in _tc_txt, "council_settings (16 chars) broke tmux click"
+
 print("REGRESSIONS_OK")
 EOF
 )
