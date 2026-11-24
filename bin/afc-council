@@ -3622,9 +3622,21 @@ LAST_FAIL = {}               # member -> what went wrong last
 ROAST = {"meeting": None, "directed": set()}   # the roast going on (a new message starts a new round: Worker.submit)
 
 
+def _status_names():
+    """Handle -> display name for active speakers, including dedicated BP position speakers."""
+    t = TABLE[0]
+    if not t:
+        return {}
+    names = table_names(list(t.members))
+    if t.format() == "bp":
+        for role, m in t.bp_cast():
+            names.setdefault(m.handle, f"{m.shown()} ({role[0]})")
+    return names
+
+
 def emit_status():
     """Who is thinking, for the members' panes. Call with LOCK held."""
-    names = table_names(list(TABLE[0].members)) if TABLE[0] else {}
+    names = _status_names()
     emit({"t": "status", "who": sorted(RUNWHO), "names": {h: names.get(h, h) for h in RUNWHO}})
 FEED = {"path": "", "grid": False}   # the live feed the member panes read; grid: the panes are open
 
@@ -3680,7 +3692,7 @@ def draw_status():
     """The animated line under the thread while members think: a spinner, who, and for how long."""
     if STATUS["line"] and TTY and not FEED["grid"]:   # in the grid each member's pane has its own spinner
         who = STATUS["who"]
-        names = table_names(list(TABLE[0].members)) if TABLE[0] else {}
+        names = _status_names()
         shown_who = [names.get(h, h) for h in who]
         frame = SPIN[int(time.time() * 10) % len(SPIN)]
         secs = int(time.time() - STATUS["since"])
@@ -3772,10 +3784,24 @@ class Grid:
                    "#{pane_id} #{?#{||:#{@council_chat},#{@council_member}},c,x}").splitlines()
         return all(r.endswith(" c") or r.split()[0] == self.me for r in rows if r.strip())
 
+    def active_roster(self, meeting):
+        """Members to show panes for: seated members, or BP cast + judge when BP uses direct provider:model slots."""
+        seated = meeting.seated()
+        if seated:
+            return seated
+        if meeting.format() == "bp":
+            seen, out = set(), []
+            for m in [x for _r, x in meeting.bp_cast()] + meeting.adjudicators():
+                if m.handle not in seen:
+                    seen.add(m.handle)
+                    out.append(m)
+            return out
+        return []
+
     def open(self, meeting):
         with GRID_LOCK:
             self.close()
-            seated = meeting.seated()
+            seated = self.active_roster(meeting)
             if not self.me or not FEED["path"]:
                 FEED["grid"] = False
                 return
@@ -3957,7 +3983,13 @@ class Grid:
         if getattr(self, "sig", None) not in (None, sig) and FEED["grid"]:
             replay(meeting)
         self.sig = sig
-        for m in meeting.members:
+        roster = list(meeting.members)
+        known = {m.handle for m in roster}
+        for m in self.active_roster(meeting):
+            if m.handle not in known:
+                roster.append(m)
+                known.add(m.handle)
+        for m in roster:
             p = self.panes.get(m.handle)
             if not p:
                 continue
@@ -3987,7 +4019,7 @@ class Grid:
         one = self.panes.get(ALL)
         if one:       # the one view's header: everyone at the table, each in the colour of its answers
             names = " ".join(f"#[fg={TMUX_COLOUR.get(m.colour(), 'colour221')},bold]@{m.shown()}#[default]"
-                             for m in meeting.seated())
+                             for m in self.active_roster(meeting))
             tmx("set-option", "-p", "-t", one, "pane-border-format",
                 f" #[fg=colour252,bold]everyone#[default] {names} #[fg=colour244]· one view (Alt+O in the chat "
                 "box: one pane each)#[default]#[align=right]#[fg=colour244] ✕ #[default]")
