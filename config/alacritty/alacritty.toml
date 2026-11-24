@@ -56,3 +56,8 @@ white = "#c0caf5"
 # Alacritty takes the more talkative of the two.
 [debug]
 log_level = "Error"
+
+[keyboard]
+bindings = [
+  { key = "Escape", mods = "Super", chars = "\u001b[99~" },
+]

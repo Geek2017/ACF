@@ -11,6 +11,7 @@ import re
 import select
 import shlex
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -246,12 +247,244 @@ def build_commands(ctx):
     ]
 
 
+AFC_KEEP = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "afc-bar.d")
+HOSTNAME = socket.gethostname()
+BRAILLE_SPIN = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+TMUX_STYLE_RE = re.compile(r"#\[[^\]]*\]")
+
+PROVIDER_COLORS = {
+    "claude": FG_PURPLE,
+    "codex": FG_GREEN,
+    "gemini": FG_CYAN,
+    "agy": FG_BLUE,
+    "copilot": FG_WHITE,
+    "opencode": FG_AMBER,
+    "council": FG_AMBER,
+}
+
+
+def _read_pane_who(pane_pid):
+    """Read cached provider & account from afc-bar.d/w<pid> (zero subprocesses)."""
+    if not pane_pid:
+        return "", ""
+    path = os.path.join(AFC_KEEP, f"w{pane_pid}")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = [ln.strip() for ln in f.readlines()]
+        if len(lines) >= 3 and lines[2]:
+            parts = lines[2].split(None, 1)
+            return parts[0].lower(), (parts[1] if len(parts) > 1 else "")
+    except Exception:
+        pass
+    return "", ""
+
+
+def _read_pane_header(pane_id):
+    """Parse cached model, token summary, and express-lane flag from afc-bar.d/h<id>."""
+    if not pane_id:
+        return "", "", False
+    path = os.path.join(AFC_KEEP, f"h{pane_id.lstrip('%')}")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        if len(lines) < 2:
+            return "", "", False
+        plain = TMUX_STYLE_RE.sub("", lines[1]).strip()
+        express = "⚡" in plain
+        groups = re.findall(r"\[([^\]]+)\]", plain)
+        model, tokens = "", ""
+        for idx, grp in enumerate(groups):
+            g = grp.strip()
+            if idx == 0:
+                continue  # provider/account slot
+            if g.startswith("T:"):
+                tokens = g
+            elif not model and not g.startswith(("S", "W", "API", "left ", "err")):
+                model = g
+        return model, tokens, express
+    except Exception:
+        return "", "", False
+
+
+def _clean_pane_title(title, win_name):
+    t = (title or "").strip()
+    if not t or t == HOSTNAME:
+        return ""
+    # Strip leading agent glyph or spinner
+    t = re.sub(r"^[✳✦●○•✻⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⚡\s]+", "", t).strip()
+    if win_name:
+        t = re.sub(rf"\s*[|·\-–]\s*{re.escape(win_name)}\s*$", "", t).strip()
+        t = re.sub(rf"\s*\({re.escape(win_name)}\)\s*$", "", t).strip()
+    t = re.sub(r"\s*-\s*GitHub Copilot\s*$", "", t).strip()
+    return t
+
+
+def _extract_live_activity(sock, pane_id):
+    """Sample bottom lines of a pane to extract live task / status cue."""
+    raw = run_out(tmux_cmd(sock, "capture-pane", "-p", "-t", pane_id, "-S", "-18"))
+    if not raw:
+        return "", False, False
+    lines = []
+    for ln in raw.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        # Skip horizontal rules / borders
+        if set(s) <= set("─━═▄▀-_=~· "):
+            continue
+        lines.append(s)
+
+    is_working = False
+    is_done = False
+    cue = ""
+    prompt_line = ""
+    fallback = ""
+
+    skip_prefixes = (
+        "? for shortcuts",
+        "workspace (/directory)",
+        "auto-accept edits",
+        "⏵⏵ bypass permissions",
+        "← for agents",
+        "└ Tip:",
+        "Type your message",
+        "Ask Codex to do anything",
+    )
+
+    for ln in reversed(lines[-14:]):
+        ln = re.sub(r"\s{2,}", " ", ln).strip()
+        low = ln.lower()
+        if any(p.lower() in low for p in skip_prefixes):
+            continue
+        if "esc to interrupt" in low or "esc to cancel" in low or re.search(r"\bworking\s*\(", low) or re.search(r"^[•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*(working|thinking|running|reading|editing)", low):
+            is_working = True
+            if low.startswith("esc to cancel") or low.startswith("esc to interrupt"):
+                continue
+            cleaned = re.sub(r"^[•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s]+", "", ln)
+            cleaned = re.sub(r"\s*[•·,]\s*esc to (interrupt|cancel)\)?", ")", cleaned)
+            cleaned = re.sub(r"\(\s*esc to (interrupt|cancel),?\s*", "(", cleaned)
+            cleaned = cleaned.replace("))", ")").strip()
+            if not cue:
+                cue = cleaned
+            continue
+        if ln.startswith("✻") and ("brewed" in low or "done" in low or "worked" in low or "cooked" in low or "churned" in low or "baked" in low):
+            is_done = True
+            if not cue:
+                cue = ln.lstrip("✻ ").strip()
+            continue
+        if re.match(r"^[❯›>]\s+\S", ln):
+            cand = re.sub(r"^[❯›>]\s+", "", ln).strip()
+            if cand and not any(p.lower() in cand.lower() for p in ("type your message", "ask codex", "try \"", "thought for ")):
+                if not prompt_line:
+                    prompt_line = cand
+            continue
+        if not fallback and len(ln) >= 6 and not ln.startswith(("/", "~/", "GPT-", "Gemini ", "Claude ")):
+            fallback = ln
+
+    if cue:
+        return cue, is_working, is_done
+    if prompt_line:
+        return f"› {prompt_line}", is_working, is_done
+    return fallback, is_working, is_done
+
+
+def load_window_agents(ctx, win_item):
+    """Inspect all panes inside a window: provider, model, tokens, state, and live task."""
+    sock = ctx["sock"]
+    wid = win_item["wid"]
+    wname = win_item.get("win_name", "")
+    tbin = shlex.quote(TMUX_BIN) + (f" -S {shlex.quote(sock)}" if sock else " -L agents")
+    fmt = "#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_active}\t#{@busy}\t#{@state}\t#{pane_current_command}\t#{pane_title}"
+    out = run_out(tmux_cmd(sock, "list-panes", "-t", wid, "-F", fmt))
+    agents = []
+
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 8:
+            continue
+        pidx, pid_id, ppid, pactive, pbusy, pstate, pcmd, ptitle = parts[:8]
+        prov, acct = _read_pane_who(ppid)
+        if not prov:
+            prov = pcmd or "shell"
+        model, tokens, express = _read_pane_header(pid_id)
+        title_clean = _clean_pane_title(ptitle, wname)
+        activity, cap_working, cap_done = _extract_live_activity(sock, pid_id)
+        if prov.startswith("python") and ("/agent new" in activity or "council" in activity.lower()):
+            prov = "council"
+
+        has_spinner = bool(ptitle) and any(ch in BRAILLE_SPIN for ch in ptitle[:3])
+        if pbusy == "1" or pstate == "busy" or has_spinner or cap_working:
+            badge, bcol = "▶ working", FG_CYAN
+        elif pstate == "wait":
+            badge, bcol = "◆ waiting", FG_AMBER
+        elif pstate == "done" or cap_done:
+            badge, bcol = "✓ done", FG_GREEN
+        else:
+            badge, bcol = "· idle", FG_MUTED
+
+        if title_clean and activity:
+            tl, al = title_clean.lower(), activity.lower()
+            if tl in al or (tl.startswith(("working", "thinking")) and al.startswith(("working", "thinking"))):
+                task_str = activity
+            elif al in tl:
+                task_str = title_clean
+            else:
+                task_str = f"{title_clean}  ·  {activity}"
+        else:
+            task_str = title_clean or activity or f"running {pcmd or 'shell'}"
+
+        agents.append({
+            "pane_idx": pidx,
+            "pane_id": pid_id,
+            "active": pactive == "1",
+            "provider": prov,
+            "account": acct,
+            "prov_col": PROVIDER_COLORS.get(prov, FG_MUTED),
+            "express": express,
+            "model": model,
+            "tokens": tokens,
+            "badge": badge,
+            "badge_col": bcol,
+            "task": task_str,
+            "cmd": f"{tbin} select-window -t {shlex.quote(wid)} \\; select-pane -t {shlex.quote(pid_id)}",
+        })
+
+    return agents
+
+
+def _summarize_window_providers(sock, sess):
+    """Build compact per-window provider summaries (e.g. 'claude · gemini · codex')."""
+    out = run_out(tmux_cmd(sock, "list-panes", "-s", "-t", sess, "-F", "#{window_id}\t#{pane_pid}\t#{pane_current_command}"))
+    by_win = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        wid, ppid, pcmd = parts[:3]
+        prov, _acct = _read_pane_who(ppid)
+        by_win.setdefault(wid, []).append(prov or pcmd or "shell")
+
+    summary = {}
+    for wid, provs in by_win.items():
+        counts = {}
+        order = []
+        for p in provs:
+            if p not in counts:
+                counts[p] = 0
+                order.append(p)
+            counts[p] += 1
+        chunks = [f"{p} ×{counts[p]}" if counts[p] > 1 else p for p in order]
+        summary[wid] = " · ".join(chunks)
+    return summary
+
+
 def load_sessions(ctx):
     rows = []
     sock = ctx["sock"]
     sess = ctx["session"] or "agents"
     fmt = "#{window_index}\t#{window_id}\t#{window_name}\t#{window_active}\t#{window_panes}\t#{@unseen}\t#{P:#{@busy}}\t#{P:#{@state}}\t#{pane_current_path}"
     out = run_out(tmux_cmd(sock, "list-windows", "-t", sess, "-F", fmt))
+    prov_map = _summarize_window_providers(sock, sess)
     tbin = shlex.quote(TMUX_BIN) + (f" -S {shlex.quote(sock)}" if sock else " -L agents")
 
     for line in out.splitlines():
@@ -270,11 +503,18 @@ def load_sessions(ctx):
         else:
             badge, col = "· idle", FG_MUTED
         short_cwd = cwd.replace(HOME, "~") if cwd.startswith(HOME) else cwd
+        provs = prov_map.get(wid, "")
+        meta = f"{panes}p  {provs}" if provs else f"{panes}p  {short_cwd}"
         rows.append({
             "kind": "window",
+            "wid": wid,
+            "win_idx": idx,
+            "win_name": name,
+            "panes_cnt": panes,
+            "cwd": short_cwd,
             "active": active == "1",
             "label": f"{idx}  {name}",
-            "meta": f"{panes}p  {short_cwd}",
+            "meta": meta,
             "badge": badge,
             "badge_col": col,
             "cmd": f"{tbin} select-window -t {shlex.quote(wid)}",
@@ -362,13 +602,32 @@ class MenuApp:
         self.status_msg = ""
         self.tab_rects = []      # [(start_col_1based, end_col_1based, tab_idx)]
         self.row_map = {}        # screen_row_1based -> item_index
+        self.inspect_win = None  # selected window dict when drilling into Sessions
+        self.inspect_agents = [] # panes/agents loaded for inspect_win
+        self.inspect_sel = 0
+        self.inspect_scroll = 0
+        self.back_rect = None    # (row, s_col, e_col)
+        self.jump_rect = None    # (row, s_col, e_col)
         self.pending_cmd = None
         self.running = True
+
+    def open_session_inspector(self, win_item):
+        self.inspect_win = win_item
+        self.inspect_agents = load_window_agents(self.ctx, win_item)
+        self.inspect_sel = 0
+        self.inspect_scroll = 0
+        for i, ag in enumerate(self.inspect_agents):
+            if ag["active"]:
+                self.inspect_sel = i
+                break
+        self.status_msg = ""
 
     def current_items_len(self):
         if self.tab == 0:
             return len(self.commands)
         if self.tab == 1:
+            if self.inspect_win is not None:
+                return len(self.inspect_agents)
             return len(self.sessions)
         if self.tab == 2:
             return len(CONFIG_SCHEMA) + 1  # +1 for Reload tmux config action
@@ -376,6 +635,13 @@ class MenuApp:
 
     def clamp_sel(self):
         n = self.current_items_len()
+        if self.tab == 1 and self.inspect_win is not None:
+            if n <= 0:
+                self.inspect_sel = 0
+                self.inspect_scroll = 0
+            else:
+                self.inspect_sel = max(0, min(self.inspect_sel, n - 1))
+            return
         if n <= 0:
             self.sel[self.tab] = 0
             self.scroll[self.tab] = 0
@@ -384,13 +650,23 @@ class MenuApp:
 
     def activate_current(self):
         self.clamp_sel()
+        if self.tab == 1 and self.inspect_win is not None:
+            idx = self.inspect_sel
+            if 0 <= idx < len(self.inspect_agents):
+                self.pending_cmd = self.inspect_agents[idx]["cmd"]
+                self.running = False
+            return
         idx = self.sel[self.tab]
         if self.tab == 0 and 0 <= idx < len(self.commands):
             self.pending_cmd = self.commands[idx][3]
             self.running = False
         elif self.tab == 1 and 0 <= idx < len(self.sessions):
-            self.pending_cmd = self.sessions[idx]["cmd"]
-            self.running = False
+            item = self.sessions[idx]
+            if item.get("kind") == "window":
+                self.open_session_inspector(item)
+            else:
+                self.pending_cmd = item["cmd"]
+                self.running = False
         elif self.tab == 2:
             if idx < len(CONFIG_SCHEMA):
                 key, _desc, choices, default = CONFIG_SCHEMA[idx]
@@ -410,20 +686,23 @@ class MenuApp:
         out = ["\x1b[H"]
         self.tab_rects = []
         self.row_map = {}
+        self.back_rect = None
+        self.jump_rect = None
 
         # Row 1: Pill tab bar matching reference look
         line1 = f"{BG_MAIN} "
         col = 2
         for i, name in enumerate(TABS):
-            pill = f" {name} "
+            num = str(i + 1)
+            pill_plain = f" {num} {name} "
             start_c = col
-            end_c = col + len(pill) - 1
+            end_c = col + len(pill_plain) - 1
             self.tab_rects.append((start_c, end_c, i))
             if i == self.tab:
-                line1 += f"{BG_TAB_ON}{FG_WHITE}{BOLD}{pill}{RESET}{BG_MAIN}"
+                line1 += f"{BG_TAB_ON}{FG_CYAN}{BOLD} {num} {FG_WHITE}{name} {RESET}{BG_MAIN}"
             else:
-                line1 += f"{BG_TAB_OFF}{FG_TEXT}{pill}{RESET}{BG_MAIN}"
-            col += len(pill)
+                line1 += f"{BG_TAB_OFF}{FG_AMBER} {num} {FG_TEXT}{name} {RESET}{BG_MAIN}"
+            col += len(pill_plain)
             if i < len(TABS) - 1:
                 line1 += "  "
                 col += 2
@@ -457,7 +736,12 @@ class MenuApp:
             out.append(f"\x1b[{h - 1};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
 
         # Row h: footer bar
-        footer = " ←/→ Tab: tabs   ↑/↓: select   Enter/Click: run   1-4: jump   q/Esc: close"
+        if self.tab == 1 and self.inspect_win is not None:
+            footer = " Enter/Click: open pane   ←/Esc: back   g: jump tab   r: refresh   q: close"
+        elif self.tab == 1:
+            footer = " Enter/Click: inspect agents   g: jump tab   r: refresh   1-4: tabs   Esc: close"
+        else:
+            footer = " ←/→ Tab: tabs   ↑/↓: select   Enter/Click: run   1-4: jump   q/Esc: close"
         footer = trunc(footer, w)
         out.append(f"\x1b[{h};1H{BG_MAIN}{FG_MUTED}{footer}{' ' * max(0, w - len(footer))}{RESET}")
 
@@ -501,6 +785,9 @@ class MenuApp:
             )
 
     def _render_sessions(self, out, w, top, rows):
+        if self.inspect_win is not None:
+            self._render_session_agents(out, w, top, rows)
+            return
         if not self.sessions:
             for r in range(rows):
                 y = top + r
@@ -522,15 +809,124 @@ class MenuApp:
             ptr_col = FG_BLUE if selected else (FG_PURPLE if item["active"] else FG_DIM)
             label_w = 24
             badge_w = 12
-            meta_w = max(0, w - 2 - label_w - badge_w - 2)
+            chevron = " › " if item.get("kind") == "window" else "   "
+            meta_w = max(0, w - 2 - label_w - badge_w - len(chevron))
             label_s = trunc(item["label"], label_w).ljust(label_w)
             badge_s = trunc(item["badge"], badge_w).ljust(badge_w)
             meta_s = trunc(item["meta"], meta_w).ljust(meta_w)
             name_col = f"{FG_WHITE}{BOLD}" if selected else (f"{FG_PURPLE}{BOLD}" if item["active"] else FG_TEXT)
+            chev_col = FG_BLUE if selected else FG_DIM
             out.append(
                 f"\x1b[{y};1H{bg}{ptr_col}{ptr}{name_col}{label_s}{RESET}{bg}"
-                f"{item['badge_col']}{badge_s}{FG_MUTED}{meta_s}  {RESET}"
+                f"{item['badge_col']}{badge_s}{FG_MUTED}{meta_s}{chev_col}{chevron}{RESET}"
             )
+
+    def _render_session_agents(self, out, w, top, rows):
+        win = self.inspect_win
+        agents = self.inspect_agents
+
+        # Header strip (row = top): clickable Back button, session title, clickable Jump button
+        back_lbl = " ← Sessions "
+        jump_lbl = " ⇄ Jump tab "
+        self.back_rect = (top, 2, 2 + len(back_lbl) - 1)
+        jump_start = max(2 + len(back_lbl) + 2, w - len(jump_lbl))
+        self.jump_rect = (top, jump_start, jump_start + len(jump_lbl) - 1)
+
+        mid_avail = max(4, jump_start - (2 + len(back_lbl)) - 2)
+        title_txt = trunc(f"›  {win['label']}  ({len(agents)}p · {win['badge']})", mid_avail)
+        pad_mid = max(1, jump_start - (2 + len(back_lbl) + 1 + len(title_txt)))
+        hdr = (
+            f"\x1b[{top};1H{BG_MAIN} "
+            f"{BG_TAB_OFF}{FG_BLUE}{BOLD}{back_lbl}{RESET}{BG_MAIN} "
+            f"{FG_WHITE}{BOLD}{title_txt}{RESET}{BG_MAIN}"
+            f"{' ' * pad_mid}"
+            f"{BG_TAB_OFF}{FG_CYAN}{jump_lbl}{RESET}{BG_MAIN}\x1b[K{RESET}"
+        )
+        out.append(hdr)
+
+        # Divider (row = top + 1)
+        if rows >= 2:
+            out.append(f"\x1b[{top + 1};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
+
+        list_top = top + 2
+        list_rows = max(0, rows - 2)
+        if not agents:
+            for r in range(list_rows):
+                y = list_top + r
+                msg = "  No panes found in this session." if r == 1 else ""
+                out.append(f"\x1b[{y};1H{BG_MAIN}{FG_MUTED}{msg.ljust(w)}{RESET}")
+            return
+
+        # Each agent renders as a 2-row card (line 1: provider/model/tokens/state, line 2: live task)
+        card_h = 2
+        cards_vis = max(1, list_rows // card_h)
+        sc = self.inspect_scroll
+        if self.inspect_sel < sc:
+            sc = self.inspect_sel
+        elif self.inspect_sel >= sc + cards_vis:
+            sc = self.inspect_sel - cards_vis + 1
+        sc = max(0, min(sc, max(0, len(agents) - cards_vis)))
+        self.inspect_scroll = sc
+
+        used_rows = 0
+        for slot in range(cards_vis):
+            idx = sc + slot
+            y1 = list_top + slot * card_h
+            y2 = y1 + 1
+            if y1 >= top + rows:
+                break
+            if idx >= len(agents):
+                out.append(f"\x1b[{y1};1H{BG_MAIN}{' ' * w}{RESET}")
+                if y2 < top + rows:
+                    out.append(f"\x1b[{y2};1H{BG_MAIN}{' ' * w}{RESET}")
+                used_rows += card_h
+                continue
+
+            ag = agents[idx]
+            selected = idx == self.inspect_sel
+            bg = BG_SEL if selected else BG_MAIN
+            self.row_map[y1] = idx
+            if y2 < top + rows:
+                self.row_map[y2] = idx
+
+            ptr = f"{FG_BLUE}▸ " if selected else ("● " if ag["active"] else "  ")
+            ptr_col = FG_BLUE if selected else (FG_PURPLE if ag["active"] else FG_DIM)
+
+            pane_tag = f"p{ag['pane_idx']}".ljust(3)
+            exp_ch = "⚡" if ag["express"] else " "
+            exp_cols = 2 if ag["express"] else 1
+            prov_name = ag["provider"].upper()
+            acct_part = f" {ag['account']}" if ag["account"] else ""
+            prov_w = 15 - (exp_cols - 1)
+            prov_str = trunc(f"{prov_name}{acct_part}", prov_w).ljust(prov_w)
+            model_str = trunc(ag["model"], 14).ljust(14)
+            badge_str = ag["badge"].rjust(10)
+            tok_w = max(0, w - 2 - 3 - exp_cols - prov_w - 1 - 14 - 1 - 10 - 2)
+            tok_str = trunc(ag["tokens"], tok_w).ljust(tok_w)
+
+            out.append(
+                f"\x1b[{y1};1H{bg}{ptr_col}{ptr}"
+                f"{FG_DIM}{pane_tag}"
+                f"{FG_AMBER}{exp_ch}"
+                f"{ag['prov_col']}{BOLD}{prov_str}{RESET}{bg} "
+                f"{FG_TEXT}{model_str} "
+                f"{FG_CYAN}{tok_str}"
+                f"{ag['badge_col']}{badge_str}  {RESET}"
+            )
+
+            if y2 < top + rows:
+                task_prefix = "      Task: "
+                task_w = max(4, w - len(task_prefix) - 2)
+                task_s = trunc(ag["task"], task_w).ljust(task_w)
+                t_col = FG_WHITE if selected else FG_MUTED
+                out.append(
+                    f"\x1b[{y2};1H{bg}{FG_DIM}{task_prefix}{t_col}{task_s}  {RESET}"
+                )
+            used_rows += card_h
+
+        for r in range(used_rows, list_rows):
+            y = list_top + r
+            out.append(f"\x1b[{y};1H{BG_MAIN}{' ' * w}{RESET}")
 
     def _render_config(self, out, w, top, rows):
         summary_lines = 3
@@ -592,20 +988,46 @@ class MenuApp:
             prov_parts.append(f"{FG_GREEN}● {name}" if ok else f"{FG_DIM}○ {name}")
         prov_line = "   ".join(prov_parts)
 
+        val_w = max(10, w - 16)
+        cg_line = trunc(
+            f"CPU {fmt_cpu_max(cg.get('cpu.max', ''))} · RAM {fmt_bytes(cg.get('memory.current', ''))}/{fmt_bytes(cg.get('memory.high', ''))} (max {fmt_bytes(cg.get('memory.max', ''))}) · Tasks {cg.get('pids.current', '?')}/{cg.get('pids.max', '?')}",
+            val_w,
+        )
+        rt_line = trunc(
+            f"{a['tmux_v']} · {a['win_cnt']} tabs, {a['pane_cnt']} panes · autonice: {a['autonice']}",
+            val_w,
+        )
+        repo_line = trunc(
+            f"{REPO_ROOT.replace(HOME, '~')} ({a['branch']} @ {a['commit']})",
+            val_w,
+        )
+        bio = [
+            "Tech engineer with over a decade of experience in tech, combining",
+            "deep digital acumen across AI, Cloud, Security & IoT — building",
+            "sub-200ms STT/TTS Voice AI, autonomous multi-agent platforms,",
+            "smart EV/motorcycle OS, custom MCP servers, RAG & edge AI.",
+        ]
+        author_s = 'John Marion "JM" Grefaldo (@Geek2017)'
+        motto_s = '"MO ERGASTEE FORN, MO ERGALONE FORN NORT..."'
         lines = [
             (f"{FG_BLUE}{BOLD}  Agentic CLI Fleet (ACF)", ""),
-            (f"{FG_MUTED}  Multi-provider tmux fleet with live telemetry, Council & cgroup guards", ""),
+            (f"{FG_MUTED}  {trunc('Multi-provider tmux fleet with live telemetry, Council & cgroup guards', max(10, w - 2))}", ""),
             ("", ""),
-            (f"{FG_AMBER}  Repository    ", f"{FG_TEXT}{trunc(REPO_ROOT.replace(HOME, '~'), w - 18)}"),
-            (f"{FG_AMBER}  Git           ", f"{FG_TEXT}{a['branch']} @ {a['commit']}"),
-            (f"{FG_AMBER}  Runtime       ", f"{FG_TEXT}{a['tmux_v']}  ·  {a['win_cnt']} tabs, {a['pane_cnt']} panes  ·  autonice: {a['autonice']}"),
-            (f"{FG_AMBER}  agents.slice  ", f"{FG_TEXT}CPU {fmt_cpu_max(cg.get('cpu.max', ''))}  ·  RAM {fmt_bytes(cg.get('memory.current', ''))} / {fmt_bytes(cg.get('memory.high', ''))} (max {fmt_bytes(cg.get('memory.max', ''))})  ·  Tasks {cg.get('pids.current', '?')}/{cg.get('pids.max', '?')}"),
+            (f"{FG_PURPLE}{BOLD}  Author        ", f"{FG_WHITE}{BOLD}{trunc(author_s, val_w)}"),
+            (f"{FG_PURPLE}  Role          ", f"{FG_CYAN}{trunc('AI Founder, Chief AI Architect & Digital Acumen Leader', val_w)}"),
+            (f"{FG_PURPLE}  Featured In   ", f"{FG_AMBER}{trunc('GMA News  ·  GadgetMatch  ·  PhilSTAR Life  ·  VISOR', val_w)}"),
+            (f"{FG_PURPLE}  Work          ", f"{FG_TEXT}{trunc(bio[0], val_w)}"),
+            (f"{FG_PURPLE}                ", f"{FG_TEXT}{trunc(bio[1], val_w)}"),
+            (f"{FG_PURPLE}                ", f"{FG_TEXT}{trunc(bio[2], val_w)}"),
+            (f"{FG_PURPLE}                ", f"{FG_TEXT}{trunc(bio[3], val_w)}"),
+            (f"{FG_PURPLE}  Credentials   ", f"{FG_MUTED}{trunc('MBA · M.S. Big Data & BI · AI Educator & Cloud Ambassador', val_w)}"),
+            (f"{FG_PURPLE}  Motto         ", f"{FG_AMBER}{trunc(motto_s, val_w)}"),
             ("", ""),
+            (f"{FG_AMBER}  Repository    ", f"{FG_TEXT}{repo_line}"),
+            (f"{FG_AMBER}  Runtime       ", f"{FG_TEXT}{rt_line}"),
+            (f"{FG_AMBER}  agents.slice  ", f"{FG_TEXT}{cg_line}"),
             (f"{FG_AMBER}  Providers     ", prov_line),
-            ("", ""),
-            (f"{FG_PURPLE}  Quick tips    ", f"{FG_MUTED}Click ACF anytime to open this menu"),
-            (f"{FG_PURPLE}                ", f"{FG_MUTED}Alt+G switches agents or hands off chat logs across providers"),
-            (f"{FG_PURPLE}                ", f"{FG_MUTED}Alt+K opens the multi-LLM Council · Alt+E toggles Express lane"),
+            (f"{FG_BLUE}  Source        ", f"{FG_CYAN}{trunc('github.com/Geek2017/ACF', val_w)}"),
         ]
 
         for r in range(rows):
@@ -616,19 +1038,30 @@ class MenuApp:
             else:
                 out.append(f"\x1b[{y};1H{BG_MAIN}{' ' * w}{RESET}")
 
+    def _set_active_sel(self, idx):
+        if self.tab == 1 and self.inspect_win is not None:
+            self.inspect_sel = max(0, min(idx, max(0, len(self.inspect_agents) - 1)))
+        else:
+            self.sel[self.tab] = max(0, min(idx, max(0, self.current_items_len() - 1)))
+
+    def _get_active_sel(self):
+        if self.tab == 1 and self.inspect_win is not None:
+            return self.inspect_sel
+        return self.sel[self.tab]
+
     def handle_mouse(self, btn, col, row, pressed):
         # Scroll wheel (64 = up, 65 = down)
         if btn == 64:
-            self.sel[self.tab] = max(0, self.sel[self.tab] - 1)
+            self._set_active_sel(self._get_active_sel() - 1)
             return
         if btn == 65:
-            self.sel[self.tab] = min(max(0, self.current_items_len() - 1), self.sel[self.tab] + 1)
+            self._set_active_sel(self._get_active_sel() + 1)
             return
 
         # Motion hover (btn & 32): highlight hovered row smoothly
         if btn & 32:
             if row in self.row_map:
-                self.sel[self.tab] = self.row_map[row]
+                self._set_active_sel(self.row_map[row])
             return
 
         # Left click press (btn == 0, pressed == 'M')
@@ -636,18 +1069,27 @@ class MenuApp:
             if row == 1:
                 for s_col, e_col, t_idx in self.tab_rects:
                     if s_col <= col <= e_col:
+                        if t_idx == 1 and self.tab == 1 and self.inspect_win is not None:
+                            self.inspect_win = None
                         self.tab = t_idx
                         self.status_msg = ""
-                        if t_idx == 1:
-                            self.sessions = load_sessions(self.ctx)
                         return
                 # Click on "Esc to close" at top-right
                 w, _ = get_term_size()
                 if col >= w - 13:
                     self.running = False
                 return
+            if self.back_rect and row == self.back_rect[0] and self.back_rect[1] <= col <= self.back_rect[2]:
+                self.inspect_win = None
+                self.status_msg = ""
+                return
+            if self.jump_rect and row == self.jump_rect[0] and self.jump_rect[1] <= col <= self.jump_rect[2]:
+                if self.inspect_win is not None:
+                    self.pending_cmd = self.inspect_win["cmd"]
+                    self.running = False
+                return
             if row in self.row_map:
-                self.sel[self.tab] = self.row_map[row]
+                self._set_active_sel(self.row_map[row])
                 self.activate_current()
 
     def handle_key(self, data):
@@ -655,36 +1097,107 @@ class MenuApp:
             return
         # SGR mouse sequence: ESC [ < btn ; col ; row M/m
         if data.startswith("\x1b[<"):
-            m = re.match(r"^\x1b\[<(\d+);(\d+);(\d+)([Mm])", data)
+            m = re.match(r"^\x1b\[<(\d+);(\d+);(\d+)([Mm])$", data)
             if m:
                 self.handle_mouse(int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4))
             return
+        # Inside Session Inspector: Esc / Backspace / Left / h returns to Sessions list
+        if self.tab == 1 and self.inspect_win is not None:
+            if data in ("\x1b", "\x7f", "\x08", "\x1b[D", "h"):
+                self.inspect_win = None
+                self.status_msg = ""
+                return
+            if data in ("g", "G"):
+                self.pending_cmd = self.inspect_win["cmd"]
+                self.running = False
+                return
+            if data in ("r", "R"):
+                self.inspect_agents = load_window_agents(self.ctx, self.inspect_win)
+                self.status_msg = f"Refreshed {self.inspect_win['win_name']} ({len(self.inspect_agents)} panes)"
+                return
         if data in ("\x1b", "q", "Q", "\x03"):
             self.running = False
         elif data in ("\t", "\x1b[C", "l"):
+            if self.tab == 1 and self.inspect_win is None and data in ("\x1b[C", "l"):
+                # Right arrow on a window row drills into its agents
+                self.clamp_sel()
+                idx = self.sel[1]
+                if 0 <= idx < len(self.sessions) and self.sessions[idx].get("kind") == "window":
+                    self.open_session_inspector(self.sessions[idx])
+                    return
             self.tab = (self.tab + 1) % len(TABS)
             self.status_msg = ""
-            if self.tab == 1:
-                self.sessions = load_sessions(self.ctx)
         elif data in ("\x1b[Z", "\x1b[D", "h"):
             self.tab = (self.tab - 1) % len(TABS)
             self.status_msg = ""
-            if self.tab == 1:
-                self.sessions = load_sessions(self.ctx)
         elif data in ("1", "2", "3", "4"):
-            self.tab = int(data) - 1
+            nxt_tab = int(data) - 1
+            if nxt_tab == 1 and self.tab == 1 and self.inspect_win is not None:
+                self.inspect_win = None
+            self.tab = nxt_tab
             self.status_msg = ""
-            if self.tab == 1:
-                self.sessions = load_sessions(self.ctx)
         elif data in ("\x1b[A", "k"):
-            self.sel[self.tab] = max(0, self.sel[self.tab] - 1)
+            self._set_active_sel(self._get_active_sel() - 1)
         elif data in ("\x1b[B", "j"):
-            self.sel[self.tab] = min(max(0, self.current_items_len() - 1), self.sel[self.tab] + 1)
+            self._set_active_sel(self._get_active_sel() + 1)
         elif data in ("\r", "\n", " "):
             self.activate_current()
-        elif data == "r" and self.tab == 1:
+        elif data in ("g", "G") and self.tab == 1 and self.inspect_win is None:
+            self.clamp_sel()
+            idx = self.sel[1]
+            if 0 <= idx < len(self.sessions):
+                self.pending_cmd = self.sessions[idx]["cmd"]
+                self.running = False
+        elif data in ("r", "R") and self.tab == 1:
             self.sessions = load_sessions(self.ctx)
             self.status_msg = "Refreshed sessions"
+
+    @staticmethod
+    def _pop_tokens(buf, fd):
+        """Parse complete key/CSI/SGR-mouse tokens without ever splitting an ESC sequence."""
+        tokens = []
+        i = 0
+        n = len(buf)
+        while i < n:
+            if buf[i] != "\x1b":
+                tokens.append(buf[i])
+                i += 1
+                continue
+            # ESC at end of buffer: wait briefly to see if a CSI/mouse sequence follows
+            if i + 1 == n:
+                rlist, _, _ = select.select([fd], [], [], 0.025)
+                if rlist:
+                    more = os.read(fd, 4096).decode("utf-8", errors="ignore")
+                    if more:
+                        buf += more
+                        n = len(buf)
+                        continue
+                tokens.append("\x1b")
+                i += 1
+                continue
+            nxt = buf[i + 1]
+            if nxt in ("[", "O"):
+                # Scan for CSI/SS3 final byte (0x40..0x7E)
+                j = i + 2
+                while j < n and not (0x40 <= ord(buf[j]) <= 0x7E):
+                    j += 1
+                if j >= n:
+                    # Incomplete sequence at buffer end; wait briefly for rest, else keep pending
+                    rlist, _, _ = select.select([fd], [], [], 0.025)
+                    if rlist:
+                        more = os.read(fd, 4096).decode("utf-8", errors="ignore")
+                        if more:
+                            buf += more
+                            n = len(buf)
+                            continue
+                    break
+                tokens.append(buf[i : j + 1])
+                i = j + 1
+            else:
+                # Alt+key two-byte sequence: consume cleanly, never treat as bare Esc
+                tokens.append(buf[i : i + 2])
+                i += 2
+        return tokens, buf[i:]
 
     def run(self):
         fd = sys.stdin.fileno()
@@ -701,6 +1214,7 @@ class MenuApp:
             sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1003h\x1b[?1006h")
             sys.stdout.flush()
             self.render()
+            pending = ""
             while self.running:
                 if resized[0]:
                     resized[0] = False
@@ -711,9 +1225,11 @@ class MenuApp:
                     continue
                 if not rlist:
                     continue
-                chunk = os.read(fd, 64).decode("utf-8", errors="ignore")
-                # Split concatenated escape sequences (e.g. fast mouse moves)
-                tokens = re.findall(r"\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[[A-Z0-9~]+|\x1b|.", chunk)
+                chunk = os.read(fd, 4096).decode("utf-8", errors="ignore")
+                if not chunk:
+                    break
+                pending += chunk
+                tokens, pending = self._pop_tokens(pending, fd)
                 for tok in tokens:
                     self.handle_key(tok)
                     if not self.running:
@@ -743,7 +1259,7 @@ def main():
             sock,
             "display-popup", "-E",
             *(["-c", client] if client else []),
-            "-x", "C", "-y", "C", "-w", "82", "-h", "23",
+            "-x", "C", "-y", "C", "-w", "84", "-h", "24",
             "-b", "rounded", "-S", "fg=#7aa2f7", "-T", " [ACF] ",
             inner,
         )
