@@ -772,6 +772,45 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
   tm send-keys -t "$chair" C-u; sleep 0.3
   tm send-keys -t "$chair" "/quit" Enter; sleep 2.5
   is "/quit closes the whole council tab, grid and all" "$(tm list-windows -F '#{window_name}' | grep -c '^council$')" 0
+
+  # ---- Alt+K inside a shared project tab (real 140x43 split stress test) -------------------------------------
+  tm resize-window -t proj -x 140 -y 43 2>/dev/null || true
+  tm set-option -w -t proj @project proj
+  code_pane=$(tm display -p -t proj '#{pane_id}')
+  code_pid=$(tm display -p -t proj '#{pane_pid}')
+  tm run-shell -b "$HOME/.local/bin/afc-council --open agents '$code_pid'"
+  for _ in $(seq 1 40); do [[ "$(tm display -p -t proj '#{window_panes}')" == 2 ]] && break; sleep 0.25; done
+  is "Alt+K in a project tab opens council as a split in that same tab" "$(tm display -p -t proj '#{window_panes}')" 2
+  sp_pane=$(tm list-panes -t proj -F '#{pane_id} #{@council_chat}' | awk '$2 == "1" {print $1; exit}')
+  for _ in $(seq 1 40); do
+    sp_pane=$(tm list-panes -t proj -F '#{pane_id} #{@council_chat}' | awk '$2 == "1" {print $1; exit}')
+    [[ -n "$sp_pane" ]] && break; sleep 0.25
+  done
+  has "... narrow split header shows compact mode, rounds, and perm (not clipped)" "$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)" 'mode: (ORDER|ROAST).* \([^)]+\).*perm: PLAN'
+  code_w=$(tm display -p -t "$code_pane" '#{pane_width}')
+  # Shift+Tab in the coding pane must NOT hijack or flip the council split's mode
+  before_mode=$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)
+  tm select-pane -t "$code_pane"; tm send-keys -K -c "$CL" BTab; sleep 0.6
+  is "Shift+Tab in a coding pane sharing a tab with council does not flip council mode" "$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)" "$before_mode"
+  # Shift+Tab inside the council split flips mode cleanly with ZERO #!# marker garbage left on screen
+  tm select-pane -t "$sp_pane"; tm send-keys -K -c "$CL" BTab
+  for _ in $(seq 1 20); do [[ "$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)" != "$before_mode" ]] && break; sleep 0.25; done
+  has "Shift+Tab in the council split switches mode" "$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)" 'mode: (ORDER|ROAST)'
+  hasnt "... leaving no raw #!# marker garbage on screen" "$(tm capture-pane -p -t "$sp_pane")" '#!#'
+  # Alt+O in the project split toggles one view inside the right column without touching the coding pane's width
+  tm send-keys -K -c "$CL" M-o
+  for _ in $(seq 1 40); do [[ "$(tm display -p -t proj '#{window_panes}')" == 3 ]] && break; sleep 0.25; done
+  is "Alt+O in a project split opens bubble one view inside the right column" "$(tm display -p -t proj '#{window_panes}')" 3
+  is "... leaving the coding pane width completely untouched" "$(tm display -p -t "$code_pane" '#{pane_width}')" "$code_w"
+  tm send-keys -K -c "$CL" M-o
+  for _ in $(seq 1 40); do [[ "$(tm display -p -t proj '#{window_panes}')" == 2 ]] && break; sleep 0.25; done
+  is "Alt+O again collapses cleanly back to the single-pane split" "$(tm display -p -t proj '#{window_panes}')" 2
+  # ✕ (agents --close) on the council split closes ONLY the council, keeps the coding pane, and clears @council
+  tm run-shell "$HOME/.local/bin/agents --close $sp_pane"
+  for _ in $(seq 1 40); do [[ "$(tm display -p -t proj '#{window_panes}')" == 1 ]] && break; sleep 0.25; done
+  is "closing the council split leaves the project coding pane intact" "$(tm display -p -t proj '#{window_panes}')" 1
+  is "... and clears stale @council from the project tab" "$(tm show-options -wqv -t proj @council 2>/dev/null)" ""
+  run "/mode order" > /dev/null
 else
   echo "  skip  Alt+K end to end (~/.local/bin/afc-council is not this folder's bin/afc-council)"
 fi

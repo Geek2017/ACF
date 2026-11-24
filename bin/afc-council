@@ -738,6 +738,18 @@ def format_menu(meeting, pane, wait=1.5):
     threading.Thread(target=go, daemon=True).start()
 
 
+def show_menu_async(pane, args, delay=0.12):
+    """Open a tmux display-menu in a background thread so command_line() finishes, chair_header()
+    updates, and chat() returns to input() before the user clicks an item."""
+    def go():
+        if delay:
+            time.sleep(delay)
+        if tmx("display-message", "-p", "-t", pane, "#{&&:#{pane_active},#{window_active}}") != "1":
+            return
+        tmx(*args)
+    threading.Thread(target=go, daemon=True).start()
+
+
 def rounds_menu(meeting, pane):
     """How many rounds, in the middle of the screen, after Open Forum or Win Stake is picked (operator,
     2026-11-24): Win Stake 1 to 12; Open Forum by its mode. Esc keeps what is set; /rounds N does the same."""
@@ -758,8 +770,8 @@ def rounds_menu(meeting, pane):
     for key, label, val in opts:
         on = (val == now) or (val == "none" and now == -1)
         items += [("• " if on else "  ") + label, key if len(key) == 1 else "", send_cmd(pane, f"/rounds {val}")]
-    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
-        "-T", f"#[align=centre]{title}", "-x", "C", "-y", "C", "--", *items)
+    show_menu_async(pane, ["display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
+                           "-T", f"#[align=centre]{title}", "-x", "C", "-y", "C", "--", *items])
 
 
 def bp_menu(meeting, pane):
@@ -784,8 +796,8 @@ def bp_menu(meeting, pane):
     adj = meeting.adjudicators()
     items += ["", "Auto-set all by seat", "a", send_cmd(pane, "/bp auto"),
               "-Judge: " + (" ".join(f"@{j.shown()} · {j.runs_on()[0]}" for j in adj) if adj else "none seated"), "", ""]
-    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
-        "-T", "#[align=centre] BP debate: who speaks (Esc when done) ", "-x", "C", "-y", "C", "--", *items)
+    show_menu_async(pane, ["display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
+                           "-T", "#[align=centre] BP debate: who speaks (Esc when done) ", "-x", "C", "-y", "C", "--", *items])
 
 
 def bp_pick_menu(meeting, pane, role):
@@ -803,8 +815,8 @@ def bp_pick_menu(meeting, pane, role):
     if not items:
         items = ["-No seated speakers besides the judge (+ add someone)", "", ""]
     name = next(r[1] for r in BP_ROLES if r[0] == role)
-    tmx("display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
-        "-T", f"#[align=centre] {name} ({role}): who? ", "-x", "C", "-y", "C", "--", *items)
+    show_menu_async(pane, ["display-menu", "-O", "-M", *(["-c", client] if client else []), "-t", pane,
+                           "-T", f"#[align=centre] {name} ({role}): who? ", "-x", "C", "-y", "C", "--", *items])
 
 
 def send_cmd_now(chair, text):
@@ -3053,6 +3065,18 @@ class Grid:
         self.me = os.environ.get("TMUX_PANE", "")
         self.panes = {}          # handle -> pane id
 
+    def alone_in_window(self):
+        """True when every pane in this window belongs to the council (dedicated tab), False when
+        sharing a project tab with coding panes."""
+        if not self.me:
+            return True
+        win = tmx("display-message", "-p", "-t", self.me, "#{window_id}")
+        if not win:
+            return True
+        rows = tmx("list-panes", "-t", win, "-F",
+                   "#{pane_id} #{?#{||:#{@council_chat},#{@council_member}},c,x}").splitlines()
+        return all(r.endswith(" c") or r.split()[0] == self.me for r in rows if r.strip())
+
     def open(self, meeting):
         with GRID_LOCK:
             self.close()
@@ -3071,8 +3095,10 @@ class Grid:
             def view_cmd(h):
                 return " ".join(shlex.quote(str(x)) for x in (ME, "--view", FEED["path"], h, os.getpid()))
 
-            if meeting.conf.get("view") == "one":
-                # one pane above the chat box with everyone's answers, the way a group chat looks
+            shared = not self.alone_in_window()
+            if meeting.conf.get("view") == "one" or shared:
+                # one pane above the chat box with everyone's answers (also always used inside a
+                # shared project tab so horizontal splits / afc-even never shrink coding panes)
                 one = tmx("split-window", "-vb", "-d", "-l", "70%", "-t", self.me, "-P", "-F", "#{pane_id}",
                           view_cmd(ALL))
                 if not one:
@@ -3088,6 +3114,8 @@ class Grid:
                 self.relabel(meeting)
                 tmx("select-pane", "-t", self.me)
                 FEED["grid"] = True
+                if shared and meeting.conf.get("view") != "one":
+                    BOX["note"] = "In a project split: using one view so coding panes stay untouched (Alt+Shift+K for a full-tab grid)."
                 return
             n = len(seated)
             rows = 1 if n <= 3 else (2 if n <= 8 else 3)
@@ -4346,6 +4374,16 @@ def command_line(line, meeting, conf, accts):
                   (" (one setting for every Gemini)" if tool == "gemini" else ""))
         note("Any name that LLM's own program takes works too (`agy models` lists Antigravity's).")
     elif cmd == "view":
+        if not args and GRID[0] and GRID[0].me and not GRID[0].alone_in_window():
+            # Inside a shared project tab, Alt+O toggles cleanly between single-pane split chat
+            # and one-view bubble chat above the 4-line box, never disturbing coding panes.
+            if FEED["grid"]:
+                GRID[0].close()
+                note("Split chat view: inline stream in one pane (Alt+O for bubble one view).")
+            else:
+                GRID[0].open(meeting)
+                note("Split one view: bubbles above the chat box (Alt+O back to single pane).")
+            return True
         want = args[0].lower() if args else ("grid" if conf.get("view") == "one" else "one")
         want = {"single": "one", "1": "one", "all": "one", "split": "grid", "panes": "grid", "each": "grid"}.get(
             want, want)
@@ -4421,9 +4459,10 @@ def open_tab(session, pid):
             tmx("select-pane", "-t", open_here[0])
             return 0
         if tmx("show-options", "-wqv", "-t", here[2], "@council") != "1":
-            subprocess.run([tmux, "split-window", "-fh", "-l", "42%", "-t", here[1],
-                            f"{shlex.quote(me)} --from-pid {pid}"])
-            return 0
+            r = subprocess.run([tmux, "split-window", "-fh", "-l", "42%", "-t", here[1],
+                                f"{shlex.quote(me)} --from-pid {pid}"])
+            if r.returncode == 0:
+                return 0
     subprocess.run([tmux, "new-window"] + target + ["-n", "council", f"{shlex.quote(me)} --from-pid {pid}"])
     return 0
 
@@ -4570,6 +4609,10 @@ def main(argv):
         return chat(meeting, members, conf, accts, folder)
     finally:
         if TABLE[0]:
+            try:
+                TABLE[0].save()
+            except Exception:  # noqa: BLE001
+                pass
             TABLE[0].close_session()
         if GRID[0]:
             GRID[0].close()
@@ -4659,6 +4702,19 @@ def chat(meeting, members, conf, accts, folder):
             continue
         finally:
             INPUT["open"] = INPUT["rl"] = False
+        if any(mk in line for mk in (KEY_CMD, KEY_MODE, KEY_VIEW, KEY_PERM, KEY_NEW)):
+            # Erase echoed internal shortcut/menu markers in plain/split mode and drop from history
+            # so Up-arrow never recalls raw #!#C#... or #!#%# tokens.
+            if TTY:
+                try:
+                    hlen = readline.get_current_history_length()
+                    if hlen > 0 and readline.get_history_item(hlen) == line:
+                        readline.remove_history_item(hlen - 1)
+                except Exception:  # noqa: BLE001
+                    pass
+                if not BOX["on"]:
+                    sys.stdout.write("\033[1A\r\033[K")
+                    sys.stdout.flush()
         m_cmd = re.search(re.escape(KEY_CMD) + r"(.*?)" + re.escape(KEY_CMD), line)
         if m_cmd:
             rest = line[:m_cmd.start()] + line[m_cmd.end():]

@@ -2156,8 +2156,16 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     if [[ -n "$(t show-options -pqv -t "$pane" @council_member 2>/dev/null)" ]]; then
       exec "$HOME/.local/bin/afc-council" --remove "$pane"
     fi
-    # The council's chat box: the council quits (/quit, so the meeting is saved), not a pane killed
+    # The council's chat box: the council quits (/quit, so the meeting is saved), not a pane killed.
+    # If a synchronous round is running in a project split, C-c stops the round first so /quit lands at once.
     if [[ -n "$(t show-options -pqv -t "$pane" @council_chat 2>/dev/null)" ]]; then
+      t send-keys -t "$pane" -l '#!#C#/quit#!#C#' \; send-keys -t "$pane" Enter
+      for _ in 1 2 3 4; do
+        t list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$pane" || exit 0
+        sleep 0.15
+      done
+      t send-keys -t "$pane" C-c
+      sleep 0.25
       t send-keys -t "$pane" -l '#!#C#/quit#!#C#' \; send-keys -t "$pane" Enter
       exit 0
     fi
