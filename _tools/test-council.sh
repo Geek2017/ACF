@@ -1144,12 +1144,41 @@ finally:
     g["Meeting"].round = orig_round
 
 # 22. tmux.conf status-bar user range names must stay <=15 chars (tmux truncates range=user|NAME at 15 chars!)
-_tc_path = os.path.join(os.path.dirname(os.path.dirname(COUNCIL)), "tmux", "tmux.conf")
+_tc_path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(sys.argv[1]))), "tmux", "tmux.conf")
 if os.path.isfile(_tc_path):
     _tc_txt = open(_tc_path).read()
     _ranges = re.findall(r"range=user\|([A-Za-z0-9_-]+)", _tc_txt)
     assert _ranges and all(len(r) <= 15 for r in _ranges), f"tmux range name >15 chars: {[(r, len(r)) for r in _ranges]}"
     assert "council_cfg" in _tc_txt and "council_settings" not in _tc_txt, "council_settings (16 chars) broke tmux click"
+
+# 23. Bug-scan regressions: per-project Judge override (no global bleed, clears stale effort, rejects unsigned-in),
+#     find()/tags() resolves active BP speakers, and @council_perm_judge guards tmux close menu
+os.environ["AFC_COUNCIL_FORCE_SUPRA"] = "1"
+try:
+    b_conf = {"agents": [], "seats": {t: False for t in ("claude", "codex", "gemini", "agy", "copilot", "opencode")},
+              "format": "bp", "bp_cast": {"PM": "claude:claude-opus-5-5", "LO": "gemini:gemini-4-neon"}}
+    partial_accts = {"claude": ("c_acct", True, T), "codex": ("x_acct", True, T), "gemini": ("g_acct", True, T)}
+    b_members = g["build_members"](b_conf, partial_accts)
+    sup = next(x for x in b_members if x.handle == "supra-omnia")
+    sup.effort = "xhigh"
+    mt_b = g["Meeting"](T, b_members, b_conf)
+    g["TABLE"][0] = mt_b
+    with _cl.redirect_stdout(_io.StringIO()):
+        g["command_line"]("/bp JUDGE gemini:gemini-4-neon", mt_b, b_conf, partial_accts)
+    assert sup.tool == "gemini" and sup.account == "g_acct" and sup.effort is None, f"stale effort/account: {sup.tool} {sup.account} {sup.effort}"
+    assert b_conf.get("judge") == "gemini:gemini-4-neon" and not b_conf.get("agents"), f"Judge bled into global agents: {b_conf}"
+    with _cl.redirect_stdout(_io.StringIO()):
+        g["command_line"]("/bp JUDGE agy:gemini-4-neon-high", mt_b, b_conf, partial_accts)
+    assert sup.tool == "gemini" and sup.account == "g_acct", f"unsigned-in provider corrupted supra: {sup.tool} {sup.account}"
+    with _cl.redirect_stdout(_io.StringIO()):
+        g["command_line"]("/bp JUDGE auto", mt_b, b_conf, partial_accts)
+    assert not b_conf.get("judge") and sup.tool == "claude" and sup.account == "c_acct", f"reset failed: {b_conf} {sup.tool}"
+    bp_tagged = g["tags"]("@neon explain your point", mt_b)
+    assert bp_tagged and bp_tagged[0].handle == "bp_lo", f"tags() failed to resolve BP speaker @neon: {bp_tagged}"
+    if os.path.isfile(_tc_path):
+        assert "@council_perm_judge" in open(_tc_path).read(), "tmux.conf missing @council_perm_judge guard"
+finally:
+    os.environ.pop("AFC_COUNCIL_FORCE_SUPRA", None)
 
 print("REGRESSIONS_OK")
 EOF
