@@ -23,6 +23,8 @@
 #   agents --view [unified|compact|classic] [pane|all]  how agents draw their chat: unified = one clean CLI UI
 #                               (checklist + 1-line bash bar) across Claude, Codex, Gemini and Antigravity;
 #                               compact = Claude's focus view; classic = native CLIs with tmux scrollbar
+#   agents --new-chat <pane>  a new split beside that one: same tool, account, mode and folder, new chat
+#                               (the + in each split's header, Alt+W)
 #
 # Project list: ~/.config/agents/projects — one per line: <name> <folder>
 # Accounts:     ~/.config/agents/accounts        — one per line: <name> <Claude config folder>   (CLAUDE_CONFIG_DIR)
@@ -969,6 +971,79 @@ pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its
   printf -v PLINE 'P\t%s\t%s\t%s\t%s\t%s' "$kind" "$acct" "$chat" "$f" "${cwd:-$HOME}"
 }
 
+# What a split needs to start again as it is (--view, --new-chat): its account, chat, mode and folder.
+# Sets RS_ACCT, RS_CHAT (id, or last / - when unknown), RS_MODE (plan | bypass | -) and RS_CWD.
+# Fails when its folder is gone.
+pane_spec() {  # agent pid, agent kind, pane pid
+  local p=$1 kind=$2 pid=$3 cm cdir adir out cmdstr
+  RS_ACCT=""; RS_CHAT=""; RS_MODE="-"; RS_CWD=""
+  if is_afc_chat "$p"; then
+    RS_ACCT=$(afc_chat_account "$p" || true)
+    RS_CHAT=$(afc_chat_val "$p" session_id || true)
+    cm=$(afc_chat_val "$p" mode || true)
+    [[ "$cm" == plan || "$cm" == bypass ]] && RS_MODE="$cm"
+    RS_CWD=$(afc_chat_val "$p" cwd || true)
+  elif [[ "$kind" == claude ]]; then
+    cdir=$(claude_dir "$p"); RS_ACCT=$(account_name "$cdir" || true)
+    RS_CHAT=$(jq -r '.sessionId // empty' "$cdir/sessions/$p.json" 2>/dev/null || true)
+    arg_after "$p" --permission-mode
+    [[ "$PV" == plan ]] && RS_MODE=plan
+    [[ "$PV" == bypassPermissions ]] && RS_MODE=bypass
+  else
+    adir=$(agent_dir "$kind" "$p"); RS_ACCT=$(tool_name "$kind" "$adir" || true)
+    out=$("$HOME/.local/bin/afc-agent-info" --chat "$kind" "$pid" 2>/dev/null || true)
+    [[ "$out" == *$TAB* ]] && RS_CHAT=${out%%$TAB*}
+    pf "$p"; cmdstr=$(tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null || true)
+    case "$kind" in
+      codex)    arg_after "$p" --sandbox; [[ "$PV" == read-only ]] && RS_MODE=plan
+                [[ " $cmdstr " == *" --dangerously-bypass-approvals-and-sandbox "* ]] && RS_MODE=bypass ;;
+      gemini)   arg_after "$p" --approval-mode; [[ "$PV" == plan ]] && RS_MODE=plan
+                [[ "$PV" == yolo ]] && RS_MODE=bypass ;;
+      agy)      arg_after "$p" --mode; [[ "$PV" == plan ]] && RS_MODE=plan
+                [[ " $cmdstr " == *" --dangerously-skip-permissions "* ]] && RS_MODE=bypass ;;
+      copilot)  arg_after "$p" --mode; [[ "$PV" == plan ]] && RS_MODE=plan
+                [[ " $cmdstr " == *" --allow-all "* || " $cmdstr " == *" --yolo "* ]] && RS_MODE=bypass ;;
+      opencode) [[ " $cmdstr " == *" --auto "* ]] && RS_MODE=bypass ;;
+    esac
+  fi
+  [[ "$RS_CHAT" =~ ^[A-Za-z0-9_.-]+$ ]] || RS_CHAT=$([[ "$kind" == claude || "$kind" == gemini || "$kind" == opencode ]] && echo last || echo "-")
+  [[ -n "$RS_CWD" && -d "$RS_CWD" ]] || { pf "$p"; RS_CWD=$(readlink "$PROC/$p/cwd" 2>/dev/null || true); }
+  [[ -d "$RS_CWD" ]]
+}
+
+# A tab holds at most GRID_COLS x GRID_ROWS splits (operator, 2026-11-25): the first GRID_COLS side by side,
+# then each further one goes under a column, left to right, halving it. Minimised splits live in
+# another tab and do not count.
+GRID_COLS=3; GRID_ROWS=2
+grid_slot() {  # pane id -> GS_HOW (split-window flag) and GS_TARGET (pane to split) for the next split
+               # in that pane's tab; fails when the tab is full (GS_FULL says so)
+  local win r left top id
+  local -a rows order
+  local -A cnt first
+  GS_HOW=""; GS_TARGET=""; GS_FULL="This tab is full: $((GRID_COLS * GRID_ROWS)) splits ($GRID_COLS x $GRID_ROWS). Close or minimise one first."
+  win=$(t display -p -t "$1" '#{window_id}' 2>/dev/null) || return 1
+  mapfile -t rows < <(t list-panes -t "$win" -F '#{pane_left} #{pane_top} #{pane_id}' 2>/dev/null | sort -n -k1,1 -k2,2)
+  (( ${#rows[@]} > 0 && ${#rows[@]} < GRID_COLS * GRID_ROWS )) || return 1
+  for r in "${rows[@]}"; do      # columns: panes that share a left edge, left to right, each with its top pane
+    read -r left top id <<< "$r"
+    if [[ -z "${cnt[$left]:-}" ]]; then order+=("$left"); first[$left]=$id; cnt[$left]=0; fi
+    cnt[$left]=$(( cnt[$left] + 1 ))
+  done
+  if (( ${#order[@]} < GRID_COLS )); then GS_HOW=-fh; GS_TARGET=$1; return 0; fi   # a new column at the right
+  for left in "${order[@]}"; do                                                     # else under the first column with room
+    if (( cnt[$left] < GRID_ROWS )); then GS_HOW=-v; GS_TARGET=${first[$left]}; return 0; fi
+  done
+  return 1
+}
+grid_below() {  # pane id -> the same, for "split below this one" (Alt+-): below it while its column has room
+  local left n
+  grid_slot "$1" || return 1
+  left=$(t display -p -t "$1" '#{pane_left}' 2>/dev/null) || return 0
+  n=$(t list-panes -t "$1" -F '#{pane_left}' 2>/dev/null | grep -cx -- "$left" || true)
+  if (( n < GRID_ROWS )); then GS_HOW=-v; GS_TARGET=$1; fi
+  return 0
+}
+
 layout_scan() {  # prints the running fleet as W and P lines; fails when it cannot be read whole
   local wins panes hidden win name project layout council w pid flag id PLINE
   local -a plines
@@ -1564,9 +1639,9 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
             copilot:-) tool_run copilot "$acct" "${plan[@]}" || true ;;
             copilot:*) tool_run copilot "$acct" "${plan[@]}" --resume="$chat" || true ;;
             # the folder's last chat; when there is none OpenCode starts a new one itself
-            opencode:last) began=$SECONDS; tool_run opencode "$acct" --standalone --continue || (( SECONDS - began > 10 )) || tool_run opencode "$acct" --standalone || true ;;
-            opencode:-)    tool_run opencode "$acct" --standalone || true ;;
-            opencode:*)    tool_run opencode "$acct" --standalone --session "$chat" || true ;;
+            opencode:last) began=$SECONDS; tool_run opencode "$acct" --standalone "${plan[@]}" --continue || (( SECONDS - began > 10 )) || tool_run opencode "$acct" --standalone "${plan[@]}" || true ;;
+            opencode:-)    tool_run opencode "$acct" --standalone "${plan[@]}" || true ;;
+            opencode:*)    tool_run opencode "$acct" --standalone "${plan[@]}" --session "$chat" || true ;;
             # the folder's latest chat; when there is none Gemini stops at once, and a new chat starts instead
             gemini:last) began=$SECONDS; tool_run gemini "$acct" "${plan[@]}" "${rmodel[@]}" --resume latest || (( SECONDS - began > 10 )) || tool_run gemini "$acct" "${plan[@]}" "${rmodel[@]}" || true ;;
             gemini:-) tool_run gemini "$acct" "${plan[@]}" "${rmodel[@]}" || true ;;
@@ -1794,9 +1869,16 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     # pane's row or column only, so top/bottom stacks survive (even-horizontal flattened them). Not
     # tmux's select-layout -E: in 3.8 it leaves a stacked column out of a row's count and pushes it
     # past the tab's edge, so a split below made both halves vanish.
-    if [[ "$menu" == --split-down ]]; then where="below"; how="-v"; else where="to the right"; how="-fh"; fi
+    # Where it goes follows the tab's 3 x 2 grid (grid_slot): a new column while there are fewer than 3,
+    # then under the columns, left to right; Alt+- goes below this pane while its column has room.
+    if [[ "$menu" == --split-down ]]; then grid_below "%$pane"; else grid_slot "%$pane"; fi ||
+      { t display-message -d 4000 -c "$client" "$GS_FULL" 2>/dev/null || echo "$GS_FULL"; exit 0; }
+    how=$GS_HOW; tgt=$GS_TARGET
+    if [[ "$how" == -fh ]]; then where="to the right"
+    elif [[ "$tgt" == "%$pane" ]]; then where="below"
+    else where="under $(t display -p -t "$tgt" '#{pane_index}' 2>/dev/null | sed 's/^/split /')"; fi
     even="run-shell -b '$HOME/.local/bin/afc-even --window $win'"
-    split() { echo "split-window $how -t %$pane '$self --pane $1 $pid${2:+ $2}' ; $even"; }
+    split() { echo "split-window $how -t $tgt '$self --pane $1 $pid${2:+ $2}' ; $even"; }
     again() { echo "run-shell -b \"$self $menu '$client' $pane $pid $1\""; }
     case "${5:-}" in
       "")
@@ -2105,46 +2187,39 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       # Switching between classic and compact only affects Claude panes (unless returning from afc-chat)
       if [[ "$want" != unified && "$kind" != claude && $in_chat == 0 ]]; then continue; fi
       if [[ "$busy" == 1 ]]; then busy_n=$((busy_n + 1)); continue; fi
-      acct=""; chat=""; pmode="-"; cwd=""
-      if (( in_chat )); then
-        acct=$(afc_chat_account "$p" || true)
-        chat=$(afc_chat_val "$p" session_id || true)
-        cm=$(afc_chat_val "$p" mode || true)
-        [[ "$cm" == plan || "$cm" == bypass ]] && pmode="$cm"
-        cwd=$(afc_chat_val "$p" cwd || true)
-      else
-        if [[ "$kind" == claude ]]; then
-          cdir=$(claude_dir "$p"); acct=$(account_name "$cdir" || true)
-          chat=$(jq -r '.sessionId // empty' "$cdir/sessions/$p.json" 2>/dev/null || true)
-          arg_after "$p" --permission-mode
-          [[ "$PV" == plan ]] && pmode=plan
-          [[ "$PV" == bypassPermissions ]] && pmode=bypass
-        else
-          adir=$(agent_dir "$kind" "$p"); acct=$(tool_name "$kind" "$adir" || true)
-          out=$("$HOME/.local/bin/afc-agent-info" --chat "$kind" "$pid" 2>/dev/null || true)
-          [[ "$out" == *$TAB* ]] && chat=${out%%$TAB*}
-          pf "$p"; cmdstr=$(tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null || true)
-          case "$kind" in
-            codex)    arg_after "$p" --sandbox; [[ "$PV" == read-only ]] && pmode=plan
-                      [[ " $cmdstr " == *" --dangerously-bypass-approvals-and-sandbox "* ]] && pmode=bypass ;;
-            gemini)   arg_after "$p" --approval-mode; [[ "$PV" == plan ]] && pmode=plan
-                      [[ "$PV" == yolo ]] && pmode=bypass ;;
-            agy)      arg_after "$p" --mode; [[ "$PV" == plan ]] && pmode=plan
-                      [[ " $cmdstr " == *" --dangerously-skip-permissions "* ]] && pmode=bypass ;;
-            copilot)  arg_after "$p" --mode; [[ "$PV" == plan ]] && pmode=plan
-                      [[ " $cmdstr " == *" --allow-all "* || " $cmdstr " == *" --yolo "* ]] && pmode=bypass ;;
-            opencode) [[ " $cmdstr " == *" --auto "* ]] && pmode=bypass ;;
-          esac
-        fi
-      fi
-      [[ "$chat" =~ ^[A-Za-z0-9_.-]+$ ]] || chat=$([[ "$kind" == claude || "$kind" == gemini || "$kind" == opencode ]] && echo last || echo "-")
-      [[ -n "$cwd" && -d "$cwd" ]] || { pf "$p"; cwd=$(readlink "$PROC/$p/cwd" 2>/dev/null || true); }
-      [[ -d "$cwd" ]] || continue
-      t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$cwd" "$HOME/.local/bin/agents --pane restore 0 $kind ${acct:--} $chat $pmode 0"
+      pane_spec "$p" "$kind" "$pid" || continue
+      t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$RS_CWD" "$HOME/.local/bin/agents --pane restore 0 $kind ${RS_ACCT:--} $RS_CHAT $RS_MODE 0"
       done_n=$((done_n + 1))
     done < <(t list-panes -a -F $'#{pane_id}\t#{pane_pid}\t#{?#{@busy},#{@busy},0}')
     echo "$done_n pane(s) restarted in the $want view, each in its own chat."
     if (( busy_n )); then echo "$busy_n left alone: working now. They get it at their next start, or run this again when they are done."; fi
+    ;;
+  --new-chat)
+    # The + in a split's header, or Alt+W: a new split (where the tab's 3 x 2 grid has room) with the same agent on
+    # a new chat: same tool, account, mode (plan / bypass) and folder. This split and its chat stay as
+    # they are. The memory and CPU walls apply as for any new split. Council panes have their own.
+    # Usage: agents --new-chat <pane-id>
+    pane="${2:?pane id}"
+    say() { t display-message -d 4000 -t "$pane" "$1" 2>/dev/null || echo "$1"; }
+    pid=$(t display -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)
+    [[ "$pid" =~ ^[0-9]+$ ]] || { echo "No such split: $pane" >&2; exit 1; }
+    council=$(t display -p -t "$pane" '#{||:#{@council_chat},#{@council_member}}' 2>/dev/null || true)
+    [[ "$council" != 1 ]] || { say "A council pane: use the council's own menu."; exit 0; }
+    read -r p kind < <(pane_agent "$pid") || { say "No agent in this split: use Alt+\\ to pick one."; exit 0; }
+    [[ "$kind" =~ ^(claude|codex|gemini|agy|copilot|opencode)$ ]] || { say "No agent in this split: use Alt+\\ to pick one."; exit 0; }
+    pane_spec "$p" "$kind" "$pid" || { say "Its folder is gone, so no new chat was started."; exit 0; }
+    case "$kind:$RS_MODE" in      # the --pane names for that tool in that mode
+      claude:-)      what=claude ;;
+      claude:*)      what=$RS_MODE ;;   # plan | bypass
+      opencode:plan) what=opencode ;;   # OpenCode has no plan mode
+      *:-)           what=$kind ;;
+      *)             what="$kind-$RS_MODE" ;;
+    esac
+    win=$(t display -p -t "$pane" '#{window_id}')
+    [[ "$RS_ACCT" =~ ^[A-Za-z0-9_.-]+$ ]] || RS_ACCT=""
+    grid_slot "$pane" || { say "$GS_FULL"; exit 0; }    # the tab's 3 x 2 grid decides where it goes
+    t split-window "$GS_HOW" -t "$GS_TARGET" -c "$RS_CWD" "$HOME/.local/bin/agents --pane $what $pid${RS_ACCT:+ $RS_ACCT}" \; \
+      run-shell -b "$HOME/.local/bin/afc-even --window $win"
     ;;
   --close)
     # Alt+Q, after its y/n: close that pane. When it is the last pane of a project tab (@project), the

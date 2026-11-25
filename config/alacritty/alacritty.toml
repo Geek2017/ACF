@@ -60,4 +60,8 @@ log_level = "Error"
 [keyboard]
 bindings = [
   { key = "Escape", mods = "Super", chars = "\u001b[99~" },
+  # Alt+W: new chat beside this split (tmux user-keys[3] -> agents --new-chat). Sent as its own
+  # code so no keyboard protocol or input method can turn it into something tmux reads differently.
+  { key = "W", mods = "Alt", chars = "\u001b[96~" },
+  { key = "W", mods = "Alt|Shift", chars = "\u001b[96~" },
 ]
