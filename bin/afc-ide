@@ -1,0 +1,1539 @@
+#!/usr/bin/env -S python3 -I
+"""afc-ide: a small code view of a project folder: the code on the left, its files on the right.
+
+Only view, edit and delete: no run, no build, no extensions. The code is coloured by language: Python,
+shell, JavaScript/TypeScript, C-like (C, Go, Rust, Java...), PowerShell, SQL, config files, JSON, Markdown.
+
+  afc-ide [FOLDER] [FILE]   the tree starts at FOLDER (default: here); FILE opens at once
+  Alt+I in the fleet opens it in a popup on the pane's folder.
+
+Code                                         Files (the tree on the right)
+  arrows Home End PgUp PgDn   move             Up/Down       move
+  Ctrl+Left/Right             word             Enter, Right  open the file / open the folder
+  Ctrl+Home/End               top / bottom     Left          close the folder / go up
+  typing Enter Tab            edit             Delete        delete the file (asks first)
+  Backspace Delete            delete a char
+  Ctrl+K                      delete the line
+  Ctrl+Z / Ctrl+Y             undo / redo
+  Ctrl+S save    Ctrl+W close the tab    Ctrl+PgUp/PgDn  other tab    Alt+Z  long lines wrap or not
+  Ctrl+F find in the file: type, Enter / ↓ / Ctrl+F next, ↑ previous, Esc closes (the cursor stays on
+         the match). Lower-case text matches any case; with a capital it matches exactly.
+  Ctrl+E or Esc  between code and files  Ctrl+Q  quit (asks when something is not saved)
+The mouse: click a file, a tab or a place in the code; the wheel scrolls. Drag a scrollbar (the code's
+right edge, the files' right edge) or click in it. Drag the line between code and files to resize
+them. ☰ (top right) hides the files and brings them back (Ctrl+E brings them back too).
+  afc-ide --open CLIENT [FOLDER]   open it full screen in a tmux popup on that client (Alt+I does)
+  afc-ide --client NAME            (inside that popup) when the window grows, reopen at the new size
+                                   with everything as it was: a tmux popup cannot grow by itself
+"""
+import codecs, json, os, re, select, shlex, shutil, signal, subprocess, sys, termios, time, tty, unicodedata
+
+TABW = 4                        # columns a tab shows as
+MAX_BYTES = 2 * 1024 * 1024     # bigger files are not opened
+MAX_DIR = 3000                  # entries listed per folder
+MAX_UNDO = 300
+HIDDEN = {".git"}               # never listed
+ESC_WAIT = 0.04                 # a lone Esc: nothing more came within this many seconds
+
+C = {   # colours (24-bit), the fleet's palette
+    "text": "\x1b[38;2;192;202;245m", "dim": "\x1b[38;2;86;95;137m", "gutter": "\x1b[38;2;59;66;97m",
+    "lnum": "\x1b[38;2;192;202;245;1m", "dir": "\x1b[38;2;122;162;247m", "file": "\x1b[38;2;169;177;214m",
+    "warn": "\x1b[38;2;224;175;104m", "bad": "\x1b[38;2;247;118;142m", "ok": "\x1b[38;2;158;206;106m",
+    "sel": "\x1b[48;2;46;60;100m", "sel2": "\x1b[48;2;41;46;66m", "bar": "\x1b[48;2;31;35;53m",
+    "tab": "\x1b[48;2;36;40;59m\x1b[38;2;192;202;245;1m", "line": "\x1b[48;2;30;32;48m", "off": "\x1b[0m",
+    "track": "\x1b[48;2;36;40;59m", "thumb": "\x1b[48;2;86;95;137m", "thumb_on": "\x1b[48;2;122;162;247m",
+}
+BURGER = " ☰ "                  # top right: hides the files, or brings them back
+TREE_MIN, CODE_MIN = 12, 30     # the narrowest the files and the code may be dragged
+
+
+# ---------------------------------------------------------------------------------------------
+# text width: tabs, wide (CJK) characters, control characters
+
+def char_w(ch):
+    if ch < " " or ch == "\x7f" or "\ud800" <= ch <= "\udfff":
+        return 1                                    # shown as "?"
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def col_of(line, idx):
+    """Display column where character idx of line starts."""
+    col = 0
+    for ch in line[:idx]:
+        col = (col // TABW + 1) * TABW if ch == "\t" else col + char_w(ch)
+    return col
+
+
+def idx_at(line, col):
+    """Index of the character shown at display column col (len(line) past the end)."""
+    c = 0
+    for i, ch in enumerate(line):
+        nxt = (c // TABW + 1) * TABW if ch == "\t" else c + char_w(ch)
+        if col < nxt:
+            return i if col - c < (nxt - c + 1) // 2 or ch == "\t" else i + 1
+        c = nxt
+    return len(line)
+
+
+def cells(line, left, width):
+    """(index of the character, what to show, its columns) for what line shows in columns [left, left + width)."""
+    c = 0
+    for i, ch in enumerate(line):
+        if c >= left + width:
+            break
+        if ch == "\t":
+            nxt = (c // TABW + 1) * TABW
+            n = max(0, min(nxt, left + width) - max(c, left))
+            if n:
+                yield i, " " * n, n
+            c = nxt
+            continue
+        w = char_w(ch)
+        if c >= left and c + w <= left + width:
+            yield i, ("?" if (ch < " " or ch == "\x7f" or "\ud800" <= ch <= "\udfff") else ch), w
+        elif c < left < c + w or (c >= left and c + w > left + width):
+            n = max(0, min(c + w, left + width) - max(c, left))    # a wide char cut at an edge
+            if n:
+                yield i, " " * n, n
+        c += w
+
+
+def visible(line, left, width):
+    """The part of line shown in display columns [left, left + width)."""
+    return "".join(t for _, t, _ in cells(line, left, width))
+
+
+def paint(line, spans, left, width):
+    """Like visible(), in the colours of spans [(start, end, colour)], padded to width columns."""
+    cols = [None] * len(line)
+    for a, b, col in spans:
+        for k in range(max(0, a), min(b, len(line))):
+            cols[k] = col
+    out, cur, used = [], None, 0
+    for i, text, w in cells(line, left, width):
+        col = cols[i] or HL["text"]
+        if col != cur:
+            out.append(col)
+            cur = col
+        out.append(text)
+        used += w
+    return "".join(out) + HL["text"] + " " * max(0, width - used)
+
+
+MAX_WRAP = 20000        # longer lines do not wrap (they scroll sideways)
+
+
+def wrap_points(line, width):
+    """Where a line goes on to the next screen row at width columns: [(char index, display column), ...].
+    A wide character or a tab that does not fit goes whole to the next row."""
+    pts = [(0, 0)]
+    if width < 2 or len(line) > MAX_WRAP:
+        return pts
+    c = start = 0
+    for i, ch in enumerate(line):
+        w = (c // TABW + 1) * TABW - c if ch == "\t" else char_w(ch)
+        if c + w > start + width and c > start:
+            pts.append((i, c))
+            start = c
+        c += w
+    return pts
+
+
+def seg_index(pts, idx):
+    """Which wrapped row of its line character idx is on."""
+    k = 0
+    while k + 1 < len(pts) and pts[k + 1][0] <= idx:
+        k += 1
+    return k
+
+
+def slider(total, top, view, rows):
+    """For each of rows screen rows, True where the scrollbar's slider is; None when everything fits."""
+    if rows < 1 or total <= view:
+        return None
+    size = max(1, min(rows, rows * view // max(1, total)))
+    start = min(rows - size, round(top * (rows - size) / max(1, total - view)))
+    return [start <= r < start + size for r in range(rows)]
+
+
+# ---------------------------------------------------------------------------------------------
+# colours for code (syntax highlighting): a small scanner per language, one line at a time. A line
+# hands a state to the next one (inside a block comment, a multi-line string or a code fence).
+
+def rgb(r, g, b, extra=""):
+    return f"\x1b[0;38;2;{r};{g};{b}{extra}m"   # starts with 0: no bold or italic left over
+
+
+HL = {"text": rgb(192, 202, 245), "kw": rgb(187, 154, 247), "str": rgb(158, 206, 106), "com": rgb(86, 95, 137, ";3"),
+      "num": rgb(255, 158, 100), "fn": rgb(122, 162, 247), "bi": rgb(42, 195, 222), "var": rgb(224, 175, 104),
+      "op": rgb(137, 221, 255), "key": rgb(115, 218, 202), "head": rgb(122, 162, 247, ";1"),
+      "bold": rgb(224, 175, 104, ";1"), "link": rgb(42, 195, 222, ";4"), "code": rgb(158, 206, 106)}
+MAX_HL_LINE = 2000      # longer lines (minified files) are shown without colours
+HL["hit"] = "\x1b[0;38;2;192;202;245;48;2;61;89;161m"         # a match of Ctrl+F
+HL["hit_on"] = "\x1b[0;38;2;26;27;38;48;2;224;175;104m"       # the match the cursor is on
+MAX_HITS = 10000        # Ctrl+F stops counting here
+
+W = lambda s: frozenset(s.split())
+PY_KW = W("and as assert async await break class continue def del elif else except finally for from global if import "
+          "in is lambda nonlocal not or pass raise return try while with yield match case")
+SH_KW = W("if then else elif fi for while until do done case esac in function return local export readonly declare "
+          "unset shift exit break continue source eval exec trap select")
+JS_KW = W("break case catch class const continue debugger default delete do else export extends finally for function if "
+          "import in instanceof let new return super switch this throw try typeof var void while with yield async await of "
+          "from as interface type enum implements private public protected readonly static")
+C_KW = W("if else for while do switch case default break continue return goto struct union enum typedef static const extern "
+         "void int char long short unsigned signed float double bool auto volatile sizeof inline func package import type var "
+         "go defer chan map range select interface fn let mut impl trait pub use mod match loop where crate class public private "
+         "protected new this try catch throw namespace using template typename virtual override")
+PS_KW = W("begin break catch class continue data do dynamicparam else elseif end exit filter finally for foreach from function "
+          "if in param process return switch throw trap try until using while")
+SQL_KW = W("select from where and or not insert into values update set delete create table alter drop index on join left right "
+           "inner outer full group by order having limit offset as distinct union all exists in is primary key foreign references "
+           "default unique begin commit rollback view function returns return language if then else end case when grant revoke "
+           "to with replace cascade constraint check add column")
+CONSTS = W("True False None true false null nil NULL nullptr undefined NaN Infinity on off yes no")
+BUILTINS = W("print len range open str int float dict list set tuple isinstance super enumerate zip min max sorted any all "
+             "getattr hasattr setattr type repr bool bytes iter next sum abs round format echo printf read cd pwd test kill "
+             "wait mapfile command console require self cls")
+
+LANGS = {   # name: comment starts, block comment, quotes (multi-line ones), keywords, ignore case, $variables
+    "Python": dict(line=("#",), quotes=('"""', "'''", '"', "'"), multi=('"""', "'''"), kw=PY_KW),
+    "Shell": dict(line=("#",), quotes=('"', "'", "`"), kw=SH_KW, var=True),
+    "JavaScript": dict(line=("//",), block=("/*", "*/"), quotes=("`", '"', "'"), multi=("`",), kw=JS_KW),
+    "C-like": dict(line=("//",), block=("/*", "*/"), quotes=('"', "'"), kw=C_KW),
+    "PowerShell": dict(line=("#",), block=("<#", "#>"), quotes=('"', "'"), kw=PS_KW, ci=True, var=True),
+    "SQL": dict(line=("--",), block=("/*", "*/"), quotes=("'", '"'), kw=SQL_KW, ci=True),
+    "Config": dict(line=("#", ";"), quotes=('"', "'"), kw=frozenset(), conf=True),
+    "JSON": dict(line=(), quotes=('"',), kw=frozenset(), json=True),
+}
+EXT = {".py": "Python", ".pyw": "Python", ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell", ".js": "JavaScript",
+       ".mjs": "JavaScript", ".cjs": "JavaScript", ".ts": "JavaScript", ".tsx": "JavaScript", ".jsx": "JavaScript",
+       ".c": "C-like", ".h": "C-like", ".cpp": "C-like", ".hpp": "C-like", ".cc": "C-like", ".go": "C-like",
+       ".rs": "C-like", ".java": "C-like", ".cs": "C-like", ".kt": "C-like", ".swift": "C-like", ".css": "C-like",
+       ".scss": "C-like", ".ps1": "PowerShell", ".psm1": "PowerShell", ".psd1": "PowerShell", ".sql": "SQL",
+       ".toml": "Config", ".ini": "Config", ".cfg": "Config", ".conf": "Config", ".service": "Config",
+       ".slice": "Config", ".timer": "Config", ".desktop": "Config", ".yaml": "Config", ".yml": "Config",
+       ".env": "Config", ".json": "JSON", ".jsonc": "JSON", ".md": "Markdown", ".markdown": "Markdown"}
+
+WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+PSCMD = re.compile(r"[A-Za-z]+-[A-Za-z]+")                                  # PowerShell: Get-Content
+NUM = re.compile(r"0[xX][0-9a-fA-F_]+|\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?")
+VAR = re.compile(r"\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_:]*|\$[@#?*0-9!$-]")
+KEYLINE = re.compile(r"^(\s*-?\s*)([\w.@\"'-]+)(\s*)([=:])(?!:)")          # key = value, key: value
+SECTION = re.compile(r"^\s*\[[^\]]+\]\s*$")
+OPS = frozenset("=+-*/%<>!&|^~?:")
+
+
+def language(path, first):
+    """The language of a file, from its name, else its first line (#!), else None (plain text)."""
+    name = os.path.basename(path).lower()
+    ext = os.path.splitext(name)[1]
+    if ext in EXT:
+        return EXT[ext]
+    if name in (".bashrc", ".zshrc", ".profile", ".bash_profile", ".bash_aliases"):
+        return "Shell"
+    if name in ("tmux.conf", ".tmux.conf", ".editorconfig", "settings") or name.endswith("rc"):
+        return "Config"
+    if first.startswith("#!"):
+        for key, lang in (("python", "Python"), ("bash", "Shell"), ("/sh", "Shell"), (" sh", "Shell"), ("zsh", "Shell"),
+                          ("node", "JavaScript"), ("pwsh", "PowerShell")):
+            if key in first:
+                return lang
+    return None
+
+
+def close_quote(text, i, q, escapes=True):
+    """Index just past the quote q that closes the string opened before i, or -1."""
+    while True:
+        j = text.find(q, i)
+        if j < 0:
+            return -1
+        k, n = j - 1, 0
+        while escapes and k >= i and text[k] == "\\":
+            n, k = n + 1, k - 1
+        if n % 2 == 0:
+            return j + len(q)
+        i = j + 1
+
+
+def scan(lang, text, state):
+    """(spans, state for the next line) of one line of code."""
+    if lang is None or len(text) > MAX_HL_LINE:
+        return [], state
+    if lang == "Markdown":
+        return scan_md(text, state)
+    L = LANGS[lang]
+    spans, i, n, prev = [], 0, len(text), ""
+    if state:                                           # still inside a block comment or a string
+        end, col = state
+        j = close_quote(text, 0, end, escapes=col == HL["str"]) if col == HL["str"] else text.find(end)
+        if j < 0:
+            return [(0, n, col)], state
+        j = j if col == HL["str"] else j + len(end)
+        spans.append((0, j, col))
+        i, state = j, None
+    if L.get("conf"):
+        if SECTION.match(text):
+            return [(0, n, HL["kw"])], None
+        m = KEYLINE.match(text)
+        if m and not text.lstrip().startswith(("#", ";")):
+            spans.append((m.start(2), m.end(2), HL["key"]))
+            spans.append((m.start(4), m.end(4), HL["op"]))
+            i = max(i, m.end(4))
+        elif text[:1].isalpha():                        # tmux.conf, .gitignore: the first word is the command
+            w = WORD.match(text)
+            if w:
+                spans.append((0, w.end(), HL["kw"]))
+                i = w.end()
+    while i < n:
+        c = text[i]
+        if c in " \t":
+            i += 1
+            continue
+        hit = next((p for p in L["line"] if text.startswith(p, i)), None)
+        if hit and (hit != "#" or i == 0 or text[i - 1] in " \t") and (hit != ";" or not text[:i].strip()):
+            spans.append((i, n, HL["com"]))
+            return spans, None
+        blk = L.get("block")
+        if blk and text.startswith(blk[0], i):
+            j = text.find(blk[1], i + len(blk[0]))
+            if j < 0:
+                spans.append((i, n, HL["com"]))
+                return spans, (blk[1], HL["com"])
+            spans.append((i, j + len(blk[1]), HL["com"]))
+            i = j + len(blk[1])
+            continue
+        q = next((q for q in L["quotes"] if text.startswith(q, i)), None)
+        if q:
+            j = close_quote(text, i + len(q), q, escapes=not (lang == "Shell" and q == "'"))
+            if j < 0:
+                spans.append((i, n, HL["str"]))
+                return spans, ((q, HL["str"]) if q in L.get("multi", ()) else None)
+            col = HL["str"]
+            if L.get("json") and text[j:].lstrip().startswith(":"):
+                col = HL["key"]
+            spans.append((i, j, col))
+            i = j
+            continue
+        if L.get("var") and c == "$":
+            m = VAR.match(text, i)
+            if m:
+                spans.append((i, m.end(), HL["var"]))
+                i = m.end()
+                continue
+        if c == "@" and lang == "Python":
+            m = WORD.match(text, i + 1)
+            if m:
+                spans.append((i, m.end(), HL["var"]))
+                i = m.end()
+                continue
+        if c.isdigit() and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            m = NUM.match(text, i)
+            spans.append((i, m.end(), HL["num"]))
+            i = m.end()
+            continue
+        if lang == "PowerShell":
+            m = PSCMD.match(text, i)
+            if m and (i == 0 or not text[i - 1].isalnum()):
+                spans.append((i, m.end(), HL["kw" if text[i - 1:i] == "-" else "fn"]))
+                i = m.end()
+                continue
+        m = WORD.match(text, i)
+        if m:
+            w = m.group()
+            key = w.lower() if L.get("ci") else w
+            after = text[m.end():].lstrip()[:1]
+            nxt = text[m.end():m.end() + 1]
+            if lang == "Python" and w.lower() in ("r", "f", "b", "rb", "br", "fr", "rf", "u") and nxt and nxt in "\"'":
+                i = m.end()                             # the string prefix goes with the string
+                spans.append((m.start(), m.end(), HL["str"]))
+                continue
+            col = (HL["kw"] if key in L["kw"] else HL["num"] if w in CONSTS else
+                   HL["fn"] if prev in ("def", "function", "fn", "func", "class") or after == "(" else
+                   HL["bi"] if w in BUILTINS else None)
+            if col:
+                spans.append((m.start(), m.end(), col))
+            prev = w
+            i = m.end()
+            continue
+        if c in OPS:
+            spans.append((i, i + 1, HL["op"]))
+        i += 1
+    return spans, None
+
+
+MD_INLINE = re.compile(r"(`[^`]+`)|(\*\*[^*]+\*\*|__[^_]+__)|(\[[^\]]*\]\([^)]*\))")
+
+
+def scan_md(text, state):
+    """Markdown: headings, quotes, lists, code fences and spans, bold, links, table bars."""
+    n, s = len(text), text.lstrip()
+    if s.startswith(("```", "~~~")):
+        return [(0, n, HL["com"])], (None if state else ("fence", HL["code"]))
+    if state:
+        return [(0, n, HL["code"])], state
+    if s.startswith("#"):
+        return [(0, n, HL["head"])], None
+    if s.startswith(">"):
+        return [(0, n, HL["com"])], None
+    spans = []
+    m = re.match(r"^(\s*)([-*+]|\d+[.)])\s", text)
+    if m:
+        spans.append((m.start(2), m.end(2), HL["num"]))
+    for m in MD_INLINE.finditer(text):
+        col = HL["code"] if m.group(1) else HL["bold"] if m.group(2) else HL["link"]
+        spans.append((m.start(), m.end(), col))
+    if s.startswith("|"):
+        spans.extend((k, k + 1, HL["op"]) for k, ch in enumerate(text) if ch == "|")
+    return spans, None
+
+
+def fit(text, width):
+    """text cut or padded to exactly width display columns."""
+    s = visible(text, 0, width)
+    return s + " " * max(0, width - col_of(s, len(s)))
+
+
+# ---------------------------------------------------------------------------------------------
+# Ctrl+F: find in the file
+
+def find_all(lines, q):
+    """Every match of q: [(line, start, end)], in order, at most MAX_HITS. Lower-case q ignores case."""
+    if not q:
+        return []
+    fold = q == q.lower()
+    hits = []
+    for n, line in enumerate(lines):
+        text = line.lower() if fold else line
+        i = text.find(q)
+        while i >= 0:
+            hits.append((n, i, i + len(q)))
+            if len(hits) >= MAX_HITS:
+                return hits
+            i = text.find(q, i + max(1, len(q)))
+    return hits
+
+
+def hit_from(hits, pos, back=False, same=True):
+    """Index of the first match at pos or after it (before it when back), going round the file; None if none.
+    same=False: a match starting exactly at pos does not count (Enter goes on to the next one)."""
+    if not hits:
+        return None
+    keys = [(n, a) for n, a, _ in hits]
+    if back:
+        for i in range(len(keys) - 1, -1, -1):
+            if keys[i] < pos or (same and keys[i] == pos):
+                return i
+        return len(keys) - 1
+    for i, k in enumerate(keys):
+        if k > pos or (same and k == pos):
+            return i
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------
+# one open file
+
+class Doc:
+    def __init__(self, path, text, mtime):
+        self.path = path
+        self.crlf = "\r\n" in text
+        self.lines = (text.replace("\r\n", "\n") if self.crlf else text).split("\n")
+        self.indent = "\t" if sum(1 for l in self.lines[:2000] if l.startswith("\t")) > \
+            sum(1 for l in self.lines[:2000] if l.startswith("    ")) else " " * TABW
+        self.mtime = mtime
+        self.cy = self.cx = self.top = self.left = 0
+        self.tseg = 0                   # the first screen row shows this wrapped row of line top
+        self.want = None                # display column kept while moving up and down
+        self.modified = False
+        self.undo, self.redo = [], []
+        self.last = None                # the kind of the last edit, to group typing into one undo step
+        self.typed = 0
+        self.lang = language(path, self.lines[0])
+        self.states = [None]            # the scanner's state at the start of each line, known this far
+
+    def spans(self, n):
+        """The colour spans of line n (the states of the lines above it are worked out once, then kept)."""
+        while len(self.states) <= n:
+            k = len(self.states) - 1
+            self.states.append(scan(self.lang, self.lines[k], self.states[k])[1])
+        return scan(self.lang, self.lines[n], self.states[n])[0]
+
+    def changed_from(self, n):
+        """Lines from n down may now start in another state (an edit there)."""
+        del self.states[max(1, n + 1):]
+
+    def text(self):
+        t = "\n".join(self.lines)
+        return t.replace("\n", "\r\n") if self.crlf else t
+
+    # -- undo ---------------------------------------------------------------------------------
+    def snap(self, kind):
+        self.changed_from(self.cy - 1)          # Backspace at a line start changes the line above
+        if kind in ("type", "bs", "del") and kind == self.last and self.typed < 30:
+            self.typed += 1
+            return
+        self.undo.append((list(self.lines), self.cy, self.cx))
+        del self.undo[:-MAX_UNDO]
+        self.redo.clear()
+        self.last, self.typed = kind, 0
+
+    def step(self, back):
+        src, dst = (self.undo, self.redo) if back else (self.redo, self.undo)
+        if not src:
+            return False
+        dst.append((list(self.lines), self.cy, self.cx))
+        self.lines, self.cy, self.cx = src.pop()
+        self.lines = list(self.lines)
+        self.changed_from(0)
+        self.modified, self.last, self.want = True, None, None
+        return True
+
+    # -- edits --------------------------------------------------------------------------------
+    def insert(self, text, kind="type"):
+        self.snap(kind)
+        line = self.lines[self.cy]
+        parts = text.split("\n")
+        if len(parts) == 1:
+            self.lines[self.cy] = line[:self.cx] + text + line[self.cx:]
+            self.cx += len(text)
+        else:
+            tail = line[self.cx:]
+            new = [line[:self.cx] + parts[0]] + parts[1:-1] + [parts[-1] + tail]
+            self.lines[self.cy:self.cy + 1] = new
+            self.cy += len(parts) - 1
+            self.cx = len(parts[-1])
+        self.modified, self.want = True, None
+
+    def newline(self):
+        line = self.lines[self.cy]
+        lead = line[:len(line) - len(line.lstrip(" \t"))][:self.cx]
+        self.insert("\n" + lead, kind="enter")
+
+    def backspace(self):
+        if self.cx == 0 and self.cy == 0:
+            return
+        self.snap("bs")
+        if self.cx > 0:
+            l = self.lines[self.cy]
+            self.lines[self.cy] = l[:self.cx - 1] + l[self.cx:]
+            self.cx -= 1
+        else:
+            self.cx = len(self.lines[self.cy - 1])
+            self.lines[self.cy - 1] += self.lines.pop(self.cy)
+            self.cy -= 1
+        self.modified, self.want = True, None
+
+    def delete(self):
+        l = self.lines[self.cy]
+        if self.cx >= len(l) and self.cy >= len(self.lines) - 1:
+            return
+        self.snap("del")
+        if self.cx < len(l):
+            self.lines[self.cy] = l[:self.cx] + l[self.cx + 1:]
+        else:
+            self.lines[self.cy] = l + self.lines.pop(self.cy + 1)
+        self.modified, self.want = True, None
+
+    def delete_line(self):
+        self.snap("line")
+        if len(self.lines) == 1:
+            self.lines[0] = ""
+        else:
+            self.lines.pop(self.cy)
+            self.cy = min(self.cy, len(self.lines) - 1)
+        self.cx = min(self.cx, len(self.lines[self.cy]))
+        self.modified, self.want = True, None
+
+    # -- moves --------------------------------------------------------------------------------
+    def move(self, how, page=10, pts=None):
+        """pts: a function giving a line's wrap points when long lines wrap (up and down then go by screen row)."""
+        self.last = None
+        l = self.lines[self.cy]
+        if how in ("up", "down", "pgup", "pgdn"):
+            d = {"up": -1, "down": 1, "pgup": -page, "pgdn": page}[how]
+            if pts:
+                return self.vmove(d, pts)
+            if self.want is None:
+                self.want = col_of(l, self.cx)
+            self.cy = max(0, min(len(self.lines) - 1, self.cy + d))
+            self.cx = idx_at(self.lines[self.cy], self.want)
+            return
+        self.want = None
+        if how == "left":
+            if self.cx > 0:
+                self.cx -= 1
+            elif self.cy > 0:
+                self.cy -= 1; self.cx = len(self.lines[self.cy])
+        elif how == "right":
+            if self.cx < len(l):
+                self.cx += 1
+            elif self.cy < len(self.lines) - 1:
+                self.cy += 1; self.cx = 0
+        elif how == "home":
+            ind = len(l) - len(l.lstrip(" \t"))
+            self.cx = ind if self.cx != ind else 0           # first press: past the indent
+        elif how == "end":
+            self.cx = len(l)
+        elif how == "top":
+            self.cy = self.cx = 0
+        elif how == "bottom":
+            self.cy = len(self.lines) - 1; self.cx = len(self.lines[self.cy])
+        elif how in ("wleft", "wright"):
+            self.word(how == "wright")
+
+    def vmove(self, n, pts):
+        """Up (n < 0) or down n screen rows through wrapped lines, keeping the column within the row."""
+        p = pts(self.lines[self.cy])
+        k = seg_index(p, self.cx)
+        if self.want is None:
+            self.want = col_of(self.lines[self.cy], self.cx) - p[k][1]
+        for _ in range(abs(n)):
+            if n < 0:
+                if k > 0:
+                    k -= 1
+                elif self.cy > 0:
+                    self.cy -= 1; p = pts(self.lines[self.cy]); k = len(p) - 1
+                else:
+                    break
+            elif k < len(p) - 1:
+                k += 1
+            elif self.cy < len(self.lines) - 1:
+                self.cy += 1; p = pts(self.lines[self.cy]); k = 0
+            else:
+                break
+        l = self.lines[self.cy]
+        end = p[k + 1][0] - 1 if k + 1 < len(p) else len(l)   # stay on this row, not the next one's start
+        self.cx = max(p[k][0], min(idx_at(l, p[k][1] + self.want), end))
+
+    def word(self, fwd):
+        l, i = self.lines[self.cy], self.cx
+        isw = lambda ch: ch.isalnum() or ch == "_"
+        if fwd:
+            if i >= len(l):
+                return self.move("right")
+            while i < len(l) and not isw(l[i]):
+                i += 1
+            while i < len(l) and isw(l[i]):
+                i += 1
+        else:
+            if i == 0:
+                return self.move("left")
+            while i > 0 and not isw(l[i - 1]):
+                i -= 1
+            while i > 0 and isw(l[i - 1]):
+                i -= 1
+        self.cx = i
+
+
+def load(path):
+    """(Doc, None) or (None, why it is not opened)."""
+    try:
+        st = os.stat(path)
+        if st.st_size > MAX_BYTES:
+            return None, f"not opened: {st.st_size // 1024 // 1024} MB is over the {MAX_BYTES // 1024 // 1024} MB this view takes"
+        with open(path, "rb") as f:
+            raw = f.read(MAX_BYTES + 1)
+    except OSError as e:
+        return None, f"not opened: {e.strerror or e}"
+    if b"\0" in raw[:8192]:
+        return None, "not opened: a binary file"
+    return Doc(path, raw.decode("utf-8", "surrogateescape"), st.st_mtime), None
+
+
+def save(doc):
+    """None, or why it was not saved. Writes beside the file and swaps it in, so a failure leaves the file as it was."""
+    tmp = f"{doc.path}.afc-ide.{os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(doc.text().encode("utf-8", "surrogateescape"))
+        shutil.copymode(doc.path, tmp)
+        os.replace(tmp, doc.path)
+        doc.mtime = os.stat(doc.path).st_mtime
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return f"not saved: {e.strerror or e}"
+    doc.modified = False
+    return None
+
+
+# ---------------------------------------------------------------------------------------------
+# the file tree
+
+class Tree:
+    def __init__(self, root):
+        self.root = root
+        self.open = {root}
+        self.items = []                 # (depth, path, is_dir); "…" rows have path None
+        self.sel = self.top = 0
+        self.refresh()
+
+    def listing(self, d):
+        try:
+            with os.scandir(d) as it:
+                ents = [(e.name, e.is_dir(follow_symlinks=False)) for e in it if e.name not in HIDDEN]
+        except OSError:
+            return [], 0
+        ents.sort(key=lambda e: (not e[1], e[0].lower()))
+        return ents[:MAX_DIR], max(0, len(ents) - MAX_DIR)
+
+    def refresh(self):
+        keep = self.items[self.sel][1] if self.items and self.sel < len(self.items) else None
+        out = []
+
+        def walk(d, depth):
+            ents, more = self.listing(d)
+            for name, is_dir in ents:
+                p = os.path.join(d, name)
+                out.append((depth, p, is_dir))
+                if is_dir and p in self.open and depth < 30:
+                    walk(p, depth + 1)
+            if more:
+                out.append((depth, None, False, f"… {more} more"))
+        walk(self.root, 0)
+        self.items = out
+        paths = [it[1] for it in out]
+        self.sel = paths.index(keep) if keep in paths else min(self.sel, max(0, len(out) - 1))
+
+    def current(self):
+        return self.items[self.sel] if self.items else None
+
+
+# ---------------------------------------------------------------------------------------------
+# the screen
+
+class App:
+    def __init__(self, root, first=None):
+        self.root = root
+        self.tree = Tree(root)
+        self.docs, self.cur = [], -1
+        self.focus = "tree"
+        self.msg, self.ask = "", None   # ask: (question, function(yes))
+        self.quit = False
+        self.size = (80, 24)
+        self.tab_spans = []
+        self.wrap = True                # long lines go on to the next screen row (Alt+Z: off)
+        self.tree_w = None              # the files' width once the divider was dragged
+        self.tree_hidden = False        # ☰ hid the files
+        self.drag = None                # "divider", "code-bar" or "tree-bar" while the mouse button is held
+        self.burger = None              # (first, last + 1) column of ☰ on the top row
+        self.client = None              # the tmux client of the popup (--client): reopen when it grows
+        self.find = None                # Ctrl+F open: {"q", "fresh", "start", "hits", "i"}
+        self.last_q = ""                # what Ctrl+F looked for last (it opens with it again)
+        if first:
+            self.open_file(first)
+
+    # -- files --------------------------------------------------------------------------------
+    def rel(self, p):
+        r = os.path.relpath(p, self.root)
+        return p if r.startswith("..") else r
+
+    def open_file(self, path):
+        path = os.path.abspath(path)
+        for i, d in enumerate(self.docs):
+            if d.path == path:
+                self.cur, self.focus = i, "edit"
+                return
+        doc, why = load(path)
+        if not doc:
+            self.msg = f"{self.rel(path)}: {why}"
+            return
+        self.docs.append(doc)
+        self.cur, self.focus = len(self.docs) - 1, "edit"
+
+    def doc(self):
+        return self.docs[self.cur] if 0 <= self.cur < len(self.docs) else None
+
+    def do_save(self):
+        d = self.doc()
+        if not d:
+            return
+        try:
+            changed = os.stat(d.path).st_mtime != d.mtime
+        except OSError:
+            changed = False
+        def go(yes=True):
+            if yes:
+                why = save(d)
+                self.msg = why or f"saved {self.rel(d.path)}"
+        if changed:
+            self.ask = (f"{self.rel(d.path)} changed on disk since it was opened: overwrite it? y/N", go)
+        else:
+            go()
+
+    def close_tab(self, i=None, force=False):
+        i = self.cur if i is None else i
+        if not 0 <= i < len(self.docs):
+            return
+        d = self.docs[i]
+        def go(yes=True):
+            if yes:
+                self.docs.pop(i)
+                if self.cur > i:
+                    self.cur -= 1
+                self.cur = min(self.cur, len(self.docs) - 1)    # -1 when no tab is left
+                if not self.docs:
+                    self.focus = "tree"
+        if d.modified and not force:
+            self.ask = (f"{self.rel(d.path)} is not saved: close it anyway? y/N", go)
+        else:
+            go()
+
+    def delete_file(self):
+        it = self.tree.current()
+        if not it or it[1] is None:
+            return
+        if it[2]:
+            self.msg = "only files can be deleted here, not folders"
+            return
+        path = it[1]
+        open_i = next((i for i, d in enumerate(self.docs) if d.path == path), None)
+        extra = " (it has edits that are not saved)" if open_i is not None and self.docs[open_i].modified else ""
+        def go(yes):
+            if not yes:
+                self.msg = "nothing deleted"
+                return
+            try:
+                os.remove(path)
+            except OSError as e:
+                self.msg = f"not deleted: {e.strerror or e}"
+                return
+            if open_i is not None:
+                self.close_tab(open_i, force=True)
+            self.tree.refresh()
+            self.msg = f"deleted {self.rel(path)}"
+        self.ask = (f"Delete {self.rel(path)} for good{extra}? y/N", go)
+
+    def try_quit(self):
+        n = sum(d.modified for d in self.docs)
+        def go(yes):
+            self.quit = yes
+        if n:
+            self.ask = (f"{n} file{'s are' if n > 1 else ' is'} not saved: quit anyway? y/N", go)
+        else:
+            self.quit = True
+
+    # -- layout -------------------------------------------------------------------------------
+    def layout(self):
+        """(width, height, files width, code width with its scrollbar, rows of the body)."""
+        w, h = self.size
+        tw = 0
+        if not self.tree_hidden and w >= TREE_MIN + CODE_MIN + 1:
+            tw = max(TREE_MIN, min(self.tree_w or max(20, min(40, w // 4)), w - CODE_MIN - 1))
+        ew = w - tw - (1 if tw else 0)
+        return w, h, tw, ew, max(1, h - 3)
+
+    def gutter(self, d):
+        return len(str(len(d.lines))) + 3
+
+    def textw(self, d):
+        return max(1, self.layout()[3] - self.gutter(d) - 1)        # the code's last column is its scrollbar
+
+    def bar_cell(self, bar, r, on):
+        """One row of a scrollbar: the track, or the slider (brighter while it is dragged)."""
+        if bar is None:
+            return " "
+        return (C["thumb_on"] if on else C["thumb"]) + " " + C["off"] if bar[r] else C["track"] + " " + C["off"]
+
+    def follow(self, d, bh):
+        """After a scroll, bring the cursor onto the screen (its first or last row)."""
+        vis = self.rows(d, bh)
+        keys = [(n, j) for n, j, _ in vis]
+        here = (d.cy, seg_index(self.pts(d, d.lines[d.cy]), d.cx))
+        if vis and here not in keys:
+            n, j, p = vis[0] if here < keys[0] else vis[-1]
+            d.cy = n
+            if self.wrap:
+                d.cx = p[j][0]
+        d.want = None
+
+    def pts(self, d, line):
+        return wrap_points(line, self.textw(d)) if self.wrap else [(0, 0)]
+
+    def rows(self, d, bh):
+        """The code's screen rows from the top: [(line, wrapped row, the line's wrap points), ...]."""
+        out, n, k = [], d.top, d.tseg
+        while len(out) < bh and n < len(d.lines):
+            p = self.pts(d, d.lines[n])
+            while k < len(p) and len(out) < bh:
+                out.append((n, k, p))
+                k += 1
+            n, k = n + 1, 0
+        return out
+
+    def shift(self, d, step):
+        """Scroll the code by step screen rows (wrapped rows count one each)."""
+        for _ in range(abs(step)):
+            if step > 0:
+                if d.tseg < len(self.pts(d, d.lines[d.top])) - 1:
+                    d.tseg += 1
+                elif d.top < len(d.lines) - 1:
+                    d.top, d.tseg = d.top + 1, 0
+            elif d.tseg > 0:
+                d.tseg -= 1
+            elif d.top > 0:
+                d.top -= 1
+                d.tseg = len(self.pts(d, d.lines[d.top])) - 1
+
+    def scroll(self):
+        w, h, tw, ew, bh = self.layout()
+        d = self.doc()
+        if d:
+            d.cy = max(0, min(d.cy, len(d.lines) - 1))
+            d.cx = max(0, min(d.cx, len(d.lines[d.cy])))
+            d.top = max(0, min(d.top, len(d.lines) - 1))
+            d.tseg = max(0, min(d.tseg, len(self.pts(d, d.lines[d.top])) - 1))
+            k = seg_index(self.pts(d, d.lines[d.cy]), d.cx)
+            if (d.cy, k) < (d.top, d.tseg):
+                d.top, d.tseg = d.cy, k
+            elif (d.cy, k) not in [(n, j) for n, j, _ in self.rows(d, bh)]:
+                d.top, d.tseg = d.cy, k                 # the cursor's row becomes the bottom one
+                self.shift(d, -(bh - 1))
+            textw = self.textw(d)
+            col = col_of(d.lines[d.cy], d.cx)
+            if self.wrap:
+                d.left = 0
+            elif col < d.left:
+                d.left = max(0, col - 8)
+            elif col >= d.left + textw:
+                d.left = col - textw + 8
+        t = self.tree
+        if t.sel < t.top:
+            t.top = t.sel
+        elif t.sel >= t.top + bh:
+            t.top = t.sel - bh + 1
+
+    # -- drawing ------------------------------------------------------------------------------
+    def draw(self):
+        self.scroll()
+        w, h, tw, ew, bh = self.layout()
+        d = self.doc()
+        out = ["\x1b[?25l"]
+        # row 1: the tabs, and the tree's folder name
+        spans, x, bar = [], 0, []
+        room = ew if tw else ew - len(BURGER)
+        for i, doc in enumerate(self.docs):
+            name = f" {os.path.basename(doc.path)}{' ●' if doc.modified else ''} × "
+            nw = col_of(name, len(name))
+            if x + nw > room:
+                break
+            bar.append((C["tab"] if i == self.cur else C["dim"]) + name + C["off"] + C["gutter"] + "│" + C["off"])
+            spans.append((x, x + nw, i))
+            x += nw + 1
+        self.tab_spans = spans
+        out.append("\x1b[1;1H" + "".join(bar) + C["off"] + " " * max(0, room - x))
+        if tw:
+            out.append(C["gutter"] + "│" + C["off"] + C["dir"]
+                       + fit(" ▾ " + (os.path.basename(self.root.rstrip("/")) or "/"), tw - len(BURGER)) + BURGER + C["off"])
+        else:
+            out.append(C["dir"] + BURGER + C["off"])
+        self.burger = (w - len(BURGER), w)
+        # row 2: the open file's path
+        path = self.rel(d.path) if d else "no file open: pick one on the right"
+        out.append("\x1b[2;1H" + C["dim"] + fit(" " + path, ew) + C["off"])
+        if tw:
+            out.append(C["gutter"] + "│" + C["off"] + " " * tw)
+        # the body
+        g = self.gutter(d) if d else 0
+        textw = self.textw(d) if d else 1
+        t = self.tree
+        vis = self.rows(d, bh) if d else []
+        spans, cur_row = {}, None
+        code_bar = slider(len(d.lines), d.top, len({n for n, _, _ in vis}), bh) if d else None
+        tree_bar = slider(len(t.items), t.top, bh, bh)
+        for r in range(bh):
+            row = f"\x1b[{r + 3};1H"
+            if r < len(vis):
+                n, k, p = vis[r]
+                num = (str(n + 1) if k == 0 else "").rjust(g - 3) + "   "      # a wrapped row has no number
+                row += (C["lnum"] if n == d.cy else C["gutter"]) + num + C["off"]
+                if n not in spans:
+                    spans[n] = d.spans(n) + self.find_spans(n)
+                if self.wrap:
+                    segw = p[k + 1][1] - p[k][1] if k + 1 < len(p) else textw
+                    row += paint(d.lines[n], spans[n], p[k][1], segw) + " " * (textw - segw) + C["off"]
+                else:
+                    row += paint(d.lines[n], spans[n], d.left, textw) + C["off"]
+                if n == d.cy and k == seg_index(p, d.cx):
+                    cur_row = r
+            else:
+                row += " " * (ew - 1 if d else ew)
+            if d:
+                row += self.bar_cell(code_bar, r, self.drag == "code-bar")
+            if tw:
+                row += (C["dir"] if self.drag == "divider" else C["gutter"]) + "│" + C["off"]
+                i = t.top + r
+                if i < len(t.items):
+                    it = t.items[i]
+                    depth, p, is_dir = it[0], it[1], it[2]
+                    if p is None:
+                        label, col = "  " * depth + "  " + it[3], C["dim"]
+                    elif is_dir:
+                        label, col = "  " * depth + ("▾ " if p in t.open else "▸ ") + os.path.basename(p), C["dir"]
+                    else:
+                        mark = " ●" if any(x.path == p and x.modified for x in self.docs) else ""
+                        label, col = "  " * depth + "  " + os.path.basename(p) + mark, C["file"]
+                    bg = (C["sel"] if self.focus == "tree" else C["sel2"]) if i == t.sel else ""
+                    row += bg + col + fit(" " + label, tw - 1) + C["off"]
+                else:
+                    row += " " * (tw - 1)
+                row += self.bar_cell(tree_bar, r, self.drag == "tree-bar")
+            out.append(row)
+        # the status line
+        if self.ask:
+            parts = [(C["warn"], " " + self.ask[0])]
+        elif self.find is not None:
+            f = self.find
+            n = len(f["hits"])
+            count = ("no match" if f["q"] else "type what to find") if not n else \
+                f"{(f['i'] or 0) + 1} of {n}{'+' if n >= MAX_HITS else ''}"
+            parts = [(C["dir"], " Find: "), (C["tab"] if f["fresh"] and f["q"] else C["text"], f["q"]),
+                     (C["off"] + C["bar"] + C["text"], " "),
+                     (C["warn"] if f["q"] and not n else C["dim"], f"  {count}" + (f"   {self.msg}" if self.msg else "")),
+                     (C["dim"], "   Enter/↓ next · ↑ previous · Esc close" + ("  (lower case: any case)" if f["q"] == f["q"].lower() and f["q"] else ""))]
+        elif self.msg:
+            parts = [(C["ok" if self.msg.startswith(("saved", "deleted")) else "warn"], " " + self.msg)]
+        elif self.focus == "edit" and d:
+            parts = [(C["text"], f" Ln {d.cy + 1}, Col {col_of(d.lines[d.cy], d.cx) + 1}  {'CRLF' if d.crlf else 'LF'}  "
+                                 f"{d.lang or 'Text'}  {'Wrap' if self.wrap else 'No wrap'}   "),
+                     (C["dim"], "Ctrl+F find · Ctrl+S save · Ctrl+K delete line · Ctrl+Z undo · Alt+Z wrap · Ctrl+W close · Ctrl+E files · Ctrl+Q quit")]
+        else:
+            parts = [(C["dim"], " Enter open · ←/→ folders · Delete deletes the file · Ctrl+E code · Ctrl+Q quit")]
+        line, room = f"\x1b[{h};1H" + C["bar"], w
+        for col, text in parts:
+            piece = visible(text, 0, room)
+            line += col + piece
+            room -= col_of(piece, len(piece))
+        out.append(line + " " * max(0, room) + C["off"])
+        # the cursor
+        if self.find is not None and not self.ask:             # the cursor stands in the find box
+            out.append(f"\x1b[{h};{8 + col_of(self.find['q'], len(self.find['q']))}H\x1b[?25h")
+        elif self.focus == "edit" and d and not self.ask and cur_row is not None:
+            n, k, p = vis[cur_row]
+            x = col_of(d.lines[d.cy], d.cx) - (p[k][1] if self.wrap else d.left)
+            out.append(f"\x1b[{cur_row + 3};{g + min(x, textw - 1) + 1}H\x1b[?25h")
+        return "".join(out)
+
+    # -- keys ---------------------------------------------------------------------------------
+    def key(self, k):
+        if self.ask:
+            q, fn = self.ask
+            self.ask = None
+            fn(k in ("y", "Y"))
+            return
+        self.msg = ""
+        if self.find is not None and isinstance(k, tuple) and k[0] == "paste" and self.doc():
+            f = self.find                                   # a paste goes into the find box (its first line)
+            f["q"] = ((("" if f["fresh"] else f["q"]) + k[1].replace("\r", "\n").split("\n")[0]))[:200]
+            f["fresh"] = False
+            self.last_q = f["q"]
+            return self.find_update(self.doc())
+        if self.find is not None and not isinstance(k, tuple) and self.find_key(k):
+            return
+        if k == "\x06":
+            return self.open_find()
+        if k == "\x11":
+            return self.try_quit()
+        if k == "\x13":
+            return self.do_save()
+        if k in ("\x05",) or (k == "esc" and self.focus == "edit"):
+            if self.focus == "edit" or self.tree_hidden:
+                self.focus, self.tree_hidden = "tree", False        # the files come back if ☰ hid them
+            elif self.doc():
+                self.focus = "edit"
+            return
+        if k in ("\x1b[5;5~", "\x1b[6;5~") and self.docs:
+            self.cur = (self.cur + (1 if k == "\x1b[6;5~" else -1)) % len(self.docs)
+            self.focus = "edit"
+            return
+        if k == "\x17":
+            return self.close_tab()
+        if k in ("\x1bz", "\x1bZ"):
+            self.wrap = not self.wrap
+            self.msg = "long lines wrap" if self.wrap else "long lines scroll sideways (no wrap)"
+            return
+        if isinstance(k, tuple):
+            return self.paste(k[1]) if k[0] == "paste" else self.mouse(*k)
+        if self.focus == "tree":
+            return self.tree_key(k)
+        self.edit_key(k)
+
+    # -- Ctrl+F ---------------------------------------------------------------------------------
+    def open_find(self):
+        d = self.doc()
+        if not d:
+            self.msg = "open a file to search in it"
+            return
+        self.focus = "edit"
+        self.find = {"q": self.last_q, "fresh": True, "start": (d.cy, d.cx), "hits": [], "i": None}
+        self.find_update(d)
+
+    def find_update(self, d, step=0):
+        """Look again (the query changed: step 0 goes to the first match from where Ctrl+F was pressed)
+        or go to the next (step 1) or previous (step -1) match. The cursor goes to the match."""
+        f = self.find
+        if step == 0:
+            f["hits"] = find_all(d.lines, f["q"])
+            f["by"] = {}
+            for m, a, b in f["hits"]:
+                f["by"].setdefault(m, []).append((a, b))
+            f["i"] = hit_from(f["hits"], f["start"])
+        elif f["hits"]:
+            here = (d.cy, d.cx)
+            i = hit_from(f["hits"], here, back=step < 0, same=False)
+            if i is not None and ((step > 0 and (f["hits"][i][0], f["hits"][i][1]) <= here)
+                                  or (step < 0 and (f["hits"][i][0], f["hits"][i][1]) >= here)):
+                self.msg = "back at the top" if step > 0 else "on from the bottom"
+            f["i"] = i
+        if f["i"] is not None:
+            n, a, _ = f["hits"][f["i"]]
+            d.cy, d.cx, d.want, d.last = n, a, None, None
+
+    def find_key(self, k):
+        """A key while Ctrl+F is open: True when it was the finder's; any other key closes it and goes on."""
+        d, f = self.doc(), self.find
+        if not d:
+            self.find = None
+            return False
+        if k in ("esc", "\r") and not f["q"]:
+            self.find = None
+        elif k == "esc":
+            self.find = None                                # the cursor stays on the match
+        elif k in ("\r", "\x06", "\x1b[B", "\x1bOB", "\x1bOR"):
+            self.find_update(d, 1)
+            f["fresh"] = False
+        elif k in ("\x1b[A", "\x1bOA", "\x1b[1;2R"):
+            self.find_update(d, -1)
+            f["fresh"] = False
+        elif k in ("\x7f", "\x08"):
+            f["q"] = "" if f["fresh"] else f["q"][:-1]
+            f["fresh"] = False
+            self.find_update(d)
+        elif len(k) == 1 and k >= " ":
+            f["q"] = (k if f["fresh"] else f["q"] + k)[:200]
+            f["fresh"] = False
+            self.find_update(d)
+        else:
+            self.find = None
+            return False
+        if self.find is not None:
+            self.last_q = f["q"]
+        return True
+
+    def find_spans(self, n):
+        """The matches on line n, coloured (the current one brighter)."""
+        f = self.find
+        if not f or not f["q"]:
+            return []
+        cur = f["hits"][f["i"]] if f["i"] is not None else None
+        return [(a, b, HL["hit_on"] if (n, a, b) == cur else HL["hit"]) for a, b in f.get("by", {}).get(n, [])]
+
+    def tree_key(self, k):
+        t = self.tree
+        it = t.current()
+        bh = self.layout()[4]
+        if k in ("\x1b[A", "\x1bOA"):
+            t.sel = max(0, t.sel - 1)
+        elif k in ("\x1b[B", "\x1bOB"):
+            t.sel = min(len(t.items) - 1, t.sel + 1)
+        elif k == "\x1b[5~":
+            t.sel = max(0, t.sel - bh)
+        elif k == "\x1b[6~":
+            t.sel = max(0, min(len(t.items) - 1, t.sel + bh))
+        elif k in ("\x1b[H", "\x1b[1~", "\x1bOH"):
+            t.sel = 0
+        elif k in ("\x1b[F", "\x1b[4~", "\x1bOF"):
+            t.sel = max(0, len(t.items) - 1)
+        elif k in ("\r", "\x1b[C", "\x1bOC") and it and it[1]:
+            self.activate(it, toggle=(k == "\r"))
+        elif k in ("\x1b[D", "\x1bOD") and it and it[1]:
+            if it[2] and it[1] in t.open:
+                t.open.discard(it[1]); t.refresh()
+            else:
+                parent = os.path.dirname(it[1])
+                paths = [x[1] for x in t.items]
+                if parent in paths:
+                    t.sel = paths.index(parent)
+        elif k == "\x1b[3~":
+            self.delete_file()
+        elif k in ("esc", "q"):
+            self.try_quit()
+
+    def activate(self, it, toggle=True):
+        t = self.tree
+        if it[2]:
+            if it[1] in t.open:
+                if toggle:
+                    t.open.discard(it[1])
+            else:
+                t.open.add(it[1])
+            t.refresh()
+        else:
+            self.open_file(it[1])
+
+    def edit_key(self, k):
+        d = self.doc()
+        if not d:
+            self.focus = "tree"
+            return
+        bh = self.layout()[4]
+        moves = {"\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left", "\x1bOA": "up", "\x1bOB": "down",
+                 "\x1bOC": "right", "\x1bOD": "left", "\x1b[H": "home", "\x1b[1~": "home", "\x1bOH": "home",
+                 "\x1b[F": "end", "\x1b[4~": "end", "\x1bOF": "end", "\x1b[5~": "pgup", "\x1b[6~": "pgdn",
+                 "\x1b[1;5H": "top", "\x1b[1;5F": "bottom", "\x1b[1;5D": "wleft", "\x1b[1;5C": "wright",
+                 "\x1b[1;3D": "wleft", "\x1b[1;3C": "wright"}
+        if k in moves:
+            d.move(moves[k], page=max(1, bh - 1), pts=(lambda line: self.pts(d, line)) if self.wrap else None)
+        elif k == "\r":
+            d.newline()
+        elif k == "\t":
+            d.insert(d.indent if d.indent == "\t" else " " * (TABW - col_of(d.lines[d.cy], d.cx) % TABW), kind="tab")
+        elif k in ("\x7f", "\x08"):
+            d.backspace()
+        elif k == "\x1b[3~":
+            d.delete()
+        elif k == "\x0b":
+            d.delete_line()
+        elif k == "\x1a":
+            self.msg = "" if d.step(True) else "nothing to undo"
+        elif k == "\x19":
+            self.msg = "" if d.step(False) else "nothing to redo"
+        elif len(k) == 1 and k >= " " and k != "\x7f":
+            d.insert(k)
+
+    def paste(self, text):
+        d = self.doc()
+        if self.focus != "edit" or not d:
+            self.msg = "open a file to paste into it"
+            return
+        d.insert(text.replace("\r\n", "\n").replace("\r", "\n"), kind="paste")
+        d.last = None
+
+    def dragging(self, x0, y0):
+        """The mouse moved with the button held on the divider or a scrollbar."""
+        w, h, tw, ew, bh = self.layout()
+        if self.drag == "divider":
+            self.tree_w = max(TREE_MIN, min(w - CODE_MIN - 1, w - 1 - x0))
+            return
+        frac = max(0, min(bh - 1, y0 - 2)) / max(1, bh - 1)
+        if self.drag == "tree-bar":
+            t = self.tree
+            t.top = round(frac * max(0, len(t.items) - bh))
+            t.sel = max(t.top, min(t.sel, t.top + bh - 1))
+        elif self.drag == "code-bar" and self.doc():
+            d = self.doc()
+            d.top, d.tseg = round(frac * max(0, len(d.lines) - bh)), 0
+            self.follow(d, bh)
+
+    def mouse(self, kind, b, x, y):
+        w, h, tw, ew, bh = self.layout()
+        x0, y0 = x - 1, y - 1
+        if kind == "release":
+            self.drag = None
+            return
+        if b == 32:                                             # moved with the left button held
+            if self.drag:
+                self.dragging(x0, y0)
+            return
+        if b in (64, 65):                                       # the wheel
+            step = -3 if b == 64 else 3
+            if tw and x0 > ew:
+                t = self.tree
+                t.top = max(0, min(max(0, len(t.items) - bh), t.top + step))
+                t.sel = max(t.top, min(t.sel, t.top + bh - 1))
+            elif self.doc():
+                self.shift(self.doc(), step)
+                self.follow(self.doc(), bh)
+            return
+        if b != 0:
+            return
+        if y0 == 0 and self.burger and self.burger[0] <= x0 < self.burger[1]:      # ☰
+            self.tree_hidden = not self.tree_hidden
+            if self.tree_hidden and self.focus == "tree" and self.doc():
+                self.focus = "edit"
+            return
+        if tw and x0 == ew:                                     # the divider: drag it
+            self.drag = "divider"
+            return
+        if self.doc() and x0 == ew - 1 and 2 <= y0 < 2 + bh:     # the code's scrollbar
+            self.drag = "code-bar"
+            return self.dragging(x0, y0)
+        if tw and x0 == w - 1 and 2 <= y0 < 2 + bh and len(self.tree.items) > bh:
+            self.drag = "tree-bar"
+            return self.dragging(x0, y0)
+        if y0 == 0 and x0 < ew:                                 # a tab; its "×" closes it
+            for a, z, i in self.tab_spans:
+                if a <= x0 < z:
+                    if x0 >= z - 2:
+                        self.close_tab(i)
+                    else:
+                        self.cur, self.focus = i, "edit"
+            return
+        if 2 <= y0 < 2 + bh:
+            if tw and x0 > ew:
+                i = self.tree.top + y0 - 2
+                if i < len(self.tree.items):
+                    self.tree.sel, self.focus = i, "tree"
+                    if self.tree.items[i][1]:
+                        self.activate(self.tree.items[i])
+            elif self.doc():
+                d = self.doc()
+                vis = self.rows(d, bh)
+                if y0 - 2 < len(vis):
+                    n, k, p = vis[y0 - 2]
+                    l = d.lines[n]
+                    end = p[k + 1][0] - 1 if k + 1 < len(p) else len(l)
+                    base = p[k][1] if self.wrap else d.left
+                    d.cy, d.cx = n, max(p[k][0], min(idx_at(l, base + max(0, x0 - self.gutter(d))), end))
+                else:                                           # below the last line: its end
+                    d.cy = len(d.lines) - 1
+                    d.cx = len(d.lines[d.cy])
+                d.want, d.last, self.focus = None, None, "edit"
+
+
+# ---------------------------------------------------------------------------------------------
+# the terminal
+
+def tokens(buf):
+    """Split input into keys: ([key, ...], what is left to complete later). Mouse and paste come as tuples."""
+    out, i = [], 0
+    while i < len(buf):
+        c = buf[i]
+        if c != "\x1b":
+            out.append(c); i += 1
+            continue
+        if buf.startswith("\x1b[200~", i):
+            end = buf.find("\x1b[201~", i + 6)
+            if end < 0:
+                return out, buf[i:]
+            out.append(("paste", buf[i + 6:end])); i = end + 6
+            continue
+        if i + 1 >= len(buf):
+            return out, buf[i:]
+        n = buf[i + 1]
+        if n == "[":
+            j = i + 2
+            while j < len(buf) and not ("\x40" <= buf[j] <= "\x7e"):
+                j += 1
+            if j >= len(buf):
+                return out, buf[i:]
+            seq = buf[i:j + 1]
+            if seq.startswith("\x1b[<") and seq[-1] in "Mm":
+                try:
+                    b, x, y = (int(v) for v in seq[3:-1].split(";"))
+                    out.append(("mouse" if seq[-1] == "M" else "release", b, x, y))
+                except ValueError:
+                    pass
+            else:
+                out.append(seq)
+            i = j + 1
+        elif n == "O":
+            if i + 2 >= len(buf):
+                return out, buf[i:]
+            out.append(buf[i:i + 3]); i += 3
+        else:
+            out.append("\x1b" + n); i += 2                  # Alt+key: not used here
+    return out, ""
+
+
+def term_size(fd):
+    """The terminal's own size (not $COLUMNS / $LINES, which can be stale)."""
+    try:
+        s = os.get_terminal_size(fd)
+        return max(20, s.columns), max(6, s.lines)
+    except OSError:
+        return 80, 24
+
+
+# ---------------------------------------------------------------------------------------------
+# full screen in a tmux popup. A popup keeps the size it opened with: when the window grows (the
+# terminal maximised, its font made smaller), the view reopens itself at the new size, with the
+# open files, the edits not saved yet, the cursors and the folders as they were.
+
+def tmux_bin():
+    own = os.path.expanduser("~/.local/bin/tmux")
+    return own if os.access(own, os.X_OK) else (shutil.which("tmux") or "tmux")
+
+
+def client_size(client):
+    """(columns, rows) of the tmux client the popup is on, or None."""
+    sock = (os.environ.get("TMUX") or "").split(",")[0]
+    if not (client and sock):
+        return None
+    try:
+        r = subprocess.run([tmux_bin(), "-S", sock, "display", "-p", "-c", client, "#{client_width} #{client_height}"],
+                           capture_output=True, text=True, timeout=2)
+        cw, ch = (int(v) for v in r.stdout.split())
+        return cw, ch
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def needs_refit(start, now, own):
+    """Reopen? Only when the window changed since this view opened and is now bigger than the view.
+    (So a popup that tmux keeps smaller than the window cannot reopen over and over.)"""
+    return bool(start and now) and now != start and (now[0] > own[0] or now[1] > own[1])
+
+
+def dump_state(app):
+    """The view as it is, for the reopened one. Unsaved text goes along whole."""
+    return {"root": app.root, "cur": app.cur, "focus": app.focus, "wrap": app.wrap, "tree_w": app.tree_w,
+            "tree_hidden": app.tree_hidden, "open": sorted(app.tree.open), "sel": app.tree.sel, "ttop": app.tree.top,
+            "docs": [{"path": d.path, "text": d.text() if d.modified else None, "mtime": d.mtime, "cy": d.cy, "cx": d.cx,
+                      "top": d.top, "tseg": d.tseg, "left": d.left} for d in app.docs]}
+
+
+def load_state(st):
+    """An App from dump_state(). A saved file that cannot be read now is left out."""
+    app = App(st["root"])
+    for x in st.get("docs", []):
+        if x.get("text") is None:
+            d, _ = load(x["path"])
+            if not d:
+                continue
+        else:
+            d = Doc(x["path"], x["text"], x.get("mtime", 0))
+            d.modified = True
+        for k in ("cy", "cx", "top", "tseg", "left"):
+            setattr(d, k, int(x.get(k, 0)))
+        app.docs.append(d)
+    app.cur = min(int(st.get("cur", 0)), len(app.docs) - 1)
+    app.focus = st.get("focus", "tree") if app.docs else "tree"
+    app.wrap, app.tree_w, app.tree_hidden = bool(st.get("wrap", True)), st.get("tree_w"), bool(st.get("tree_hidden"))
+    app.tree.open = set(st.get("open") or [app.root]) | {app.root}
+    app.tree.refresh()
+    last = max(0, len(app.tree.items) - 1)
+    app.tree.sel, app.tree.top = min(int(st.get("sel", 0)), last), min(int(st.get("ttop", 0)), last)
+    return app
+
+
+def popup_cmd(client, root, *args):
+    """tmux display-popup that runs this program full screen on client, in folder root."""
+    sock = (os.environ.get("TMUX") or "").split(",")[0]
+    inner = " ".join(shlex.quote(a) for a in [os.path.abspath(sys.argv[0]), "--client", client, *args])
+    return [tmux_bin(), *(["-S", sock] if sock else ["-L", "agents"]), "display-popup", "-c", client,
+            "-E", "-B", "-x", "C", "-y", "C", "-w", "100%", "-h", "100%", "-d", root, inner]
+
+
+def open_popup(client, root):
+    """afc-ide --open CLIENT [FOLDER] (the Alt+I key, through run-shell, which fills in the client's
+    name; a popup's own command line gets no #{...} filled in). Waits while the popup is open."""
+    if not client:
+        print("afc-ide --open: which tmux client? (#{client_name})", file=sys.stderr)
+        return 2
+    return subprocess.run(popup_cmd(client, root)).returncode
+
+
+def reopen(app):
+    """Hand the view to a new full-size popup (opened once this one is gone) and stop."""
+    fd, path = None, os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", f"afc-ide-{os.getpid()}.json")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(dump_state(app), f)
+    except OSError as e:
+        app.msg = f"cannot reopen at the new size: {e.strerror or e}"
+        return False
+    cmd = popup_cmd(app.client, app.root, "--resume", path)
+    subprocess.Popen(["sh", "-c", 'sleep 0.3; exec "$@"', "sh"] + cmd, start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    app.quit = True
+    return True
+
+
+def run(app):
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    wr = sys.stdout.buffer
+    resized = [True]
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
+    dec = codecs.getincrementaldecoder("utf-8")("replace")
+    pend = ""
+    start = client_size(app.client) if app.client else None
+    checked = time.monotonic()
+    try:
+        tty.setraw(fd)
+        # mouse: presses, drags (1002) and releases, in SGR form (1006); pastes come bracketed (2004)
+        wr.write(b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h"); wr.flush()
+        while not app.quit:
+            if resized[0]:
+                resized[0] = False
+                app.size = term_size(fd)
+                wr.write(b"\x1b[2J")
+            if start and time.monotonic() - checked >= 1.0:
+                checked = time.monotonic()
+                if needs_refit(start, client_size(app.client), app.size) and reopen(app):
+                    break
+            wr.write(app.draw().encode("utf-8", "replace")); wr.flush()
+            r, _, _ = select.select([fd], [], [], ESC_WAIT if pend else 0.5)
+            if not r:
+                if pend == "\x1b":
+                    app.key("esc")
+                    pend = ""
+                continue
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            keys, pend = tokens(pend + dec.decode(data))
+            for k in keys:
+                app.key(k)
+                if app.quit:
+                    break
+    finally:
+        wr.write(b"\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l"); wr.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if argv and argv[0] == "--open":
+        return open_popup(argv[1] if len(argv) > 1 else "",
+                          os.path.abspath(os.path.expanduser(argv[2])) if len(argv) > 2 else os.getcwd())
+    client = resume = None
+    while argv and argv[0] in ("--client", "--resume") and len(argv) > 1:
+        if argv[0] == "--client":
+            client = argv[1]
+        else:
+            resume = argv[1]
+        argv = argv[2:]
+    if not sys.stdin.isatty():
+        print("afc-ide: needs a terminal", file=sys.stderr)
+        return 2
+    if resume:
+        try:
+            with open(resume, encoding="utf-8") as f:
+                app = load_state(json.load(f))
+        except (OSError, ValueError, KeyError, TypeError) as e:     # the file stays: it may hold unsaved text
+            print(f"afc-ide: cannot resume from {resume}: {e}", file=sys.stderr)
+            return 2
+        try:
+            os.remove(resume)
+        except OSError:
+            pass
+        app.client = client
+        run(app)
+        return 0
+    root = os.path.abspath(os.path.expanduser(argv[0])) if argv else os.getcwd()
+    first = None
+    if os.path.isfile(root):
+        root, first = os.path.dirname(root), root
+    if len(argv) > 1:
+        first = os.path.abspath(os.path.join(root, os.path.expanduser(argv[1])))
+    if not os.path.isdir(root):
+        print(f"afc-ide: no such folder: {root}", file=sys.stderr)
+        return 2
+    app = App(root, first)
+    app.client = client
+    run(app)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

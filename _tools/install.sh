@@ -55,6 +55,17 @@ copy() {  # <path inside the project> <target file> [mode]
     sed -E "s|^(Exec=)[^ ]*/\.local/bin/|\1$HOME/.local/bin/|" "$src" > "$TMP/f"
     touch -r "$src" "$TMP/f"; chmod --reference="$src" "$TMP/f"; src="$TMP/f"
   fi
+  # Auto-scale RAM/CPU/slot limits to the installing machine's specs (RAM + CPU cores).
+  case "$1" in
+    config/systemd/user/agents.slice|config/systemd/user/app.slice.d/memory.conf|config/systemd/user/agents-council.slice|config/systemd/user/agents-express.slice|config/autonice/rules)
+      if [[ -r "$HERE/_tools/tune-specs.py" ]] && command -v python3 >/dev/null 2>&1; then
+        local tflags=()
+        (( DESKTOP )) || tflags+=(--headless)
+        python3 -I "$HERE/_tools/tune-specs.py" "${tflags[@]}" apply "$1" "$src" "$TMP/tuned"
+        touch -r "$src" "$TMP/tuned"; chmod --reference="$src" "$TMP/tuned"; src="$TMP/tuned"
+      fi
+      ;;
+  esac
   if [[ -e "$dst" && ! -L "$dst" ]] && cmp -s "$src" "$dst"; then same=$((same + 1)); return 0; fi
   changed=$((changed + 1))
   if (( ! APPLY )); then echo "  would $([[ -e "$dst" || -L "$dst" ]] && echo replace || echo create) $dst (copy)"; return 0; fi
@@ -84,7 +95,7 @@ kwin_logo() {
   local kw rc="${XDG_CONFIG_HOME:-$HOME/.config}/kwinrulesrc" g found="" list
   command -v kwin_x11 >/dev/null || command -v kwin_wayland >/dev/null || return 0
   kw=$(command -v kwriteconfig6 || command -v kwriteconfig5) || return 0
-  section() { awk -v g="[$1]" '$0 == g { s = 1; next } /^\[/ { s = 0 } s' "$rc" 2>/dev/null; }
+  section() { [[ -r "$rc" ]] || return 0; awk -v g="[$1]" '$0 == g { s = 1; next } /^\[/ { s = 0 } s' "$rc" 2>/dev/null; }
   list=$(section General | sed -n 's/^rules=//p')
   for g in ${list//,/ }; do
     if section "$g" | grep -qx 'wmclass=agents'; then found=$g; break; fi
@@ -141,7 +152,14 @@ if (( DESKTOP )); then
 fi
 for f in "$HERE"/share/llm-usage/nobrowser/*; do link "share/llm-usage/nobrowser/$(basename "$f")" "$HOME/.local/share/llm-usage/nobrowser/$(basename "$f")" 755; done
 
-if (( ! MAC )); then for f in "$HERE"/config/systemd/user/*; do copy "config/systemd/user/$(basename "$f")" "$HOME/.config/systemd/user/$(basename "$f")"; done; fi
+if (( ! MAC )); then
+  for f in "$HERE"/config/systemd/user/* "$HERE"/config/systemd/user/*/*; do
+    [[ -f "$f" ]] || continue
+    rel=${f#"$HERE/config/systemd/user/"}
+    if [[ "$rel" == app.slice.d/* ]] && (( ! DESKTOP )); then continue; fi
+    copy "config/systemd/user/$rel" "$HOME/.config/systemd/user/$rel"
+  done
+fi
 for f in "$HERE"/config/agents/*; do copy "config/agents/$(basename "$f")" "$HOME/.config/agents/$(basename "$f")"; done
 if (( DESKTOP )); then
   copy config/autonice/rules "$HOME/.config/autonice/rules"
@@ -150,6 +168,8 @@ fi
 
 if (( APPLY )); then [[ -e "$HOME/.local/bin/afc" ]] || ln -s agents "$HOME/.local/bin/afc"
 elif [[ ! -e "$HOME/.local/bin/afc" ]]; then echo "  would link ~/.local/bin/afc -> agents"; fi
+# /collab in each Claude account and Gemini home (a /collab of your own is left alone)
+python3 -I "$HERE/bin/afc-collab" install $( ((APPLY)) || echo --dry-run ) | sed 's/^/  /' || echo "  afc-collab install failed"
 
 echo
 echo "$( ((APPLY)) || echo 'DRY RUN: ' )$changed file(s) $( ((APPLY)) && echo 'set up' || echo 'would change' ), $same already as they should be."
@@ -159,7 +179,7 @@ cat <<'EOF'
 Left for you:
   1. Merge config/claude/settings.fleet-keys.json into ~/.claude/settings.json (keys: tui, statusLine, hooks).
   2. Merge config/gemini/settings.fleet-keys.json into ~/.gemini/settings.json (keys: experimental, modelConfigs).
-  3. systemctl --user daemon-reload && systemctl --user enable --now autonice.service afc-logs.timer
+  3. systemctl --user daemon-reload && systemctl --user enable --now autonice.service afc-logs.timer afc-tmp-clean.timer
   4. Build the patched tmux if ~/.local/opt/tmux-3.8 is missing:  bash _tools/build-tmux.sh
      then point the tmux command at it:  ln -s ~/.local/opt/tmux-3.8/bin/tmux ~/.local/bin/tmux
   5. Sign each account in:  agents --as <account>  then /login.  Then start the fleet:  agents

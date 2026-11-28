@@ -20,6 +20,12 @@ import json
 import os
 import sys
 
+_HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(_HERE, "..", "lib", "afc"), os.path.expanduser("~/.local/lib/afc")):
+    if _lib not in sys.path:
+        sys.path.insert(0, _lib)
+import state as afc_state  # noqa: E402
+
 TITLE = "Agentic CLI Fleet"
 INK = (0.13, 0.19, 0.23)          # the logo's dark grey
 GREY = (0.42, 0.46, 0.50)
@@ -30,6 +36,7 @@ def assets():
     """share/acf beside this program (its real path: the fleet's folder), else the copies."""
     here = os.path.dirname(os.path.realpath(__file__))
     for d in (os.path.join(here, "..", "share", "acf"), os.path.expanduser("~/.local/share/acf"),
+              "/Applications/ACF.app/Contents/Resources/fleet/share/acf",
               "/opt/agentic-cli-fleet/share/acf"):
         if os.path.exists(os.path.join(d, "splash.png")) and os.path.exists(os.path.join(d, "splash.json")):
             return os.path.normpath(d)
@@ -39,16 +46,7 @@ def assets():
 def splash_off():
     if os.environ.get("ACF_SPLASH", "").lower() in ("0", "off", "no"):
         return True
-    path = os.environ.get("AGENTS_SETTINGS") or os.path.expanduser("~/.config/agents/settings")
-    try:
-        with open(path) as f:
-            for line in f:
-                p = line.split()
-                if len(p) >= 2 and p[0] == "splash":
-                    return p[1].lower() in ("off", "0", "no")
-    except OSError:
-        pass
-    return False
+    return afc_state.setting("splash", "on").lower() in ("off", "0", "no")
 
 
 def arg(name, default=None):
@@ -98,6 +96,23 @@ class Card:
 
 def main():
     save = arg("--save")
+    if sys.platform == "darwin":
+        if not save and splash_off():
+            return 0
+        d = assets()
+        if not d:
+            return 0
+        mac_bin = next(
+            (p for p in (
+                os.path.expanduser("~/.local/bin/afc-splash-mac"),
+                os.path.join(_HERE, "..", "bin-mac", "afc-splash-mac"),
+                "/Applications/ACF.app/Contents/Resources/fleet/bin-mac/afc-splash-mac",
+            ) if os.path.isfile(p) and os.access(p, os.X_OK)),
+            None,
+        )
+        if not mac_bin:
+            return 0
+        os.execv(mac_bin, [mac_bin, "--assets", d] + sys.argv[1:])
     if not save and (splash_off() or not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))):
         return 0
     d = assets()

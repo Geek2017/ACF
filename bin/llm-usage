@@ -21,23 +21,51 @@ Never blocks: the last answer is printed and refreshed in the background.
 import glob, json, os, re, select, signal, subprocess, sys, time
 from datetime import datetime
 
+def _env_ttl(name, default):
+    try:
+        return max(10, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def valid_acct(acct):
+    return isinstance(acct, str) and bool(re.fullmatch(r"[\w.-]{1,64}", acct)) and acct not in (".", "..")
+
+
 HOME = os.path.expanduser("~")
 CFG = f"{HOME}/.config/agents"
 CACHE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp", "llm-usage")
-IDLE_TTL = int(os.environ.get("LLM_USAGE_AGY_TTL", "300"))
-ACTIVE_TTL = int(os.environ.get("LLM_USAGE_ACTIVE_TTL", "300"))    # seconds between background reads while active
+TMUXBIN = f"{HOME}/.local/bin/tmux" if os.access(f"{HOME}/.local/bin/tmux", os.X_OK) else "tmux"
+IDLE_TTL = _env_ttl("LLM_USAGE_AGY_TTL", 300)
+ACTIVE_TTL = _env_ttl("LLM_USAGE_ACTIVE_TTL", 300)    # seconds between background reads while active
 LOCK_TTL = 30      # max in-flight refresh time before a stale lock expires
 ROLLOVER = 1800    # a reset time this far from the stored one is a different window
 WARN = 80          # same "!" threshold as claude-usage
 TMUX_ENV = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
 
 
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 def account_dir(tool, name, default):
     try:
-        for line in open(f"{CFG}/accounts-{tool}"):
-            parts = line.split()
-            if len(parts) >= 2 and parts[0] == name:
-                return os.path.expanduser(parts[1])
+        with open(f"{CFG}/accounts-{tool}") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == name:
+                    return os.path.expanduser(parts[1])
     except OSError:
         pass
     return default
@@ -72,20 +100,27 @@ def codex_limits(path):
 
 
 def codex_render(limits):
+    if not isinstance(limits, dict):
+        return ""
     bits, now = [], time.time()
     for key in ("primary", "secondary"):
         w = limits.get(key)
-        if not w:
+        if not isinstance(w, dict):
             continue
         label = {300: "S", 10080: "W"}.get(w.get("window_minutes"), key[0].upper())
         # A window that has reset since this was read has nothing used in it.
-        used = 0 if (w.get("resets_at") or 0) < now else w.get("used_percent", 0)
+        try:
+            resets = float(w.get("resets_at") or 0)
+            raw_used = float(w.get("used_percent", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        used = 0.0 if resets < now else raw_used
         bits.append(f"{label}{pct(used)}")
     return " ".join(bits)
 
 
 def codex_logs(folder):
-    return sorted(glob.glob(f"{folder}/sessions/*/*/*/*.jsonl"), key=os.path.getmtime, reverse=True)
+    return sorted(glob.glob(f"{folder}/sessions/*/*/*/*.jsonl"), key=mtime, reverse=True)
 
 
 def codex_read(folder):
@@ -128,38 +163,76 @@ def codex_read(folder):
             os.killpg(p.pid, signal.SIGTERM)    # the group: on some installs `codex` is a wrapper around the real binary
         except OSError:
             pass
-        p.wait()
+        try:
+            p.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 def codex(acct, refreshing=False):
     folder = account_dir("codex", acct, f"{HOME}/.codex")
-    os.makedirs(CACHE, mode=0o700, exist_ok=True)
+    try:
+        os.makedirs(CACHE, mode=0o700, exist_ok=True)
+    except OSError:
+        return "no data: cache unavailable"
     cache, stamp, lock, err = (f"{CACHE}/codex-{acct}.{x}" for x in ("json", "stamp", "lock", "err"))
     if refreshing:
-        limits, why = codex_read(folder)
-        if limits:
-            with open(f"{cache}.tmp", "w") as f:
-                json.dump(limits, f)
-            os.replace(f"{cache}.tmp", cache)
-        with open(err, "w") as f:
-            f.write(why or "")
-        open(stamp, "w").close()
-        return codex_render(limits) if limits else why
+        try:
+            limits, why = codex_read(folder)
+            if limits:
+                tmp = f"{cache}.{os.getpid()}.tmp"
+                try:
+                    with open(tmp, "w") as f:
+                        json.dump(limits, f)
+                    os.replace(tmp, cache)
+                except OSError:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            try:
+                with open(err, "w") as f:
+                    f.write(why or "")
+                open(stamp, "w").close()
+            except OSError:
+                pass
+            return codex_render(limits) if limits else why
+        finally:
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
 
     logs, now = codex_logs(folder), time.time()
-    last_log = os.path.getmtime(logs[0]) if logs else 0
-    age = now - os.path.getmtime(stamp) if os.path.exists(stamp) else None
-    due = age is None or age >= IDLE_TTL or (last_log > os.path.getmtime(stamp) and age >= ACTIVE_TTL)
-    locked = os.path.exists(lock) and now - os.path.getmtime(lock) < LOCK_TTL
+    last_log = mtime(logs[0]) if logs else 0.0
+    stamp_t = mtime(stamp)
+    age = (now - stamp_t) if stamp_t else None
+    due = age is None or age >= IDLE_TTL or (last_log > stamp_t and age >= ACTIVE_TTL)
+    lock_t = mtime(lock)
+    locked = bool(lock_t) and now - lock_t < LOCK_TTL
     if due and not locked:
-        open(lock, "w").close()
-        subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "--refresh", f"codex {acct}"],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
-    fresh = os.path.getmtime(cache) if os.path.exists(cache) else 0
+        try:
+            open(lock, "w").close()
+            subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "--refresh", f"codex {acct}"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
+    fresh = mtime(cache)
     if fresh >= last_log and fresh:
         try:
-            return codex_render(json.load(open(cache)))
+            with open(cache) as f:
+                return codex_render(json.load(f))
         except (OSError, ValueError):
             pass
     for path in logs[:10]:
@@ -171,10 +244,11 @@ def codex(acct, refreshing=False):
                 return line
     if fresh:
         try:
-            return codex_render(json.load(open(cache)))
+            with open(cache) as f:
+                return codex_render(json.load(f))
         except (OSError, ValueError):
             pass
-    return (open(err).read().strip() if os.path.exists(err) else "") or "checking"
+    return read_text(err).strip() or "checking"
 
 
 # ---- Antigravity ------------------------------------------------------------------------------------------
@@ -183,12 +257,16 @@ def agy_json_samples(raw):
     """Output of `agy -p /usage --output-format json` -> [(group, window, used, reset time)]."""
     samples = []
     for group in json.loads(raw)["command"]["data"]["groups"]:
-        name = group.get("name", "").upper()
+        name = (group.get("name") or "").upper()
         letter = "A" if "ARGON" in name else "C" if "CLAUDE" in name else "G" if "GEMINI" in name else name[:1]
-        for bucket in group.get("buckets", []):
+        for bucket in group.get("buckets") or []:
             window = {"5h": "S", "weekly": "W"}.get(bucket.get("window"))
-            if window and bucket.get("remaining_fraction") is not None:
-                reset = datetime.fromisoformat(bucket["reset_time"].replace("Z", "+00:00")).timestamp()
+            rt = bucket.get("reset_time")
+            if window and bucket.get("remaining_fraction") is not None and isinstance(rt, str) and rt:
+                try:
+                    reset = datetime.fromisoformat(rt.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
                 samples.append((letter, window, 100 - bucket["remaining_fraction"] * 100, reset))
     return samples
 
@@ -223,17 +301,25 @@ def agy_state_path(acct):
 
 def agy_load(acct):
     try:
-        return json.load(open(agy_state_path(acct)))
+        with open(agy_state_path(acct)) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
 def agy_merge(state, samples):
     """Keep the highest used value per window. Returns True if anything changed."""
+    if not isinstance(state, dict):
+        return False
     changed = False
     for group, window, used, reset in samples:
-        slot = state.setdefault(group, {})
+        slot = state.get(group)
+        if not isinstance(slot, dict):
+            slot = state[group] = {}
         old = slot.get(window)
+        if not isinstance(old, dict) or not isinstance(old.get("reset"), (int, float)) or not isinstance(old.get("used"), (int, float)):
+            old = None
         if old is None or reset > old["reset"] + ROLLOVER:
             slot[window] = {"used": used, "reset": reset}      # first sighting, or a new window has started
             changed = True
@@ -245,25 +331,44 @@ def agy_merge(state, samples):
 
 
 def agy_absorb(acct, samples):
-    if not samples:
+    if not samples or not valid_acct(acct):
         return
-    os.makedirs(CACHE, mode=0o700, exist_ok=True)
+    try:
+        os.makedirs(CACHE, mode=0o700, exist_ok=True)
+    except OSError:
+        return
     state = agy_load(acct)
     if agy_merge(state, samples):
         tmp = f"{agy_state_path(acct)}.{os.getpid()}"
-        with open(tmp, "w") as f:
-            json.dump(state, f)
-        os.replace(tmp, agy_state_path(acct))
+        try:
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, agy_state_path(acct))
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def agy_render(state, now):
     """Percent LEFT with two decimals, the same numbers as agy's /usage panel. "!" at 20% left or less."""
+    if not isinstance(state, dict):
+        return ""
     bits = []
     for group, windows in state.items():
+        if not isinstance(windows, dict):
+            continue
         parts = []
         for w in "SW":
-            if w in windows:
-                left = 100.0 if windows[w]["reset"] < now else 100 - windows[w]["used"]
+            entry = windows.get(w)
+            if isinstance(entry, dict):
+                try:
+                    reset = float(entry["reset"])
+                    used = float(entry["used"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                left = 100.0 if reset < now else max(0.0, min(100.0, 100.0 - used))
                 parts.append(f"{w}{left:.2f}%" + ("!" if left <= 100 - WARN else ""))
         if parts:
             bits.append(f"{group}:" + " ".join(parts))
@@ -274,7 +379,7 @@ def agy_open_panels():
     """Read any /usage panel showing in a fleet pane. Reads the screen only; never sends a key."""
     sock = os.environ.get("AGENTS_SOCK", "agents")
     def tm(*args):
-        return subprocess.run(["tmux", "-L", sock, *args], env=TMUX_ENV, text=True, stdout=subprocess.PIPE,
+        return subprocess.run([TMUXBIN, "-L", sock, *args], env=TMUX_ENV, text=True, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, timeout=5).stdout
     try:
         for row in tm("list-panes", "-a", "-F", "#{pane_id} #{pane_pid}").splitlines():
@@ -301,7 +406,14 @@ def agy_read(acct):
     # stand-ins for xdg-open and its kin; put first on PATH, they swallow the page (and note it in
     # $XDG_RUNTIME_DIR/llm-usage/nobrowser.log). agy then waits for a sign-in that never comes and is
     # stopped by the timeout.
-    env["PATH"] = f"{HOME}/.local/share/llm-usage/nobrowser:" + env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    nobrowser = f"{HOME}/.local/share/llm-usage/nobrowser"
+    if not os.path.isdir(nobrowser):
+        alt = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "share", "llm-usage", "nobrowser")
+        if os.path.isdir(alt):
+            nobrowser = alt
+    env["PATH"] = f"{nobrowser}:" + env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    shim = os.path.join(nobrowser, "xdg-open")
+    env["BROWSER"] = shim if os.access(shim, os.X_OK) else "/bin/true"
     try:
         out = subprocess.run(["nice", "-n", "10", "agy", "-p", "/usage", "--output-format", "json"], cwd=CACHE, env=env,
                              text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -309,7 +421,7 @@ def agy_read(acct):
         samples = agy_json_samples(out)
     except subprocess.TimeoutExpired:
         return "no data: agy gave no answer"
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
         return "no data: agy not signed in"
     if not samples:
         return "no data: agy showed no quota"
@@ -327,36 +439,53 @@ def agy_last_work(acct):
 
 
 def agy(acct, refreshing=False):
-    os.makedirs(CACHE, mode=0o700, exist_ok=True)
+    try:
+        os.makedirs(CACHE, mode=0o700, exist_ok=True)
+    except OSError:
+        return "no data: cache unavailable"
     stamp, lock, err = (f"{CACHE}/agy-{acct}.{x}" for x in ("stamp", "lock", "err"))
     if refreshing:
-        why = agy_read(acct)
-        with open(err, "w") as f:
-            f.write(why or "")
-        open(stamp, "w").close()
-        return why or agy_render(agy_load(acct), time.time())
+        try:
+            why = agy_read(acct)
+            try:
+                with open(err, "w") as f:
+                    f.write(why or "")
+                open(stamp, "w").close()
+            except OSError:
+                pass
+            return why or agy_render(agy_load(acct), time.time())
+        finally:
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
 
     agy_open_panels()
     now = time.time()
-    age = now - os.path.getmtime(stamp) if os.path.exists(stamp) else None
-    worked = age is not None and agy_last_work(acct) > os.path.getmtime(stamp)
+    stamp_t = mtime(stamp)
+    age = (now - stamp_t) if stamp_t else None
+    worked = age is not None and agy_last_work(acct) > stamp_t
     # After a read that failed (signed out, no answer) do not hurry the next one: each attempt on a
     # signed-out account starts a sign-in of its own. Once every IDLE_TTL is enough to notice a new sign-in.
-    try:
-        failed = open(err).read().startswith("no data")
-    except OSError:
-        failed = False
+    failed = read_text(err).startswith("no data")
     due = age is None or age >= IDLE_TTL or (worked and age >= ACTIVE_TTL and not failed)
-    locked = os.path.exists(lock) and now - os.path.getmtime(lock) < LOCK_TTL
+    lock_t = mtime(lock)
+    locked = bool(lock_t) and now - lock_t < LOCK_TTL
     if due and not locked:
-        open(lock, "w").close()
-        subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "--refresh", f"agy {acct}"],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        try:
+            open(lock, "w").close()
+            subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "--refresh", f"agy {acct}"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
     line = agy_render(agy_load(acct), now)
     if line:
         return line
-    return (open(err).read().strip() if os.path.exists(err) else "") or "checking"
+    return read_text(err).strip() or "checking"
 
 
 # ---- Gemini -----------------------------------------------------------------------------------------------
@@ -364,7 +493,8 @@ def agy(acct, refreshing=False):
 def gemini(acct):
     folder = account_dir("gemini", acct, HOME)
     try:
-        kind = json.load(open(f"{folder}/.gemini/settings.json")).get("security", {}).get("auth", {}).get("selectedType")
+        with open(f"{folder}/.gemini/settings.json") as f:
+            kind = json.load(f).get("security", {}).get("auth", {}).get("selectedType")
     except (OSError, ValueError, AttributeError):
         kind = None
     if kind == "gemini-api-key":
@@ -378,7 +508,13 @@ def main(argv):
     if not words:
         print(__doc__, file=sys.stderr)
         return 1
-    tool, acct = words[0], words[1] if len(words) > 1 else "main"
+    tool, acct = words[0].lower(), words[1] if len(words) > 1 else "main"
+    if tool not in ("codex", "agy", "gemini"):
+        print(f"llm-usage: unknown tool {tool!r} (expected codex, agy, or gemini)", file=sys.stderr)
+        return 2
+    if not valid_acct(acct):
+        print(f"llm-usage: invalid account name {acct!r}", file=sys.stderr)
+        return 2
     if tool == "codex":
         print(codex(acct, refreshing))
     elif tool == "agy":
@@ -389,4 +525,10 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as _e:
+        print(f"llm-usage: unexpected error: {_e}", file=sys.stderr)
+        sys.exit(1)

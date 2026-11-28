@@ -9,6 +9,8 @@ No model is asked anything: it reads files, so it costs no tokens.
   afc-logs search WORDS [--all] [--tool T] [--since YYYY-MM-DD] [--limit N]
   afc-logs show THREAD                               print one thread (id, or the start of one)
   afc-logs file THREAD                               write one thread to a readable file, print its path
+  afc-logs handoff THREAD [--stdout]                 write a compact pickup brief for another LLM, print its path
+  afc-logs summary [DIR] [--stdout] [--max-lines N]  refresh hard-capped (<=50 lines) logs/acf/SUMMARY.md from acf.db
   afc-logs time [THREAD] [--top N]                   where a thread's time went: the model, each tool, waiting
                                                      for you, and its slowest steps (no THREAD: this project's latest)
   afc-logs prune-md [--all] [--dry-run]              remove the readable .md files of earlier runs
@@ -38,8 +40,12 @@ when the machine's CPU or RAM is at 85% or more, unless --force.
 import datetime, fcntl, glob, hashlib, json, os, re, sqlite3, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
-sys.path.insert(0, os.path.join(HOME, ".local/lib/afc"))
+_HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(_HERE, "..", "lib", "afc"), os.path.join(HOME, ".local", "lib", "afc")):
+    if _lib not in sys.path:
+        sys.path.insert(0, _lib)
 from pb import pb_all, pb_fields, pb_get, pb_strings, pb_text  # noqa: E402
+import state as afc_state  # noqa: E402
 
 CFG = f"{HOME}/.config/agents"
 CACHE = os.environ.get("AFC_LOGS_CACHE") or f"{HOME}/.cache/acf-logs"
@@ -52,15 +58,7 @@ KEEP_HANDOVER = 86400      # seconds a file written by `afc-logs file` stays
 
 def setting(name, default):
     """A "name value" line of the fleet's settings file, read the way `agents` reads it."""
-    try:
-        with open(os.environ.get("AGENTS_SETTINGS") or f"{CFG}/settings", encoding="utf-8") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 2 and parts[0] == name:
-                    return parts[1]
-    except OSError:
-        pass
-    return default
+    return afc_state.setting(name, default)
 
 
 MD = setting("log-md", "off") == "on"      # also one readable .md file per thread
@@ -1157,13 +1155,19 @@ def run(dry=False, force=False):
         s.close()
     if not dry:
         save_state(state_file, state)
+        for p in per_project:
+            try:
+                refresh_project_summary(p)
+            except (OSError, sqlite3.Error):
+                pass
         for p in all_projects():
-            for f in glob.glob(os.path.join(glob.escape(os.path.join(p, SUB)), "handover-*.md")):
-                try:
-                    if time.time() - os.path.getmtime(f) > KEEP_HANDOVER:
-                        os.remove(f)
-                except OSError:
-                    pass
+            for pat in ("handover-*.md", "handoff-*.md"):
+                for f in glob.glob(os.path.join(glob.escape(os.path.join(p, SUB)), pat)):
+                    try:
+                        if time.time() - os.path.getmtime(f) > KEEP_HANDOVER:
+                            os.remove(f)
+                    except OSError:
+                        pass
     took = time.time() - t0
     verb = "would add" if dry else "added"
     print(f"{'DRY RUN: ' if dry else ''}{done} changed source file(s), {verb} {sum(per_tool.values())} entries in {took:.1f}s")
@@ -1384,6 +1388,299 @@ def cmd_file(args):
     return 0
 
 
+def _extract_touched_files(rows, limit=20):
+    """Extract edited/written file paths from tool_call entries (deterministic, zero tokens)."""
+    edit_tools = {"edit", "write", "edit_file", "write_file", "replace_file_content",
+                  "multi_replace_file_content", "apply_patch", "notebookedit", "create_file"}
+    seen = []
+    for _ts, kind, who, _model, text in rows:
+        if kind != "tool_call":
+            continue
+        w = (who or "").lower()
+        if w not in edit_tools and "edit" not in w and "write" not in w and "patch" not in w:
+            continue
+        path = ""
+        try:
+            d = json.loads(text) if text and text.lstrip().startswith("{") else None
+        except ValueError:
+            d = None
+        if isinstance(d, dict):
+            for k in ("file_path", "path", "Path", "TargetFile", "target_file", "notebook_path"):
+                if isinstance(d.get(k), str) and d[k].strip():
+                    path = d[k].strip(); break
+        if not path and text:
+            m = re.search(r'"(?:file_path|path|Path|TargetFile|target_file)"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+            if m:
+                path = m.group(1)
+        if path and path not in seen:
+            seen.append(path)
+            if len(seen) >= limit:
+                break
+    return seen
+
+
+def _clip(text, max_chars=700, max_lines=14):
+    s = (text or "").strip()
+    if not s:
+        return ""
+    lines = s.splitlines()
+    clipped = False
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        clipped = True
+    out = "\n".join(lines)
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip()
+        clipped = True
+    return out + ("\n… (trimmed; full detail in acf.db)" if clipped else "")
+
+
+def write_handoff_brief(project, db, tid, out):
+    """Write a compact, token-budgeted pickup brief so another LLM can continue a cut-off topic."""
+    row = db.execute(
+        "SELECT tool, account, cwd, title, first_ts, last_ts, models FROM threads WHERE id=?", (tid,)
+    ).fetchone()
+    tool, acct, cwd, title, fts, lts, models = row or ("agent", "", project, tid, "", "", "")
+    work_dir = cwd if cwd and os.path.isdir(cwd) else project
+
+    entries = db.execute(
+        "SELECT ts, kind, who, model, text FROM entries WHERE thread=? ORDER BY id", (tid,)
+    ).fetchall()
+    n_user = sum(1 for e in entries if e[1] == "user")
+    n_asst = sum(1 for e in entries if e[1] == "assistant")
+    n_tools = sum(1 for e in entries if e[1] == "tool_call")
+
+    out.write(f"# Handoff Brief: {' '.join((title or tid).split())}\n\n")
+    out.write(f"- **Thread:** `{tid}`  |  **From:** `{tool}` ({acct or 'default'})")
+    if models:
+        out.write(f"  |  **Model:** `{models}`")
+    out.write("\n")
+    out.write(f"- **Project:** `{project}`")
+    if work_dir != project:
+        out.write(f"  |  **Folder:** `{work_dir}`")
+    out.write("\n")
+    out.write(f"- **Window:** {local(fts)} → {local(lts)}  |  **Activity:** {n_user} user, {n_asst} replies, {n_tools} tool calls\n")
+    out.write(f"- **Deep log (on demand):** `afc-logs show {tid}`  or  `afc-logs search <terms>` (full history in `logs/acf/acf.db`)\n")
+
+    # Live git state (deterministic, instant)
+    if work_dir and os.path.isdir(work_dir):
+        try:
+            br = subprocess.run(["git", "-C", work_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True, timeout=3)
+            if br.returncode == 0 and br.stdout.strip():
+                st = subprocess.run(["git", "-C", work_dir, "status", "-s"],
+                                    capture_output=True, text=True, timeout=3).stdout.splitlines()
+                lg = subprocess.run(["git", "-C", work_dir, "log", "-n", "4", "--oneline"],
+                                    capture_output=True, text=True, timeout=3).stdout.splitlines()
+                out.write(f"\n## Repo State (`{br.stdout.strip()}`)\n")
+                if st:
+                    out.write("- **Modified/untracked:**\n")
+                    for ln in st[:20]:
+                        out.write(f"  - `{ln}`\n")
+                    if len(st) > 20:
+                        out.write(f"  - … +{len(st) - 20} more\n")
+                else:
+                    out.write("- Working tree clean.\n")
+                if lg:
+                    out.write("- **Recent commits:** " + " ; ".join(f"`{c}`" for c in lg) + "\n")
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    touched = _extract_touched_files(entries)
+    if touched:
+        out.write("\n## Files Edited in This Thread\n")
+        for p in touched:
+            out.write(f"- `{p}`\n")
+
+    # Opening goal (first substantive user message, skipping slash-command XML wrappers)
+    user_msgs = [e for e in entries if e[1] == "user" and (e[4] or "").strip() and not e[4].lstrip().startswith(NOT_A_PROMPT)]
+    convo = [e for e in entries if e[1] in ("user", "assistant") and (e[4] or "").strip() and not e[4].lstrip().startswith(NOT_A_PROMPT)]
+
+    if user_msgs:
+        out.write("\n## Original Request\n")
+        out.write(_clip(user_msgs[0][4], max_chars=500, max_lines=10) + "\n")
+
+    # Recent exchanges (cut-off point — last 8 user/assistant messages, excluding duplicate of opening if already covered)
+    tail_convo = convo[-8:]
+    if tail_convo and len(convo) == 1 and user_msgs and tail_convo[0] is user_msgs[0]:
+        tail_convo = []
+    if tail_convo:
+        out.write(f"\n## Where It Left Off (last {len(tail_convo)} messages)\n")
+        for ts, kind, _who, _model, text in tail_convo:
+            role = "USER" if kind == "user" else tool.upper()
+            out.write(f"\n### {local(ts)} · {role}\n")
+            out.write(_clip(text, max_chars=900, max_lines=18) + "\n")
+
+    # If the thread ended mid-turn on tool calls after the last assistant/user text, list them!
+    last_text_idx = -1
+    for i, e in enumerate(entries):
+        if e[1] in ("user", "assistant") and (e[4] or "").strip():
+            last_text_idx = i
+    trailing_tools = [e for e in entries[last_text_idx + 1:] if e[1] == "tool_call"][-6:]
+    if trailing_tools:
+        out.write("\n## Interrupted Mid-Turn (trailing tool calls after last message)\n")
+        for ts, _kind, who, _model, text in trailing_tools:
+            out.write(f"- {local(ts)} · `{step_words(who, text, width=90)}`\n")
+
+    out.write("\n---\n")
+    out.write("Pick up from the cut-off point above. Do not re-scan the whole repo unless needed; "
+              f"query `afc-logs show {tid}` only if you need earlier context from `logs/acf/acf.db`.\n")
+
+
+def cmd_handoff(args):
+    """Write a compact pickup brief for one thread (for handing a cut-off topic to another LLM)."""
+    want = next((a for a in args if not a.startswith("--")), None)
+    if not want:
+        print("usage: afc-logs handoff THREAD [--stdout]"); return 2
+    found = find_thread(want)
+    if not found:
+        print(f"no thread matching {want}", file=sys.stderr)
+        return 1
+    p, db, tid, _md = found
+    if "--stdout" in args:
+        write_handoff_brief(p, db, tid, sys.stdout)
+        return 0
+    slug_id = re.sub(r"[^A-Za-z0-9]", "", tid.split(":")[-1])[:12] or "thread"
+    brief_path = os.path.join(p, SUB, f"handoff-{slug_id}.md")
+    os.makedirs(os.path.join(p, SUB), exist_ok=True)
+    with open(brief_path + ".tmp", "w", encoding="utf-8") as f:
+        write_handoff_brief(p, db, tid, f)
+    os.replace(brief_path + ".tmp", brief_path)
+    print(brief_path)
+    return 0
+
+
+def write_project_summary(project, db, out, max_lines=50):
+    """Write a hard-capped (<=max_lines) cross-provider SUMMARY.md materialized view from acf.db."""
+    try:
+        cap = max(12, min(100, int(max_lines)))
+    except (TypeError, ValueError):
+        cap = 50
+    proj_name = os.path.basename(os.path.normpath(project)) or project
+    branch = ""
+    dirty = []
+    commits = []
+    if project and os.path.isdir(project):
+        try:
+            br = subprocess.run(["git", "-C", project, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True, timeout=2)
+            if br.returncode == 0:
+                branch = br.stdout.strip()
+            if branch:
+                dirty = subprocess.run(["git", "-C", project, "status", "-s"],
+                                       capture_output=True, text=True, timeout=2).stdout.splitlines()
+                commits = subprocess.run(["git", "-C", project, "log", "-n", "4", "--oneline"],
+                                         capture_output=True, text=True, timeout=2).stdout.splitlines()
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    total_threads = db.execute(
+        "SELECT count(*) FROM threads WHERE parent IS NULL OR parent=''"
+    ).fetchone()[0]
+    now_s = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    lines = [
+        f"# Project Memory Summary: {proj_name}",
+        f"- **Project:** `{project}` | **Branch:** `{branch or '-'}` | **Threads:** {total_threads} | **Updated:** {now_s}",
+        "- **Deep history:** `logs/acf/acf.db` — run `afc-logs show <id>` or `afc-logs search <terms>` on demand",
+        "",
+        "## Recent Sessions (newest first)",
+    ]
+
+    snap_lines = []
+    if branch and (commits or dirty):
+        snap_lines.append("")
+        snap_lines.append("## Repo Snapshot")
+        if commits:
+            snap_lines.append("- **Commits:** " + " ; ".join(f"`{c[:70]}`" for c in commits[:3]))
+        if dirty:
+            shown = ", ".join(f"`{d.strip()[:40]}`" for d in dirty[:5])
+            extra = f" (+{len(dirty) - 5} more)" if len(dirty) > 5 else ""
+            snap_lines.append(f"- **Dirty:** {shown}{extra}")
+
+    budget_for_sessions = max(3, cap - len(lines) - len(snap_lines))
+    rows = db.execute(
+        "SELECT t.id, t.tool, t.account, t.title, t.last_ts, "
+        "(SELECT count(*) FROM entries e WHERE e.thread=t.id AND e.kind='user') AS nu, "
+        "(SELECT count(*) FROM entries e WHERE e.thread=t.id AND e.kind='tool_call') AS nt "
+        "FROM threads t WHERE t.parent IS NULL OR t.parent='' "
+        "ORDER BY t.last_ts DESC LIMIT ?",
+        (budget_for_sessions,),
+    ).fetchall()
+
+    if not rows:
+        lines.append("- No sessions logged yet.")
+    else:
+        for tid, tool, acct, title, lts, nu, nt in rows:
+            when_s = (local(lts) or "")[5:16] or "?"
+            who = f"{tool}/{acct}" if acct else (tool or "agent")
+            clean_title = " ".join((title or tid).split())
+            if len(clean_title) > 68:
+                clean_title = clean_title[:67] + "…"
+            lines.append(f"- [{when_s}] `{who}` `{tid}` — {clean_title} ({nu}u/{nt}t)")
+
+    lines.extend(snap_lines)
+    lines = lines[:cap]
+    out.write("\n".join(lines) + "\n")
+
+
+def refresh_project_summary(project, max_lines=50):
+    """Atomically write <project>/logs/acf/SUMMARY.md from <project>/logs/acf/acf.db."""
+    db = open_db(project)
+    if db is None:
+        return None
+    try:
+        out_dir = os.path.join(project, SUB)
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "SUMMARY.md")
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            write_project_summary(project, db, f, max_lines=max_lines)
+        os.replace(tmp, path)
+        return path
+    finally:
+        db.close()
+
+
+def cmd_summary(args):
+    """Generate or print a project's hard-capped (<=50 lines) logs/acf/SUMMARY.md."""
+    max_raw = opt(args, "--max-lines", "50")
+    try:
+        max_lines = max(12, min(100, int(max_raw or 50)))
+    except ValueError:
+        print(f"invalid --max-lines: {max_raw}", file=sys.stderr)
+        return 2
+    skip_next = False
+    pos = []
+    for a in args:
+        if skip_next:
+            skip_next = False; continue
+        if a == "--max-lines":
+            skip_next = True; continue
+        if not a.startswith("--"):
+            pos.append(a)
+    if pos:
+        cand = os.path.realpath(pos[0])
+        project = cand if os.path.isfile(os.path.join(cand, SUB, "acf.db")) else project_for(cand)
+    else:
+        project = project_here()
+    db = open_db(project)
+    if db is None:
+        print(f"no acf.db for {project} (run afc-logs run first)", file=sys.stderr)
+        return 1
+    try:
+        if "--stdout" in args:
+            write_project_summary(project, db, sys.stdout, max_lines=max_lines)
+            return 0
+    finally:
+        db.close()
+    path = refresh_project_summary(project, max_lines=max_lines)
+    if not path:
+        return 1
+    print(path)
+    return 0
+
+
 def span(sec):
     """A length of time, short: 42 s, 3.2 min, 1 h 05 min."""
     sec = max(0, sec)
@@ -1593,6 +1890,10 @@ def main(argv):
             return cmd_show(args)
         if cmd == "file":
             return cmd_file(args)
+        if cmd == "handoff":
+            return cmd_handoff(args)
+        if cmd == "summary":
+            return cmd_summary(args)
         if cmd == "time":
             return cmd_time(args)
         if cmd == "prune-md":

@@ -1,31 +1,43 @@
 #!/usr/bin/env python3
-"""Interactive tabbed ACF popup menu (Commands | Sessions | Config | About).
+"""Interactive tabbed ACF popup menu (Commands | Sessions | History | Config | About).
 
 Launched by clicking the bottom-left ACF badge in tmux status-left:
   afc-menu <socket_path> <client_name> <window_id> <pane_id> <pane_pid> <pane_path>
 """
 
+import concurrent.futures
+import datetime
 import fcntl
+import json
 import os
 import re
 import select
 import shlex
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
 import termios
+import textwrap
 import tty
 
 HOME = os.path.expanduser("~")
 LOCAL_BIN = os.path.join(HOME, ".local", "bin")
-TMUX_BIN = os.path.join(LOCAL_BIN, "tmux")
-if not os.path.isfile(TMUX_BIN):
-    TMUX_BIN = "tmux"
-
-SETTINGS_PATH = os.path.join(HOME, ".config", "agents", "settings")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+for _lib in (os.path.join(REPO_ROOT, "lib", "afc"), os.path.join(HOME, ".local", "lib", "afc")):
+    if _lib not in sys.path:
+        sys.path.insert(0, _lib)
+import state as afc_state  # noqa: E402
+
+TMUX_BIN = afc_state.find_tmux_bin()
+
+SETTINGS_PATH = afc_state.settings_path()
+PROJECT_MODES_PATH = afc_state.project_modes_path()
+LOG_PROJECTS_PATH = os.environ.get("AFC_LOGS_LIST") or os.path.join(HOME, ".config", "agents", "log-projects")
+PROJECTS_PATH = os.path.join(HOME, ".config", "agents", "projects")
+LOG_SUB = os.path.join("logs", "acf")
 
 # Palette (Tokyo Night + crisp blue active pill)
 BG_MAIN = "\x1b[48;2;26;27;38m"        # #1a1b26
@@ -47,16 +59,34 @@ FG_RED = "\x1b[38;2;247;118;142m"      # #f7768e
 BOLD = "\x1b[1m"
 RESET = "\x1b[0m"
 
-TABS = ["Commands", "Sessions", "Config", "About"]
+TABS = ["Commands", "Sessions", "History", "Config", "About"]
+TAB_COMMANDS = 0
+TAB_SESSIONS = 1
+TAB_HISTORY = 2
+TAB_CONFIG = 3
+TAB_ABOUT = 4
+
+DOCTRINE_CHOICES = ["off", "mdmp", "f3ead", "ooda"]
+MODEL_CHOICES = ["off", "ooda", "first-principles", "six-hats", "80-20", "rca", "occam", "5x5"]
+MODEL_SHORT = {
+    "off": "off", "ooda": "ooda", "first-principles": "1st-pr",
+    "six-hats": "6-hats", "80-20": "80-20", "rca": "rca",
+    "occam": "occam", "5x5": "5x5",
+}
 
 CONFIG_SCHEMA = [
+    ("style-ste", "~80% ASD-STE100 + Diagram First", ["on", "off"], "on"),
+    ("code-do178c", "DO-178C-Lite coding discipline", ["on", "off"], "on"),
+    ("search-hygiene", "Search hygiene (Grep + capped rg + Rule of 3)", ["off", "on"], "off"),
+    ("memory-summary", "Hybrid memory (turn-1 <=50-line SUMMARY.md)", ["off", "on"], "off"),
+    ("sitrep", "Reply footer (You: + SITREP · D/M · phase · Done/Open/Next)", ["off", "on"], "off"),
+    ("doctrine", "Fallback when pane & project inherit", DOCTRINE_CHOICES, "off"),
+    ("mental-model", "Fallback when pane & project inherit", MODEL_CHOICES, "off"),
     ("view", "Chat UI mode", ["classic", "compact", "unified"], "classic"),
     ("start-agent", "New tab default agent", ["claude", "ask"], "claude"),
-    ("rules", "TokenOps rule check", ["off", "report", "enforce"], "enforce"),
     ("rules-recap", "Rule verdict recap line", ["on", "off"], "on"),
     ("notify-wait", "Notify when agent asks", ["on", "off"], "on"),
     ("notify-done", "Notify when turn finishes", ["on", "off"], "on"),
-    ("log-md", "Also write Markdown logs", ["off", "on"], "off"),
     ("splash", "Startup splash animation", ["on", "off"], "on"),
     ("mem-wall", "Fleet RAM wall (%)", ["90", "85", "95", "0"], "90"),
     ("ram-wall", "Machine RAM wall (%)", ["90", "85", "95", "0"], "90"),
@@ -72,13 +102,33 @@ def run_out(cmd, timeout=2.0):
         return ""
 
 
+def session_id_for_copy(tid):
+    """The provider's own session id from an acf.db thread id ("claude:<uuid>" -> "<uuid>")."""
+    tid = tid or ""
+    return tid.split(":", 1)[1] if ":" in tid else tid
+
+
+def copy_to_clipboard(text, sock=""):
+    """Put text on the system clipboard via afc-copy (pbcopy / clip.exe / wl-copy / xclip) and the
+    tmux paste buffer. Returns True when either took it."""
+    ok = False
+    try:
+        r = subprocess.run([os.path.join(REPO_ROOT, "bin", "afc-copy"), "--raw"], input=text.encode("utf-8"),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        ok = r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    try:
+        r = subprocess.run(tmux_cmd(sock, "set-buffer", "-w", "--", text),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        ok = ok or r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ok
+
+
 def tmux_cmd(sock, *args):
-    base = [TMUX_BIN]
-    if sock:
-        base += ["-S", sock]
-    else:
-        base += ["-L", "agents"]
-    return base + list(args)
+    return afc_state.tmux_cmd(sock, *args, default_sock="agents", tmux_bin=TMUX_BIN)
 
 
 def spawn_deferred(shell_cmd):
@@ -96,7 +146,7 @@ def get_term_size():
         rows, cols = struct.unpack("hh", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\x00\x00\x00\x00"))
         if rows > 0 and cols > 0:
             return cols, rows
-    except Exception:
+    except (OSError, ValueError, struct.error):
         pass
     return 78, 24
 
@@ -110,60 +160,42 @@ def trunc(text, width):
 
 
 def load_settings():
-    values = {}
-    if not os.path.isfile(SETTINGS_PATH):
-        return values
-    try:
-        with open(SETTINGS_PATH, "r", encoding="utf-8", errors="replace") as f:
-            for raw in f:
-                line = raw.split("#", 1)[0].strip()
-                if not line:
-                    continue
-                parts = line.split(None, 1)
-                if len(parts) == 2:
-                    values[parts[0]] = parts[1].strip()
-    except Exception:
-        pass
-    if "view" not in values and "claude-view" in values:
-        values["view"] = values["claude-view"]
-    return values
+    return afc_state.load_settings(SETTINGS_PATH)
 
 
 def save_setting(key, value):
-    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-    lines = []
-    if os.path.isfile(SETTINGS_PATH):
-        with open(SETTINGS_PATH, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+    afc_state.save_setting(key, value, SETTINGS_PATH)
 
-    active_pat = re.compile(rf"^(\s*){re.escape(key)}(\s+)\S+(.*)$")
-    commented_pat = re.compile(rf"^(\s*)#(\s*){re.escape(key)}(\s+)\S+(.*)$")
 
-    replaced = False
-    for idx, raw in enumerate(lines):
-        m = active_pat.match(raw)
-        if m:
-            lines[idx] = f"{m.group(1)}{key}{m.group(2)}{value}{m.group(3)}\n"
-            replaced = True
-            break
+def project_key_for(cwd):
+    return afc_state.project_key_for(cwd)
 
-    if not replaced:
-        for idx, raw in enumerate(lines):
-            m = commented_pat.match(raw)
-            if m:
-                lines[idx] = f"{m.group(1)}{key} {value}{m.group(4)}\n"
-                replaced = True
-                break
 
-    if not replaced:
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        lines.append(f"{key} {value}\n")
+def load_project_modes():
+    return afc_state.load_project_modes(PROJECT_MODES_PATH)
 
-    tmp = SETTINGS_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-    os.replace(tmp, SETTINGS_PATH)
+
+def save_project_mode(proj_key, field, value):
+    afc_state.save_project_mode(proj_key, field, value, PROJECT_MODES_PATH)
+
+
+def clear_project_modes(proj_key):
+    afc_state.clear_project_modes(proj_key, PROJECT_MODES_PATH)
+
+
+def load_pane_modes(ctx):
+    pane = ctx.get("pane") or ""
+    if not pane:
+        return {"doctrine": "inherit", "mental-model": "inherit"}
+    d, m = afc_state.read_pane_modes(tmux_cmd(ctx.get("sock", "")), pane)
+    return {"doctrine": d or "inherit", "mental-model": m or "inherit"}
+
+
+def save_pane_mode(ctx, field, value, pane_id=None):
+    pane = pane_id or ctx.get("pane") or ""
+    if not pane:
+        return
+    afc_state.write_pane_mode(tmux_cmd(ctx.get("sock", "")), pane, field, value)
 
 
 def read_cgroup_summary():
@@ -200,51 +232,314 @@ def fmt_cpu_max(val):
     return val or "?"
 
 
-def build_commands(ctx):
+def load_pane_context(ctx):
+    """Query focused pane/window council and project flags once so menu commands match tmux bindings."""
+    pctx = {
+        "council_chat": False,
+        "council_member": False,
+        "council_one": False,
+        "council_perm_judge": False,
+        "council_name": "",
+        "council_what": "",
+        "council_chair": "",
+        "window_panes": 1,
+        "project": "",
+        "win_council": False,
+        "in_council": False,
+        "chair_target": "",
+    }
+    pane = ctx.get("pane") or ""
+    if not pane:
+        return pctx
+    fmt = (
+        "#{@council_chat}\t#{@council_member}\t#{@council_one}\t#{@council_perm_judge}\t"
+        "#{@council_name}\t#{@council_what}\t#{@council_chair}\t#{window_panes}\t"
+        "#{@project}\t#{@council}"
+    )
+    raw = run_out(tmux_cmd(ctx.get("sock", ""), "display-message", "-p", "-t", pane, fmt))
+    if not raw:
+        return pctx
+    parts = raw.split("\t")
+    if len(parts) < 10:
+        parts += [""] * (10 - len(parts))
+    pctx["council_chat"] = parts[0] == "1"
+    pctx["council_member"] = bool(parts[1])
+    pctx["council_one"] = parts[2] == "1"
+    pctx["council_perm_judge"] = parts[3] == "1"
+    pctx["council_name"] = parts[4]
+    pctx["council_what"] = parts[5]
+    pctx["council_chair"] = parts[6]
+    try:
+        pctx["window_panes"] = max(1, int(parts[7]))
+    except Exception:
+        pctx["window_panes"] = 1
+    pctx["project"] = parts[8]
+    pctx["win_council"] = bool(parts[9])
+    pctx["in_council"] = pctx["council_chat"] or pctx["council_member"] or pctx["win_council"]
+    pctx["chair_target"] = pctx["council_chair"] or (pane if pctx["council_chat"] else "")
+    return pctx
+
+
+def _build_close_cmd(ctx, pctx, tbin, client_arg, council, agents, afc_min):
+    """Build the exact Alt+Q close confirmation action matching tmux.conf."""
+    client = shlex.quote(ctx["client"])
+    pane = shlex.quote(ctx["pane"])
+    raw_pane = ctx["pane"]
+    raw_client = ctx["client"]
+    raw_win = ctx["win"]
+    council_bin = os.path.join(LOCAL_BIN, "afc-council")
+    agents_bin = os.path.join(LOCAL_BIN, "agents")
+    afc_min_bin = os.path.join(LOCAL_BIN, "afc-min")
+
+    if pctx["council_one"]:
+        return f"{council} --one-menu {client} {pane}"
+
+    if pctx["council_perm_judge"]:
+        jname = pctx["council_name"] or "supra-omnia"
+        title = f"#[align=centre] 🔒 @{jname} is the permanent final judge "
+        open_cfg_inner = (
+            f"{council_bin} --open-settings {shlex.quote(raw_client)} "
+            f"{shlex.quote(raw_win)} bp_role:JUDGE"
+        )
+        open_cfg = f"run-shell -b {shlex.quote(open_cfg_inner)}"
+        return (
+            f"{tbin} display-menu -M {client_arg}-x C -y C -T {shlex.quote(title)} "
+            f"{shlex.quote('Switch Judge provider & model…')} m {shlex.quote(open_cfg)} "
+            f"'' {shlex.quote('Close menu')} n ''"
+        )
+
+    if pctx["council_chat"]:
+        title = "#[align=centre] Close the council? (saved: Alt+K opens it again) "
+    elif pctx["council_member"]:
+        what = pctx["council_what"] or "Remove"
+        who = pctx["council_name"] or "member"
+        for_good = " for good" if what == "Delete agent" else ""
+        title = f"#[align=centre] {what} @{who}{for_good} from the council? "
+    elif pctx["project"] and pctx["window_panes"] == 1:
+        title = f"#[align=centre] Close {pctx['project']} for good (off the fleet list)? "
+    else:
+        title = "#[align=centre] Close this split? "
+
+    close_inner = f"{agents_bin} --close {shlex.quote(raw_pane)}"
+    close_run = f"run-shell {shlex.quote(close_inner)}"
+    can_min = not pctx["council_chat"] and not pctx["council_member"] and pctx["window_panes"] > 1
+    min_label = "Minimise it instead" if can_min else "-Minimise it instead"
+    min_inner = f"{afc_min_bin} hide {shlex.quote(raw_pane)}"
+    min_run = f"run-shell -b {shlex.quote(min_inner)}"
+    return (
+        f"{tbin} display-menu -M {client_arg}-x C -y C -T {shlex.quote(title)} "
+        f"{shlex.quote('Yes, close it')} y {shlex.quote(close_run)} "
+        f"{shlex.quote(min_label)} m {shlex.quote(min_run)} "
+        f"{shlex.quote('No, keep it')} n ''"
+    )
+
+
+def build_command_sections(ctx, pctx=None):
+    """Return all ACF command shortcuts grouped into logical sections."""
+    if pctx is None:
+        pctx = {
+            "council_chat": False,
+            "council_member": False,
+            "council_one": False,
+            "council_perm_judge": False,
+            "council_name": "",
+            "council_what": "",
+            "council_chair": "",
+            "window_panes": 1,
+            "project": "",
+            "win_council": False,
+            "in_council": False,
+            "chair_target": "",
+        }
+
     sock = shlex.quote(ctx["sock"]) if ctx["sock"] else ""
     tbin = shlex.quote(TMUX_BIN) + (f" -S {sock}" if sock else " -L agents")
     client = shlex.quote(ctx["client"])
+    client_arg = f"-c {client} " if ctx["client"] else ""
     win = shlex.quote(ctx["win"])
     pane = shlex.quote(ctx["pane"])
     pid = shlex.quote(ctx["pid"])
+    sess = shlex.quote(ctx["session"])
+    sess_colon = shlex.quote(ctx["session"] + ":")
     agents = shlex.quote(os.path.join(LOCAL_BIN, "agents"))
     council = shlex.quote(os.path.join(LOCAL_BIN, "afc-council"))
     model_menu = shlex.quote(os.path.join(LOCAL_BIN, "afc-model-menu"))
     afc_min = shlex.quote(os.path.join(LOCAL_BIN, "afc-min"))
     afc_move = shlex.quote(os.path.join(LOCAL_BIN, "afc-move"))
+    afc_even_path = os.path.join(LOCAL_BIN, "afc-even")
+    agents_path = os.path.join(LOCAL_BIN, "agents")
+    folder_name = os.path.basename((ctx.get("cwd") or "").rstrip("/")) or "shell"
 
-    return [
-        ("Switch agent / handoff", "Alt+G", "Change provider or hand off chat log",
-         f"{agents} --account-menu {client} {pane} {pid}"),
-        ("Pick model / effort", "Alt+M", "Switch model or reasoning effort",
-         f"{model_menu} {client} {pane} {pid}"),
-        ("Split right", "Alt+\\", "Open a new agent or terminal on the right",
-         f"{agents} --split-menu {client} {pane} {pid}"),
-        ("Split down", "Alt+-", "Open a new agent or terminal below",
-         f"{agents} --split-down {client} {pane} {pid}"),
-        ("Add project tab", "Alt+N", "Pick or create a project folder",
-         f"{agents} --pick >/dev/null 2>&1"),
-        ("Open project Council", "Alt+K", "Multi-LLM council in this project",
-         f"{council} --open {shlex.quote(ctx['session'])} {pid}"),
-        ("Open general Council", "Alt+Shift+K", "Multi-LLM council in ~/Council",
-         f"{council} --open-general {shlex.quote(ctx['session'])}"),
-        ("Fleet overview", "Alt+L", "List every agent and jump to it",
-         f"{agents} --overview-menu {client}"),
-        ("Toggle Express lane", "Alt+E", "Give this tab priority CPU & memory",
-         f"{agents} --lane-toggle {client} {win} {pid}"),
-        ("Move / merge split", "Alt+J", "Swap or merge this pane with neighbours",
-         f"{afc_move} menu {client} {pane}"),
-        ("Minimise split", "Alt+H", "Hide pane while keeping it running",
-         f"{afc_min} hide {pane}"),
-        ("Restore minimised", "Alt+U", "Bring back a minimised split",
-         f"{afc_min} show {client} {win}"),
-        ("Zoom / unzoom split", "Alt+Z", "Toggle fullscreen for this pane",
-         f"{tbin} resize-pane -Z -t {pane}"),
-        ("New terminal tab", "Alt+C", "Plain shell in current project folder",
-         f"{tbin} new-window -t {shlex.quote(ctx['session'] + ':')} {shlex.quote(os.path.join(LOCAL_BIN, 'agents') + ' --pane tab ' + ctx['pid'])}"),
-        ("Reload tmux config", "Ctrl+B r", "Source ~/.tmux.conf live",
-         f"{tbin} source-file {shlex.quote(os.path.join(HOME, '.tmux.conf'))} \\; display-message 'tmux config reloaded'"),
-    ]
+    in_council = pctx["in_council"]
+    chair_q = shlex.quote(pctx["chair_target"] or ctx["pane"])
+    council_hint = "Council only — press Alt+K or Alt+Shift+K to open a Council first"
+
+    join_prompt_cmd = (
+        f"join-pane -fh -s ':%%' ; run-shell -b '{afc_even_path} --window \"#{{window_id}}\"'"
+    )
+    tab_ctx_cmd = (
+        f"{tbin} display-menu -O {client_arg}-t {win} -x C -y C "
+        f"-T {shlex.quote('#[align=centre]#{window_index}:#{window_name}')} "
+        f"{shlex.quote('#{?#{>:#{session_windows},1},,-}Swap Left')} l {shlex.quote('swap-window -t :-1')} "
+        f"{shlex.quote('#{?#{>:#{session_windows},1},,-}Swap Right')} r {shlex.quote('swap-window -t :+1')} "
+        f"{shlex.quote('#{?pane_marked_set,,-}Swap Marked')} s {shlex.quote('swap-window')} '' "
+        f"Kill X {shlex.quote('kill-window')} "
+        f"Respawn R {shlex.quote('respawn-window -k')} "
+        f"{shlex.quote('#{?pane_marked,Unmark,Mark}')} m {shlex.quote('select-pane -m')} "
+        f"""Rename n {shlex.quote('command-prompt -F -I "#W" "rename-window -t \'#{window_id}\' -- \'%%\'"')} '' """
+        f"{shlex.quote('New After')} w {shlex.quote('new-window -a')} "
+        f"{shlex.quote('New At End')} W {shlex.quote('new-window')}"
+    )
+    close_cmd = _build_close_cmd(ctx, pctx, tbin, client_arg, council, agents, afc_min)
+
+    def item(name, key, desc, cmd, hotkeys=(), hint=""):
+        return {
+            "name": name,
+            "key": key,
+            "desc": desc,
+            "cmd": cmd,
+            "hotkeys": tuple(hotkeys),
+            "hint": hint,
+        }
+
+    agents_section = ("Agents & Models", [
+        item("Switch agent / handoff", "Alt+G", "Change provider, account or hand off chat",
+             f"{agents} --account-menu {client} {pane} {pid}", ("\x1bg",)),
+        item("Pick model / effort", "Alt+M", "Switch model or reasoning effort",
+             f"{model_menu} {client} {pane} {pid}", ("\x1bm",)),
+        item("Fleet overview", "Alt+L", "List every agent and jump to it",
+             f"{agents} --overview-menu {client}", ("\x1bl",)),
+        item("Toggle Express lane", "Alt+E", "Give this tab priority CPU & memory",
+             f"{agents} --lane-toggle {client} {win} {pid}", ("\x1be",)),
+    ])
+
+    council_section = ("Council (Multi-LLM)", [
+        item("Open project Council", "Alt+K", "Multi-LLM council in this project",
+             f"{council} --open {sess} {pid}", ("\x1bk",)),
+        item("Open general Council", "Alt+Shift+K", "Multi-LLM council in ~/Council",
+             f"{council} --open-general {sess}", ("\x1bK",)),
+        item("Council settings", "⚙ /settings", "Format, rounds, length & BP seat models",
+             f"{council} --open-settings {client} {win} settings" if in_council else None,
+             hint=council_hint),
+        item("Council add member", "Alt+A", "Add seat/agent or remove all (Council)",
+             f"{council} --add-menu {client} {win}" if in_council else None,
+             ("\x1ba",), hint=council_hint),
+        item("Council view toggle", "Alt+O / Alt+0", "One view vs one pane each (Council)",
+             f"{tbin} send-keys -t {chair_q} M-o" if in_council else None,
+             ("\x1bo", "\x1bO"), hint=council_hint),
+        item("Council new topic", "Alt+T", "Start a new meeting topic (Council)",
+             f"{tbin} send-keys -t {chair_q} M-t" if in_council else None,
+             ("\x1bt",), hint=council_hint),
+        item("Council permission", "Alt+P", "Cycle plan / edit / bypass (Council)",
+             f"{tbin} send-keys -t {chair_q} M-p" if in_council else None,
+             ("\x1bp",), hint=council_hint),
+        item("Council mode / Perm", "Shift+Tab", "Switch order/roast mode or agent perm",
+             f"{tbin} send-keys -t {chair_q if in_council else pane} BTab"),
+        item("Member model / side", "Alt+M / m", "Model, effort, side (O/G/F) on member",
+             f"{model_menu} {client} {pane} {pid}" if in_council else None,
+             hint=council_hint),
+        item("Council reset & wipe", "Meta+Alt+R", "Wipe memory, keep members (Alt+Shift+R)",
+             f"{council} --restart-wipe {win} {pane}" if in_council else None,
+             ("\x1b[97~", "\x1bR"), hint=council_hint),
+        item("Council end & purge", "Meta+Alt+Q", "End council & delete all (Alt+Shift+Q)",
+             f"{council} --end-all {win} {pane}" if in_council else None,
+             ("\x1b[98~", "\x1bQ"), hint=council_hint),
+        item("Stop council round", "Ctrl+C", "Interrupt active round without leaving",
+             f"{tbin} send-keys -t {chair_q} C-c" if in_council else None,
+             hint=council_hint),
+        item("Leave council", "Ctrl+D", "Exit council chat (same as /quit)",
+             f"{tbin} send-keys -t {chair_q} C-d" if in_council else None,
+             hint=council_hint),
+    ])
+
+    splits_section = ("Splits & Panes", [
+        item("Split right", "Alt+\\", "Open a new agent or terminal on the right",
+             f"{agents} --split-menu {client} {pane} {pid}", ("\x1b\\",)),
+        item("Split down", "Alt+-", "Open a new agent or terminal below",
+             f"{agents} --split-down {client} {pane} {pid}", ("\x1b-",)),
+        item("New chat beside", "Alt+W", "Same agent, new chat, in a new split",
+             None if in_council else f"{agents} --new-chat {pane}", ("\x1bw",)),
+        item("Move / merge split", "Alt+J", "Swap or merge this pane with neighbours",
+             f"{afc_move} menu {client} {pane}", ("\x1bj",)),
+        item("Minimise split", "Alt+H", "Hide pane while keeping it running",
+             f"{afc_min} hide {pane}", ("\x1bh",)),
+        item("Restore minimised", "Alt+U", "Bring back a minimised split",
+             f"{afc_min} show {client} {win}", ("\x1bu",)),
+        item("Zoom / unzoom split", "Alt+Z", "Toggle fullscreen for this pane",
+             f"{tbin} resize-pane -Z -t {pane}", ("\x1bz",)),
+        item("Close split / project", "Alt+Q", "Close pane or project (asks first)",
+             close_cmd, ("\x1bq",)),
+        item("Show tab beside this", "Alt+S", "Join another tab on the right side",
+             f"{tbin} command-prompt {client_arg}-p {shlex.quote('Show tab # on the right:')} {shlex.quote(join_prompt_cmd)}",
+             ("\x1bs",)),
+        item("Break split to own tab", "Alt+X", "Send focused pane to its own tab",
+             f"{tbin} break-pane -s {pane} \\; rename-window -t {pane} {shlex.quote(folder_name)}",
+             ("\x1bx",)),
+        item("Terminal split right", "Ctrl+B %", "Plain shell split on the right",
+             f"{tbin} split-window -h -t {pane} {shlex.quote(agents_path + ' --pane term ' + ctx['pid'])}"),
+        item("Terminal split down", 'Ctrl+B "', "Plain shell split below",
+             f"{tbin} split-window -v -t {pane} {shlex.quote(agents_path + ' --pane term ' + ctx['pid'])}"),
+    ])
+
+    tabs_section = ("Tabs & Navigation", [
+        item("Add project tab", "Alt+N", "Pick or create a project folder",
+             f"{agents} --pick >/dev/null 2>&1", ("\x1bn",)),
+        item("New terminal tab", "Alt+C", "Plain shell in current folder (Ctrl+B c)",
+             f"{tbin} new-window -t {sess_colon} {shlex.quote(agents_path + ' --pane tab ' + ctx['pid'])}",
+             ("\x1bc",)),
+        item("Code view", "Alt+I", "View, edit, delete code in this folder",
+             f"{shlex.quote(os.path.join(LOCAL_BIN, 'afc-ide'))} --open {client} "
+             f"{shlex.quote(ctx.get('cwd') or os.getcwd())}",
+             ("\x1bi",)),
+        item("Jump to tab 1–10", "Alt+1..0", "Pick a tab (Alt+1..9, Alt+0 = tab 10)",
+             f"{agents} --tab-menu {client}"),
+        item("Previous tab", "Ctrl+B p", "Switch to previous tab (or click ◀)",
+             f"{tbin} previous-window -t {sess}"),
+        item("Next tab", "Ctrl+B n", "Switch to next tab (or click ▶)",
+             f"{tbin} next-window -t {sess}"),
+        item("Open ACF menu", "Meta+Esc", "Toggle this popup (Alt+Esc or ACF badge)",
+             None, hint="Already open — press Meta+Esc, Alt+Esc, or Esc to close"),
+        item("Focus Fleet window", "Meta+A", "Bring ACF window to front (Mac: Opt+A)",
+             f"{agents} --window >/dev/null 2>&1"),
+    ])
+
+    clipboard_section = ("Clipboard & Chat", [
+        item("Smart paste (text/img)", "Ctrl+V", "Paste clipboard text or image into pane",
+             f"{agents} --paste {pane} {sock}" if sock else f"{agents} --paste {pane}",
+             ("\x16",)),
+        item("Send raw Ctrl+V", "Alt+V", "Pass literal Ctrl+V directly to app",
+             f"{tbin} send-keys -t {pane} C-v", ("\x1bv",)),
+        item("Long copy (>1 screen)", "Ctrl+Click", "Ctrl+Click start, scroll, Ctrl+Click end",
+             None, hint="Ctrl+Click start, scroll, Ctrl+Click end (Esc/q finishes)"),
+        item("Toggle task checklist", "Ctrl+T", "Show/hide task list (Claude / afc-chat)",
+             f"{tbin} send-keys -t {pane} C-t", ("\x14",)),
+        item("Expand / fold steps", "Ctrl+O", "Expand or fold tool steps (afc-chat)",
+             f"{tbin} send-keys -t {pane} C-o", ("\x0f",)),
+    ])
+
+    system_section = ("System & tmux", [
+        item("Reload tmux config", "Ctrl+B r", "Source ~/.tmux.conf live",
+             f"{tbin} source-file {shlex.quote(os.path.join(HOME, '.tmux.conf'))} \\; display-message 'tmux config reloaded'"),
+        item("Tab context menu", "Ctrl+B <", "Swap, rename, kill or create tab",
+             tab_ctx_cmd),
+        item("Pane context menu", "Ctrl+B >", "Copy, paste, search, top/bottom",
+             None, hint="Press Ctrl+B > or right-click any pane for the pane menu"),
+    ])
+
+    if in_council:
+        return [council_section, agents_section, splits_section, tabs_section, clipboard_section, system_section]
+    return [agents_section, council_section, splits_section, tabs_section, clipboard_section, system_section]
+
+
+def build_commands(ctx, pctx=None):
+    """Flat list of all ACF command dicts (preserves count/iteration ergonomics)."""
+    flat = []
+    for sec_title, items in build_command_sections(ctx, pctx):
+        for it in items:
+            it_copy = dict(it)
+            it_copy["section"] = sec_title
+            flat.append(it_copy)
+    return flat
 
 
 AFC_KEEP = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "afc-bar.d")
@@ -274,7 +569,7 @@ def _read_pane_who(pane_pid):
         if len(lines) >= 3 and lines[2]:
             parts = lines[2].split(None, 1)
             return parts[0].lower(), (parts[1] if len(parts) > 1 else "")
-    except Exception:
+    except OSError:
         pass
     return "", ""
 
@@ -389,20 +684,40 @@ def _extract_live_activity(sock, pane_id):
 
 
 def load_window_agents(ctx, win_item):
-    """Inspect all panes inside a window: provider, model, tokens, state, and live task."""
+    """Inspect all panes inside a window: provider, model, tokens, doctrine/model, state, and live task."""
     sock = ctx["sock"]
     wid = win_item["wid"]
     wname = win_item.get("win_name", "")
     tbin = shlex.quote(TMUX_BIN) + (f" -S {shlex.quote(sock)}" if sock else " -L agents")
-    fmt = "#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_active}\t#{@busy}\t#{@state}\t#{pane_current_command}\t#{pane_title}"
+    fmt = "#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_active}\t#{@busy}\t#{@state}\t#{pane_current_command}\t#{pane_title}\t#{@doctrine}\t#{@mental_model}\t#{pane_current_path}"
     out = run_out(tmux_cmd(sock, "list-panes", "-t", wid, "-F", fmt))
+    settings = load_settings()
+    g_doc = settings.get("doctrine", "off")
+    g_mod = settings.get("mental-model", "off")
+    all_pm = load_project_modes()
     agents = []
+
+    def resolve_eff(pv, prv, gv):
+        for v in (pv, prv, gv):
+            if v and v != "inherit":
+                return v
+        return "off"
 
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) < 8:
             continue
         pidx, pid_id, ppid, pactive, pbusy, pstate, pcmd, ptitle = parts[:8]
+        p_doc = parts[8].strip() if len(parts) > 8 and parts[8].strip() else "inherit"
+        p_mod = parts[9].strip() if len(parts) > 9 and parts[9].strip() else "inherit"
+        p_cwd = parts[10].strip() if len(parts) > 10 else ""
+        pkey = project_key_for(p_cwd) if p_cwd else ""
+        pm = all_pm.get(pkey) if pkey else None
+        pr_doc = (pm.get("doctrine") or "inherit") if isinstance(pm, dict) else "inherit"
+        pr_mod = (pm.get("mental-model") or "inherit") if isinstance(pm, dict) else "inherit"
+        eff_doc = resolve_eff(p_doc, pr_doc, g_doc)
+        eff_mod = resolve_eff(p_mod, pr_mod, g_mod)
+
         prov, acct = _read_pane_who(ppid)
         if not prov:
             prov = pcmd or "shell"
@@ -443,6 +758,13 @@ def load_window_agents(ctx, win_item):
             "express": express,
             "model": model,
             "tokens": tokens,
+            "proj_key": pkey,
+            "pane_doctrine": p_doc,
+            "pane_model": p_mod,
+            "proj_doctrine": pr_doc,
+            "proj_model": pr_mod,
+            "eff_doctrine": eff_doc,
+            "eff_model": eff_mod,
             "badge": badge,
             "badge_col": bcol,
             "task": task_str,
@@ -453,16 +775,44 @@ def load_window_agents(ctx, win_item):
 
 
 def _summarize_window_providers(sock, sess):
-    """Build compact per-window provider summaries (e.g. 'claude · gemini · codex')."""
-    out = run_out(tmux_cmd(sock, "list-panes", "-s", "-t", sess, "-F", "#{window_id}\t#{pane_pid}\t#{pane_current_command}"))
+    """Build compact per-window provider + active Doctrine/Model summaries in one tmux query."""
+    fmt = "#{window_id}\t#{pane_pid}\t#{pane_current_command}\t#{@doctrine}\t#{@mental_model}\t#{pane_current_path}"
+    out = run_out(tmux_cmd(sock, "list-panes", "-s", "-t", sess, "-F", fmt))
     by_win = {}
+    modes_by_win = {}
+    settings = load_settings()
+    all_pm = load_project_modes()
+    g_doc = settings.get("doctrine", "off")
+    g_mod = settings.get("mental-model", "off")
+
+    def _pick(pv, prv, gv):
+        for v in (pv, prv, gv):
+            if v and v != "inherit":
+                return v
+        return "off"
+
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) < 3:
             continue
         wid, ppid, pcmd = parts[:3]
+        p_doc = parts[3].strip() if len(parts) > 3 and parts[3].strip() else "inherit"
+        p_mod = parts[4].strip() if len(parts) > 4 and parts[4].strip() else "inherit"
+        pcwd = parts[5].strip() if len(parts) > 5 else ""
         prov, _acct = _read_pane_who(ppid)
         by_win.setdefault(wid, []).append(prov or pcmd or "shell")
+        pkey = project_key_for(pcwd) if pcwd else ""
+        pm = all_pm.get(pkey) if pkey else None
+        pr_doc = (pm.get("doctrine") or "inherit") if isinstance(pm, dict) else "inherit"
+        pr_mod = (pm.get("mental-model") or "inherit") if isinstance(pm, dict) else "inherit"
+        ed = _pick(p_doc, pr_doc, g_doc)
+        em = _pick(p_mod, pr_mod, g_mod)
+        if ed != "off" or em != "off":
+            wmodes = modes_by_win.setdefault(wid, [[], []])
+            if ed != "off" and ed not in wmodes[0]:
+                wmodes[0].append(ed)
+            if em != "off" and em not in wmodes[1]:
+                wmodes[1].append(em)
 
     summary = {}
     for wid, provs in by_win.items():
@@ -474,6 +824,12 @@ def _summarize_window_providers(sock, sess):
                 order.append(p)
             counts[p] += 1
         chunks = [f"{p} ×{counts[p]}" if counts[p] > 1 else p for p in order]
+        wmodes = modes_by_win.get(wid)
+        if wmodes:
+            if wmodes[0]:
+                chunks.append("D:" + "/".join(wmodes[0][:2]))
+            if wmodes[1]:
+                chunks.append("M:" + "/".join(MODEL_SHORT.get(m, m) for m in wmodes[1][:2]))
         summary[wid] = " · ".join(chunks)
     return summary
 
@@ -561,6 +917,759 @@ def load_sessions(ctx):
     return rows
 
 
+def _fmt_tokens_short(n):
+    try:
+        n = int(n or 0)
+    except Exception:
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1e3:.0f}k"
+    return str(n)
+
+
+def _parse_iso_local(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _fmt_history_when(ts, now_local=None):
+    dt = _parse_iso_local(ts)
+    if dt is None:
+        return "—"
+    now = now_local or datetime.datetime.now().astimezone()
+    mon = _MONTHS[dt.month - 1]
+    if dt.year == now.year:
+        return f"{mon} {dt.day:02d} {dt.strftime('%H:%M')}"
+    return f"{mon} {dt.day:02d} {dt.year}"
+
+
+def _date_parts_for_ts(ts):
+    """Return (date_key 'YYYY-MM-DD' or '', full_label 'Nov 25, 2026 (Wed)', short_label 'Nov 25, 2026')."""
+    dt = _parse_iso_local(ts)
+    if dt is None:
+        return "", "Undated", "Undated"
+    mon = _MONTHS[dt.month - 1]
+    wd = _WEEKDAYS[dt.weekday()]
+    short = f"{mon} {dt.day:02d}, {dt.year}"
+    return dt.strftime("%Y-%m-%d"), f"{short} ({wd})", short
+
+
+def group_history_by_date(items):
+    """Consolidate history threads into per-date groups sorted newest-first (Undated last)."""
+    buckets = {}
+    for it in items:
+        dk = it.get("date_key")
+        if dk is None:
+            dk, lbl, slbl = _date_parts_for_ts(it.get("last_ts") or it.get("first_ts"))
+            it["date_key"], it["date_label"], it["date_short"] = dk, lbl, slbl
+        buckets.setdefault(dk, []).append(it)
+
+    ordered_keys = sorted((k for k in buckets if k), reverse=True)
+    if "" in buckets:
+        ordered_keys.append("")
+
+    groups = []
+    for dk in ordered_keys:
+        grp_items = buckets[dk]
+        proj_names = []
+        tool_counts = {}
+        tool_order = []
+        for x in grp_items:
+            pn = x.get("project_name") or "~"
+            if pn not in proj_names:
+                proj_names.append(pn)
+            tl = x.get("tool") or "agent"
+            if tl not in tool_counts:
+                tool_counts[tl] = 0
+                tool_order.append(tl)
+            tool_counts[tl] += 1
+        tool_order.sort(key=lambda t: (-tool_counts[t], t))
+        tools_summary = " · ".join(f"{t} ×{tool_counts[t]}" if tool_counts[t] > 1 else t for t in tool_order)
+        groups.append({
+            "date_key": dk,
+            "label": grp_items[0].get("date_label") or (dk or "Undated"),
+            "short_label": grp_items[0].get("date_short") or (dk or "Undated"),
+            "items": grp_items,
+            "count": len(grp_items),
+            "proj_count": len(proj_names),
+            "proj_names": proj_names,
+            "tools_summary": tools_summary,
+        })
+    return groups
+
+
+def _scrollbar_cells(total, bar_rows, scroll, vis_units=None):
+    """Return a list of (color, glyph) for a vertical scrollbar of height `bar_rows`."""
+    if bar_rows <= 0:
+        return []
+    vis = bar_rows if vis_units is None else max(1, vis_units)
+    if total <= vis:
+        return [(FG_DIM, " ")] * bar_rows
+    thumb_h = max(1, min(bar_rows, int(round(bar_rows * vis / total))))
+    max_sc = max(1, total - vis)
+    thumb_top = int(round(max(0, min(scroll, max_sc)) * (bar_rows - thumb_h) / max_sc))
+    cells = []
+    for r in range(bar_rows):
+        if thumb_top <= r < thumb_top + thumb_h:
+            cells.append((FG_BLUE, "┃"))
+        else:
+            cells.append((FG_DIM, "│"))
+    return cells
+
+
+def _project_label(path):
+    if not path:
+        return "~"
+    try:
+        if os.path.realpath(path) == os.path.realpath(HOME):
+            return "~"
+    except OSError:
+        pass
+    return os.path.basename(path.rstrip("/")) or path
+
+
+def _discover_log_projects(cwd=""):
+    """Collect every project directory that has a logs/acf/acf.db database."""
+    candidates = []
+    if os.path.isfile(LOG_PROJECTS_PATH):
+        try:
+            with open(LOG_PROJECTS_PATH, "r", encoding="utf-8", errors="replace") as f:
+                for ln in f:
+                    p = ln.strip()
+                    if p and not p.startswith("#"):
+                        candidates.append(os.path.expanduser(p))
+        except OSError:
+            pass
+    if os.path.isfile(PROJECTS_PATH):
+        try:
+            with open(PROJECTS_PATH, "r", encoding="utf-8", errors="replace") as f:
+                for ln in f:
+                    raw = ln.strip()
+                    if raw.startswith("# closed"):
+                        raw = raw.split(":", 1)[-1].strip()
+                    if not raw or raw.startswith("#"):
+                        continue
+                    parts = raw.split()
+                    if len(parts) >= 2:
+                        candidates.append(os.path.expanduser(" ".join(parts[1:]).replace("\\$", "$")))
+        except OSError:
+            pass
+    if cwd:
+        cur = os.path.realpath(os.path.expanduser(cwd))
+        while cur and cur != "/":
+            if os.path.isfile(os.path.join(cur, LOG_SUB, "acf.db")):
+                candidates.append(cur)
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    candidates.append(HOME)
+
+    found = []
+    seen = set()
+    for p in candidates:
+        dbp = os.path.join(p, LOG_SUB, "acf.db")
+        if not os.path.isfile(dbp):
+            continue
+        try:
+            rp = os.path.realpath(p)
+        except OSError:
+            rp = p
+        if rp in seen:
+            continue
+        seen.add(rp)
+        found.append((rp, os.path.join(rp, LOG_SUB, "acf.db")))
+    return found
+
+
+HISTORY_TOP_DATES = 10
+
+
+def _parse_single_date(tok, today):
+    """Parse YYYY-MM-DD or MM-DD into a datetime.date, or None."""
+    s = tok.strip()
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s)
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.match(r"^(\d{1,2})-(\d{1,2})$", s)
+    if m:
+        try:
+            return datetime.date(today.year, int(m.group(1)), int(m.group(2)))
+        except ValueError:
+            return None
+    return None
+
+
+def _month_bounds(tok):
+    """Parse YYYY-MM into (first_date, last_date) as datetime.date, or None."""
+    m = re.match(r"^(\d{4})-(\d{1,2})$", tok.strip())
+    if not m:
+        return None
+    y, mo = int(m.group(1)), int(m.group(2))
+    if not (1 <= mo <= 12):
+        return None
+    first = datetime.date(y, mo, 1)
+    nxt = datetime.date(y + 1, 1, 1) if mo == 12 else datetime.date(y, mo + 1, 1)
+    return first, nxt - datetime.timedelta(days=1)
+
+
+def parse_date_range(spec, today=None):
+    """Parse a History date-range string into (mode, start_iso, end_iso, label), or None if invalid.
+
+    Accepts: empty/'top10'/'10' (Top 10), 'all'/'*', '30d', 'YYYY-MM', 'YYYY-MM-DD', 'MM-DD',
+    'A..B', 'A to B', 'A..', '..B'.
+    """
+    today = today or datetime.datetime.now().astimezone().date()
+    raw = (spec or "").strip()
+    low = raw.lower()
+    if low in ("", "top10", "top 10", "10"):
+        return ("top", None, None, "Top 10")
+    if low in ("all", "*"):
+        return ("all", None, None, "All")
+    m = re.match(r"^(\d+)\s*d(?:ays?)?$", low)
+    if m:
+        days = int(m.group(1))
+        if days < 1 or days > 3650:
+            return None
+        start = today - datetime.timedelta(days=days - 1)
+        return ("range", start.isoformat(), today.isoformat(), f"Last {days}d")
+
+    def _fmt_d(d):
+        return d.strftime("%m-%d") if d.year == today.year else d.isoformat()
+
+    # Range: A..B, A to B, A.., ..B
+    sep_m = re.search(r"\.\.|\s+to\s+", raw, re.IGNORECASE)
+    if sep_m:
+        left_s = raw[:sep_m.start()].strip()
+        right_s = raw[sep_m.end():].strip()
+        if not left_s and not right_s:
+            return None
+        s_d = e_d = None
+        if left_s:
+            mb = _month_bounds(left_s)
+            s_d = mb[0] if mb else _parse_single_date(left_s, today)
+            if s_d is None:
+                return None
+        if right_s:
+            mb = _month_bounds(right_s)
+            e_d = mb[1] if mb else _parse_single_date(right_s, today)
+            if e_d is None:
+                return None
+        if s_d and e_d and s_d > e_d:
+            s_d, e_d = e_d, s_d
+        s_iso = s_d.isoformat() if s_d else None
+        e_iso = e_d.isoformat() if e_d else None
+        if s_d and e_d:
+            lbl = _fmt_d(s_d) if s_d == e_d else f"{_fmt_d(s_d)}..{_fmt_d(e_d)}"
+        elif s_d:
+            lbl = f"{_fmt_d(s_d)}.."
+        else:
+            lbl = f"..{_fmt_d(e_d)}"
+        return ("range", s_iso, e_iso, lbl)
+
+    mb = _month_bounds(raw)
+    if mb:
+        return ("range", mb[0].isoformat(), mb[1].isoformat(), raw)
+    d = _parse_single_date(raw, today)
+    if d:
+        return ("range", d.isoformat(), d.isoformat(), _fmt_d(d))
+    return None
+
+
+def _shift_iso_date(iso_str, delta_days):
+    try:
+        d = datetime.date.fromisoformat(iso_str)
+        return (d + datetime.timedelta(days=delta_days)).isoformat()
+    except ValueError:
+        return iso_str
+
+
+def _month_calendar_weeks(year, month):
+    """Return list of Monday-first 7-cell weeks (datetime.date or None) for (year, month)."""
+    first = datetime.date(year, month, 1)
+    nxt = datetime.date(year + 1, 1, 1) if month == 12 else datetime.date(year, month + 1, 1)
+    n_days = (nxt - first).days
+    lead = first.weekday()  # Mon=0 .. Sun=6
+    cells = [None] * lead + [datetime.date(year, month, day) for day in range(1, n_days + 1)]
+    while len(cells) % 7:
+        cells.append(None)
+    return [cells[i:i + 7] for i in range(0, len(cells), 7)]
+
+
+def _shift_month(year, month, delta):
+    idx = year * 12 + (month - 1) + delta
+    return idx // 12, (idx % 12) + 1
+
+
+def _read_project_history(proj_tuple, now_local, start_date=None, end_date=None, max_dates=None):
+    project, db_path = proj_tuple
+    proj_name = _project_label(project)
+    short_proj = project.replace(HOME, "~", 1) if project.startswith(HOME) else project
+    items = []
+    db = None
+    try:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        ts_day = "substr(COALESCE(NULLIF(last_ts,''), first_ts), 1, 10)"
+        where = ["(parent IS NULL OR parent = '')"]
+        params = []
+        if start_date:
+            where.append(f"{ts_day} >= ?")
+            params.append(_shift_iso_date(start_date, -1))
+        if end_date:
+            where.append(f"{ts_day} <= ?")
+            params.append(_shift_iso_date(end_date, 1))
+        if max_dates and not start_date and not end_date:
+            # Global top N local dates are always a subset of each project's top N+1 UTC dates.
+            where.append(
+                f"{ts_day} >= COALESCE(("
+                f"SELECT MIN(d) FROM ("
+                f"SELECT DISTINCT {ts_day} AS d FROM threads "
+                f"WHERE parent IS NULL OR parent = '' ORDER BY d DESC LIMIT ?)), '')"
+            )
+            params.append(int(max_dates) + 1)
+        sql = (
+            "SELECT id, tool, account, cwd, title, first_ts, last_ts, "
+            "models, cost_usd, tokens_in, tokens_out, source "
+            f"FROM threads WHERE {' AND '.join(where)} ORDER BY last_ts DESC"
+        )
+        rows = db.execute(sql, params).fetchall()
+        for r in rows:
+            tid, tool, acct, cwd, title, fts, lts, models, cost, tin, tout, source = r
+            dk, dlbl, dshort = _date_parts_for_ts(lts or fts)
+            if start_date and (not dk or dk < start_date):
+                continue
+            if end_date and (not dk or dk > end_date):
+                continue
+            tool_l = (tool or "agent").lower()
+            clean_title = " ".join((title or "").split()) or "(untitled)"
+            native_id = tid.split(":", 1)[1] if ":" in (tid or "") else (tid or "")
+            if native_id.startswith("session-"):   # Gemini: session-<date>T<time>-<hash>: the hash is the distinct part
+                native_id = native_id.rsplit("-", 1)[-1]
+            short_id = native_id[:8]
+            items.append({
+                "id": tid or "",
+                "short_id": short_id,
+                "tool": tool_l,
+                "prov_col": PROVIDER_COLORS.get(tool_l, FG_MUTED),
+                "account": acct or "",
+                "project": project,
+                "project_name": proj_name,
+                "short_project": short_proj,
+                "cwd": cwd or project,
+                "title": clean_title,
+                "first_ts": fts or "",
+                "last_ts": lts or fts or "",
+                "when_short": _fmt_history_when(lts or fts, now_local),
+                "date_key": dk,
+                "date_label": dlbl,
+                "date_short": dshort,
+                "models": " ".join((models or "").split()),
+                "cost_usd": cost,
+                "tokens_in": tin,
+                "tokens_out": tout,
+                "source": source or "",
+                "db_path": db_path,
+            })
+    except sqlite3.Error:
+        return []
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
+    return items
+
+
+def load_history(cwd="", start_date=None, end_date=None, max_dates=None):
+    """Load top-level session history across all projects' logs/acf/acf.db files."""
+    projects = _discover_log_projects(cwd)
+    if not projects:
+        return []
+    now_local = datetime.datetime.now().astimezone()
+    all_items = []
+    max_workers = min(8, max(1, len(projects)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(_read_project_history, pt, now_local, start_date, end_date, max_dates) for pt in projects]
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                all_items.extend(fut.result())
+            except (OSError, sqlite3.Error, ValueError):
+                pass
+    all_items.sort(key=lambda x: x["last_ts"], reverse=True)
+    return all_items
+
+
+def _resolve_resume_chat_id(item):
+    """Return the exact CLI session/conversation ID to pass to `agents --pane restore`."""
+    tid = item.get("id") or ""
+    raw_id = tid.split(":", 1)[1] if ":" in tid else tid
+    if item.get("tool") == "gemini":
+        src = item.get("source") or ""
+        if src and os.path.isfile(src):
+            try:
+                with open(src, "r", encoding="utf-8", errors="replace") as f:
+                    if src.endswith(".jsonl"):
+                        first = json.loads(f.readline())
+                    else:
+                        first = json.load(f)
+                if isinstance(first, dict) and first.get("sessionId"):
+                    return str(first["sessionId"])
+            except (OSError, ValueError):
+                pass
+    return raw_id
+
+
+def find_live_pane_for_history(ctx, item):
+    """If this historical session is currently open in a live tmux pane, return (wid, pane_id)."""
+    chat_id = _resolve_resume_chat_id(item)
+    if not chat_id or len(chat_id) < 6:
+        return None
+    sock = ctx.get("sock", "")
+    sess = ctx.get("session") or "agents"
+    pane_out = run_out(tmux_cmd(sock, "list-panes", "-s", "-t", sess, "-F", "#{window_id}\t#{pane_id}\t#{pane_pid}"))
+    if not pane_out:
+        return None
+
+    panes = []
+    for ln in pane_out.splitlines():
+        parts = ln.split("\t")
+        if len(parts) >= 3 and parts[2].isdigit():
+            panes.append((parts[0], parts[1], int(parts[2])))
+    if not panes:
+        return None
+
+    # Build lightweight process tree once via ps
+    ps_out = run_out(["ps", "-eo", "pid=,ppid=,args="], timeout=1.5)
+    children = {}
+    args_by_pid = {}
+    for ln in ps_out.splitlines():
+        parts = ln.strip().split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            p_i, pp_i = int(parts[0]), int(parts[1])
+            children.setdefault(pp_i, []).append(p_i)
+            args_by_pid[p_i] = parts[2] if len(parts) == 3 else ""
+
+    afc_chat_dir = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "afc-chat")
+    claude_dirs = [os.path.join(HOME, ".claude")]
+    acct_file = os.path.join(HOME, ".config", "agents", "accounts")
+    if os.path.isfile(acct_file):
+        try:
+            for raw in open(acct_file, "r", encoding="utf-8", errors="replace"):
+                s = raw.strip()
+                if s and not s.startswith("#"):
+                    pts = s.split()
+                    if len(pts) >= 2:
+                        d = os.path.expanduser(pts[1])
+                        if d not in claude_dirs:
+                            claude_dirs.append(d)
+        except OSError:
+            pass
+
+    def pid_matches(pid):
+        if chat_id in args_by_pid.get(pid, ""):
+            return True
+        chat_json = os.path.join(afc_chat_dir, f"{pid}.json")
+        if os.path.isfile(chat_json):
+            try:
+                data = json.load(open(chat_json, "r", encoding="utf-8", errors="replace"))
+                if data.get("session_id") == chat_id:
+                    return True
+            except (OSError, ValueError):
+                pass
+        for cdir in claude_dirs:
+            sf = os.path.join(cdir, "sessions", f"{pid}.json")
+            if os.path.isfile(sf):
+                try:
+                    data = json.load(open(sf, "r", encoding="utf-8", errors="replace"))
+                    if data.get("sessionId") == chat_id:
+                        return True
+                except (OSError, ValueError):
+                    pass
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            for entry in os.scandir(fd_dir):
+                try:
+                    if chat_id in os.readlink(entry.path):
+                        return True
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return False
+
+    for wid, pid_id, root_pid in panes:
+        stack = [root_pid]
+        seen = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if pid_matches(cur):
+                return wid, pid_id
+            stack.extend(children.get(cur, ()))
+    return None
+
+
+def has_native_session_file(item):
+    """True when the tool's own native session file is still present on disk for native resume."""
+    src = item.get("source") or ""
+    if src and os.path.isfile(src):
+        return True
+    if item.get("tool") == "claude":
+        chat_id = _resolve_resume_chat_id(item)
+        if chat_id:
+            proj_root = os.path.join(HOME, ".claude", "projects")
+            if os.path.isdir(proj_root):
+                try:
+                    for e in os.scandir(proj_root):
+                        if e.is_dir() and os.path.isfile(os.path.join(e.path, f"{chat_id}.jsonl")):
+                            return True
+                except OSError:
+                    pass
+    return False
+
+
+def load_handoff_targets(origin_tool="", origin_acct=""):
+    """List installed LLM providers/accounts to hand off a cut-off session to (other tools first)."""
+    cfg_dir = os.path.join(HOME, ".config", "agents")
+    acct_files = {
+        "claude": "accounts",
+        "codex": "accounts-codex",
+        "gemini": "accounts-gemini",
+        "agy": "accounts-agy",
+        "copilot": "accounts-copilot",
+        "opencode": "accounts-opencode",
+    }
+    targets = []
+    for tool in ("claude", "codex", "gemini", "agy", "copilot", "opencode"):
+        if not run_out(["/bin/sh", "-c", f"command -v {tool}"], timeout=1.0):
+            continue
+        af = os.path.join(cfg_dir, acct_files[tool])
+        accts = []
+        if os.path.isfile(af):
+            try:
+                for raw in open(af, "r", encoding="utf-8", errors="replace"):
+                    s = raw.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    pts = s.split()
+                    if len(pts) >= 2 and pts[0] not in accts:
+                        accts.append(pts[0])
+            except OSError:
+                pass
+        if not accts:
+            accts = ["default" if tool == "claude" else "main"]
+        for acct in accts:
+            same = (tool == (origin_tool or "").lower() and acct == (origin_acct or ""))
+            targets.append({
+                "tool": tool,
+                "account": acct,
+                "same": same,
+                "prov_col": PROVIDER_COLORS.get(tool, FG_MUTED),
+            })
+    # Put different providers first so switching to another LLM is immediate
+    origin_l = (origin_tool or "").lower()
+    targets.sort(key=lambda t: (1 if t["tool"] == origin_l else 0, 1 if t["same"] else 0))
+    return targets
+
+
+def build_history_handoff_cmd(ctx, item, target_tool, target_acct=""):
+    """Build a tmux command that generates a compact pickup brief from acf.db and launches target_tool."""
+    sock = shlex.quote(ctx["sock"]) if ctx.get("sock") else ""
+    tbin = shlex.quote(TMUX_BIN) + (f" -S {sock}" if sock else " -L agents")
+    sess_colon = shlex.quote((ctx.get("session") or "agents") + ":")
+    agents_path = os.path.join(LOCAL_BIN, "agents")
+    afc_logs = os.path.join(LOCAL_BIN, "afc-logs")
+    target_dir = item.get("cwd") or ""
+    if not target_dir or not os.path.isdir(target_dir):
+        target_dir = item.get("project") or HOME
+    if not os.path.isdir(target_dir):
+        target_dir = HOME
+    win_name = item.get("project_name") or _project_label(target_dir)
+    tid = item.get("id") or ""
+    acct = target_acct or ("-" if target_tool != "claude" else "")
+    pane_cmd = (
+        f"cd {shlex.quote(target_dir)} && "
+        f"brief=$({shlex.quote(afc_logs)} handoff {shlex.quote(tid)} 2>/dev/null) ; "
+        f"exec {shlex.quote(agents_path)} --pane handoff 0 "
+        f"{shlex.quote(target_tool)} {shlex.quote(acct or '-')} \"$brief\""
+    )
+    return f"{tbin} new-window -t {sess_colon} -n {shlex.quote(win_name)} {shlex.quote(pane_cmd)}"
+
+
+def build_history_go_cmd(ctx, item):
+    """Jump to live pane if open, native-resume if source exists, else auto-handoff via acf.db brief."""
+    live = find_live_pane_for_history(ctx, item)
+    if live:
+        wid, pid_id = live
+        sock = shlex.quote(ctx["sock"]) if ctx.get("sock") else ""
+        tbin = shlex.quote(TMUX_BIN) + (f" -S {sock}" if sock else " -L agents")
+        return f"{tbin} select-window -t {shlex.quote(wid)} \\; select-pane -t {shlex.quote(pid_id)}"
+    if not has_native_session_file(item):
+        return build_history_handoff_cmd(ctx, item, item.get("tool") or "claude", item.get("account") or "")
+    return build_history_resume_cmd(ctx, item)
+
+
+def build_history_resume_cmd(ctx, item):
+    """Build a tmux command to resume a historical session in its project folder."""
+    sock = shlex.quote(ctx["sock"]) if ctx.get("sock") else ""
+    tbin = shlex.quote(TMUX_BIN) + (f" -S {sock}" if sock else " -L agents")
+    sess_colon = shlex.quote((ctx.get("session") or "agents") + ":")
+    agents_path = os.path.join(LOCAL_BIN, "agents")
+    target_dir = item.get("cwd") or ""
+    if not target_dir or not os.path.isdir(target_dir):
+        target_dir = item.get("project") or HOME
+    if not os.path.isdir(target_dir):
+        target_dir = HOME
+    win_name = item.get("project_name") or _project_label(target_dir)
+    tool = item.get("tool") or "claude"
+    acct = item.get("account") or "-"
+    chat_id = _resolve_resume_chat_id(item) or "last"
+    # Use explicit `cd` so paths containing `$$` (like Codebase/$$AFocus) are never mangled
+    pane_cmd = (
+        f"cd {shlex.quote(target_dir)} && "
+        f"exec {shlex.quote(agents_path)} --pane restore 0 "
+        f"{shlex.quote(tool)} {shlex.quote(acct)} {shlex.quote(chat_id)}"
+    )
+    return f"{tbin} new-window -t {sess_colon} -n {shlex.quote(win_name)} {shlex.quote(pane_cmd)}"
+
+
+def build_history_pager_cmd(ctx, item):
+    """Build a tmux popup command to read the full thread via `afc-logs show` in less."""
+    sock = shlex.quote(ctx["sock"]) if ctx.get("sock") else ""
+    tbin = shlex.quote(TMUX_BIN) + (f" -S {sock}" if sock else " -L agents")
+    client_arg = f"-c {shlex.quote(ctx['client'])} " if ctx.get("client") else ""
+    afc_logs = os.path.join(LOCAL_BIN, "afc-logs")
+    tid = item.get("id") or ""
+    title = f" History: {trunc(item.get('title') or tid, 50)} "
+    inner = f"{shlex.quote(afc_logs)} show {shlex.quote(tid)} | less -R"
+    return (
+        f"{tbin} display-popup -E {client_arg}-x C -y C -w 88% -h 88% "
+        f"-b rounded -S fg=#7aa2f7 -T {shlex.quote(title)} {shlex.quote(inner)}"
+    )
+
+
+def load_history_entries(item, include_tools=False, max_entries=500):
+    """Load transcript blocks and metadata for a single thread from its acf.db."""
+    db_path = item.get("db_path") or ""
+    tid = item.get("id") or ""
+    result = {
+        "total": 0,
+        "users": 0,
+        "assistants": 0,
+        "tools": 0,
+        "subagents": 0,
+        "tokens_in": item.get("tokens_in"),
+        "tokens_out": item.get("tokens_out"),
+        "blocks": [],
+        "truncated": False,
+        "error": "",
+    }
+    if not db_path or not os.path.isfile(db_path):
+        result["error"] = "Log database not found on disk."
+        return result
+
+    db = None
+    try:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        cnt_row = db.execute(
+            """SELECT count(*),
+                      sum(CASE WHEN kind='user' THEN 1 ELSE 0 END),
+                      sum(CASE WHEN kind='assistant' THEN 1 ELSE 0 END),
+                      sum(CASE WHEN kind='tool_call' THEN 1 ELSE 0 END)
+               FROM entries WHERE thread=?""",
+            (tid,),
+        ).fetchone()
+        if cnt_row:
+            result["total"] = cnt_row[0] or 0
+            result["users"] = cnt_row[1] or 0
+            result["assistants"] = cnt_row[2] or 0
+            result["tools"] = cnt_row[3] or 0
+        sub_row = db.execute("SELECT count(*) FROM threads WHERE parent=?", (tid,)).fetchone()
+        if sub_row:
+            result["subagents"] = sub_row[0] or 0
+        if result["tokens_in"] is None or result["tokens_out"] is None:
+            u_row = db.execute(
+                "SELECT sum(input+cache_read+cache_write), sum(output) FROM usage WHERE thread=?",
+                (tid,),
+            ).fetchone()
+            if u_row and (u_row[0] or u_row[1]):
+                if result["tokens_in"] is None:
+                    result["tokens_in"] = u_row[0] or 0
+                if result["tokens_out"] is None:
+                    result["tokens_out"] = u_row[1] or 0
+
+        if include_tools:
+            q = "SELECT ts, kind, who, model, text FROM entries WHERE thread=? ORDER BY id LIMIT ?"
+        else:
+            q = (
+                "SELECT ts, kind, who, model, text FROM entries "
+                "WHERE thread=? AND kind IN ('user','assistant','tool_call') ORDER BY id LIMIT ?"
+            )
+        rows = db.execute(q, (tid, max_entries + 1)).fetchall()
+        if len(rows) > max_entries:
+            result["truncated"] = True
+            rows = rows[:max_entries]
+
+        blocks = []
+        pending_tools = []
+
+        def flush_tools():
+            if not pending_tools:
+                return
+            names = []
+            for nm in pending_tools:
+                if nm and nm not in names:
+                    names.append(nm)
+            preview = ", ".join(names[:4]) + ("…" if len(names) > 4 else "")
+            n = len(pending_tools)
+            lbl = f"{n} tool call{'s' if n != 1 else ''}" + (f" ({preview})" if preview else "")
+            blocks.append({"kind": "tool_summary", "ts": "", "who": "", "text": lbl})
+            pending_tools.clear()
+
+        for ts, kind, who, model, text in rows:
+            if not include_tools and kind == "tool_call":
+                pending_tools.append(who or "tool")
+                continue
+            flush_tools()
+            dt = _parse_iso_local(ts)
+            ts_short = dt.strftime("%H:%M") if dt else ""
+            blocks.append({
+                "kind": kind or "system",
+                "ts": ts_short,
+                "who": who or "",
+                "model": model or "",
+                "text": text or "",
+            })
+        flush_tools()
+        result["blocks"] = blocks
+    except sqlite3.Error as e:
+        result["error"] = f"Could not read log DB: {e}"
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
+    return result
+
+
 def load_about(ctx):
     branch = run_out(["git", "-C", REPO_ROOT, "rev-parse", "--abbrev-ref", "HEAD"]) or "—"
     commit = run_out(["git", "-C", REPO_ROOT, "rev-parse", "--short", "HEAD"]) or "—"
@@ -590,12 +1699,32 @@ def load_about(ctx):
 class MenuApp:
     def __init__(self, ctx):
         self.ctx = ctx
-        self.tab = 0
-        self.sel = [0, 0, 0, 0]
-        self.scroll = [0, 0, 0, 0]
-        self.commands = build_commands(ctx)
+        self.tab = TAB_COMMANDS
+        self.sel = [0] * len(TABS)
+        self.scroll = [0] * len(TABS)
+        self.pane_ctx = load_pane_context(ctx)
+        self.command_sections = build_command_sections(ctx, self.pane_ctx)
+        self.commands = []
+        self.command_rows = []
+        self.cmd_to_row = []
+        self.hotkey_map = {}
+        for sec_title, items in self.command_sections:
+            self.command_rows.append(("header", sec_title, None))
+            for it in items:
+                cmd_idx = len(self.commands)
+                it_copy = dict(it)
+                it_copy["section"] = sec_title
+                self.commands.append(it_copy)
+                self.cmd_to_row.append(len(self.command_rows))
+                self.command_rows.append(("cmd", cmd_idx, it_copy))
+                for hk in it_copy.get("hotkeys", ()):
+                    self.hotkey_map[hk] = cmd_idx
         self.sessions = load_sessions(ctx)
         self.settings = load_settings()
+        self.proj_key = project_key_for(ctx.get("cwd", ""))
+        self.proj_name = _project_label(self.proj_key) if self.proj_key else "project"
+        self.proj_modes = dict(load_project_modes().get(self.proj_key) or {}) if self.proj_key else {}
+        self.pane_modes = load_pane_modes(ctx)
         self.cg = read_cgroup_summary()
         self.autonice = run_out(["systemctl", "--user", "is-active", "autonice.service"]) or "inactive"
         self.about = load_about(ctx)
@@ -608,8 +1737,424 @@ class MenuApp:
         self.inspect_scroll = 0
         self.back_rect = None    # (row, s_col, e_col)
         self.jump_rect = None    # (row, s_col, e_col)
+        self.agent_doc_rects = {}  # row -> (s_col, e_col, agent_idx)
+        self.agent_mod_rects = {}  # row -> (s_col, e_col, agent_idx)
+        self.agent_clr_rects = {}  # row -> (s_col, e_col, agent_idx)
+
+        # History tab state (lazy-loaded on first visit so menu startup stays instant)
+        self.history_loaded = False
+        self.history_loaded_scope = None  # ("top", None, None) | ("range", s, e) | ("all", None, None)
+        self.history_all = []
+        self.history_projects = []      # [(project_path, project_name, count)]
+        self.history_tools = []         # [tool_name, ...]
+        self.history_proj_filter = ""   # "" = All projects
+        self.history_tool_filter = ""   # "" = All tools
+        self.history_query = ""
+        self.history_searching = False
+        self.history_date_mode = "top"  # "top" (latest 10 dates) | "range" (custom) | "all"
+        self.history_date_start = None
+        self.history_date_end = None
+        self.history_date_range_label = "Top 10"
+        self.history_date_input = ""
+        self.history_date_editing = False
+        _today = datetime.datetime.now().astimezone().date()
+        self.dp_year = _today.year
+        self.dp_month = _today.month
+        self.dp_cursor = _today
+        self.dp_start = None
+        self.dp_end = None
+        self.dp_day_rects = []
+        self.dp_btn_rects = []
+        self.history_filtered = []
+        self.history_date_groups = []   # consolidated per-date groups (Level 1)
+        self.history_date_key = None    # selected date_key when drilling into a date (Level 2)
+        self.history_date_label = ""
+        self.history_date_sel = 0
+        self.history_date_scroll = 0
+        self.history_detail = None      # selected history thread dict when inspecting (Level 3)
+        self.history_detail_data = None
+        self.history_detail_tools = False
+        self.history_detail_scroll = 0
+        self.history_detail_lines = []
+        self.history_detail_cache_key = None
+        self.history_handoff_item = None  # thread dict when picking another LLM to hand off to
+        self.history_handoff_targets = []
+        self.history_handoff_sel = 0
+        self.history_handoff_scroll = 0
+        self.hist_proj_rect = None
+        self.hist_tool_rect = None
+        self.hist_dates_rect = None
+        self.hist_search_rect = None
+        self.hist_resume_rect = None
+        self.hist_handoff_rect = None
+        self.hist_pager_rect = None
+        self.hist_doc_rects = {}   # row -> (s_col, e_col, item_idx)
+        self.hist_mod_rects = {}   # row -> (s_col, e_col, item_idx)
+        self.hist_clr_rects = {}   # row -> (s_col, e_col, item_idx)
+        self.hist_copy_rects = {}  # row -> (s_col, e_col, item_idx) for the session-id ⧉ copy icon
+        self.scrollbar_rect = None      # (top_row, bot_row, col, total, visible, mode)
+
         self.pending_cmd = None
         self.running = True
+
+    def _desired_history_scope(self):
+        if self.history_date_mode == "range":
+            return ("range", self.history_date_start, self.history_date_end)
+        if self.history_date_mode == "all":
+            return ("all", None, None)
+        return ("top", None, None)
+
+    def ensure_history_loaded(self, force=False):
+        desired = self._desired_history_scope()
+        if self.history_loaded and not force:
+            if self.history_loaded_scope == desired or self.history_loaded_scope == ("all", None, None):
+                return
+        cwd = self.ctx.get("cwd", "")
+        if desired[0] == "range":
+            self.history_all = load_history(cwd, start_date=desired[1], end_date=desired[2])
+        elif desired[0] == "all":
+            self.history_all = load_history(cwd)
+        else:
+            self.history_all = load_history(cwd, max_dates=HISTORY_TOP_DATES)
+        self.history_loaded = True
+        self.history_loaded_scope = desired
+
+        # Order projects: current project first (if it has history), then by most recent thread
+        proj_counts = {}
+        proj_names = {}
+        proj_order = []
+        tools_seen = []
+        for it in self.history_all:
+            p = it["project"]
+            if p not in proj_counts:
+                proj_counts[p] = 0
+                proj_names[p] = it["project_name"]
+                proj_order.append(p)
+            proj_counts[p] += 1
+            t = it["tool"]
+            if t and t not in tools_seen:
+                tools_seen.append(t)
+
+        cwd_real = ""
+        if self.ctx.get("cwd"):
+            try:
+                cwd_real = os.path.realpath(self.ctx["cwd"])
+            except OSError:
+                cwd_real = self.ctx["cwd"]
+        cur_proj = ""
+        if cwd_real:
+            for p in sorted(proj_order, key=len, reverse=True):
+                if cwd_real == p or cwd_real.startswith(p.rstrip("/") + "/"):
+                    cur_proj = p
+                    break
+        if cur_proj and cur_proj in proj_order:
+            proj_order.remove(cur_proj)
+            proj_order.insert(0, cur_proj)
+
+        self.history_projects = [(p, proj_names[p], proj_counts[p]) for p in proj_order]
+        self.history_tools = tools_seen
+        if self.history_proj_filter and self.history_proj_filter not in proj_counts:
+            self.history_proj_filter = ""
+        if self.history_tool_filter and self.history_tool_filter not in tools_seen:
+            self.history_tool_filter = ""
+        self._apply_history_filter()
+
+    def _apply_history_filter(self):
+        pf = self.history_proj_filter
+        tf = self.history_tool_filter
+        terms = [w for w in self.history_query.lower().split() if w]
+        d_start = self.history_date_start if self.history_date_mode == "range" else None
+        d_end = self.history_date_end if self.history_date_mode == "range" else None
+        out = []
+        for it in self.history_all:
+            if pf and it["project"] != pf:
+                continue
+            if tf and it["tool"] != tf:
+                continue
+            dk = it.get("date_key") or ""
+            if d_start and (not dk or dk < d_start):
+                continue
+            if d_end and (not dk or dk > d_end):
+                continue
+            if terms:
+                hay = (
+                    f"{it['title']} {it['project_name']} {it['short_project']} "
+                    f"{it['tool']} {it['account']} {it['models']} {it['short_id']}"
+                ).lower()
+                if not all(w in hay for w in terms):
+                    continue
+            out.append(it)
+        groups = group_history_by_date(out)
+        if self.history_date_mode == "top" and len(groups) > HISTORY_TOP_DATES:
+            groups = groups[:HISTORY_TOP_DATES]
+            allowed_dates = {g["date_key"] for g in groups}
+            out = [it for it in out if (it.get("date_key") or "") in allowed_dates]
+        self.history_filtered = out
+        self.history_date_groups = groups
+        self.sel[TAB_HISTORY] = 0
+        self.scroll[TAB_HISTORY] = 0
+        self.history_date_sel = 0
+        self.history_date_scroll = 0
+
+    def _apply_history_date_spec(self, spec):
+        parsed = parse_date_range(spec)
+        if parsed is None:
+            self.status_msg = "Invalid date range — try 2026-11-01..2026-11-15, 2026-11-10, 30d, or all"
+            return False
+        mode, start_d, end_d, label = parsed
+        self.history_date_mode = mode
+        self.history_date_start = start_d
+        self.history_date_end = end_d
+        self.history_date_range_label = label
+        self.history_date_editing = False
+        self.history_date_input = "" if mode == "top" else (spec or "").strip()
+        self.ensure_history_loaded()
+        self._apply_history_filter()
+        d_n = len(self.history_date_groups)
+        c_n = len(self.history_filtered)
+        self.status_msg = f"Dates: {label} ({d_n}d · {c_n} chat{'s' if c_n != 1 else ''})"
+        return True
+
+    def open_history_date_picker(self):
+        today = datetime.datetime.now().astimezone().date()
+        self.history_searching = False
+        self.history_date_editing = True
+        self.history_date_input = ""
+        s_d = e_d = None
+        if self.history_date_mode == "range":
+            try:
+                if self.history_date_start:
+                    s_d = datetime.date.fromisoformat(self.history_date_start)
+                if self.history_date_end:
+                    e_d = datetime.date.fromisoformat(self.history_date_end)
+            except ValueError:
+                s_d = e_d = None
+        self.dp_start = s_d
+        self.dp_end = e_d
+        self.dp_cursor = e_d or s_d or today
+        self.dp_year = self.dp_cursor.year
+        self.dp_month = self.dp_cursor.month
+        self.status_msg = "Click or Enter Start date, then End date (or pick a preset)"
+
+    def _dp_move_cursor(self, delta_days):
+        self.dp_cursor = self.dp_cursor + datetime.timedelta(days=delta_days)
+        self.dp_year = self.dp_cursor.year
+        self.dp_month = self.dp_cursor.month
+
+    def _dp_shift_month(self, delta_months):
+        ny, nm = _shift_month(self.dp_year, self.dp_month, delta_months)
+        nxt = datetime.date(ny + 1, 1, 1) if nm == 12 else datetime.date(ny, nm + 1, 1)
+        last_day = (nxt - datetime.timedelta(days=1)).day
+        self.dp_year, self.dp_month = ny, nm
+        self.dp_cursor = datetime.date(ny, nm, min(self.dp_cursor.day, last_day))
+
+    def _dp_pick_date(self, d):
+        self.history_date_input = ""
+        self.dp_cursor = d
+        self.dp_year, self.dp_month = d.year, d.month
+        if self.dp_start is None or self.dp_end is not None:
+            self.dp_start = d
+            self.dp_end = None
+            self.status_msg = f"Start: {d.isoformat()} — click/Enter End date (Enter again = 1 day)"
+        else:
+            s, e = (self.dp_start, d) if self.dp_start <= d else (d, self.dp_start)
+            self.dp_start, self.dp_end = s, e
+            self._apply_history_date_spec(f"{s.isoformat()}..{e.isoformat()}")
+
+    def _dp_apply_current(self):
+        if self.history_date_input.strip():
+            self._apply_history_date_spec(self.history_date_input)
+            return
+        if self.dp_start and self.dp_end:
+            s, e = (self.dp_start, self.dp_end) if self.dp_start <= self.dp_end else (self.dp_end, self.dp_start)
+        elif self.dp_start:
+            s, e = (self.dp_start, self.dp_cursor) if self.dp_start <= self.dp_cursor else (self.dp_cursor, self.dp_start)
+        else:
+            s = e = self.dp_cursor
+        self._apply_history_date_spec(f"{s.isoformat()}..{e.isoformat()}")
+
+    def open_history_date(self, grp):
+        self.history_date_key = grp["date_key"]
+        self.history_date_label = grp["label"]
+        self.history_date_sel = 0
+        self.history_date_scroll = 0
+        self.status_msg = ""
+
+    def _current_date_group(self):
+        if self.history_date_key is None:
+            return None
+        for grp in self.history_date_groups:
+            if grp["date_key"] == self.history_date_key:
+                return grp
+        return {
+            "date_key": self.history_date_key,
+            "label": self.history_date_label or (self.history_date_key or "Undated"),
+            "short_label": self.history_date_label or (self.history_date_key or "Undated"),
+            "items": [],
+            "count": 0,
+            "proj_count": 0,
+            "proj_names": [],
+            "tools_summary": "",
+        }
+
+    def _cycle_history_project(self, step=1):
+        opts = [""] + [p for p, _nm, _cnt in self.history_projects]
+        if len(opts) <= 1:
+            self.history_proj_filter = ""
+            return
+        cur_idx = opts.index(self.history_proj_filter) if self.history_proj_filter in opts else 0
+        self.history_proj_filter = opts[(cur_idx + step) % len(opts)]
+        self._apply_history_filter()
+
+    def _cycle_history_tool(self, step=1):
+        opts = [""] + list(self.history_tools)
+        if len(opts) <= 1:
+            self.history_tool_filter = ""
+            return
+        cur_idx = opts.index(self.history_tool_filter) if self.history_tool_filter in opts else 0
+        self.history_tool_filter = opts[(cur_idx + step) % len(opts)]
+        self._apply_history_filter()
+
+    def open_history_detail(self, item):
+        self.history_detail = item
+        self.history_detail_tools = False
+        self.history_detail_scroll = 0
+        self.history_detail_data = load_history_entries(item, include_tools=False)
+        self.history_detail_lines = []
+        self.history_detail_cache_key = None
+        self.status_msg = ""
+
+    def _reload_history_detail(self):
+        if self.history_detail is None:
+            return
+        self.history_detail_data = load_history_entries(
+            self.history_detail, include_tools=self.history_detail_tools
+        )
+        self.history_detail_lines = []
+        self.history_detail_cache_key = None
+
+    def _build_history_detail_lines(self, w):
+        key = (w, self.history_detail_tools)
+        if self.history_detail_cache_key == key and self.history_detail_lines:
+            return self.history_detail_lines
+        data = self.history_detail_data or {}
+        lines = []
+        if data.get("error"):
+            lines.append((FG_RED, f"  {data['error']}"))
+        else:
+            blocks = data.get("blocks") or []
+            if not blocks:
+                lines.append((FG_MUTED, "  No conversation entries recorded for this thread."))
+            body_w = max(16, w - 6)
+            tool_lbl = (self.history_detail.get("tool") or "agent").upper()
+            tool_col = self.history_detail.get("prov_col", FG_PURPLE)
+            for blk in blocks:
+                kind = blk["kind"]
+                ts = f"  {blk['ts']}" if blk.get("ts") else ""
+                if kind == "tool_summary":
+                    lines.append((FG_DIM, f"    ⚙ {trunc(blk['text'], body_w)}"))
+                    lines.append((FG_DIM, ""))
+                    continue
+                if kind == "user":
+                    lines.append((f"{FG_CYAN}{BOLD}", f"  ▶ YOU{FG_DIM}{ts}"))
+                    tcol = FG_WHITE
+                elif kind == "assistant":
+                    lines.append((f"{tool_col}{BOLD}", f"  ◆ {tool_lbl}{FG_DIM}{ts}"))
+                    tcol = FG_TEXT
+                elif kind == "thinking":
+                    lines.append((FG_DIM, f"  · thinking{ts}"))
+                    tcol = FG_DIM
+                elif kind == "tool_call":
+                    who = blk.get("who") or "tool"
+                    lines.append((FG_AMBER, f"  ⚙ {who}{FG_DIM}{ts}"))
+                    tcol = FG_MUTED
+                elif kind == "tool_result":
+                    who = f" ({blk['who']})" if blk.get("who") else ""
+                    lines.append((FG_DIM, f"  ↳ result{who}{ts}"))
+                    tcol = FG_DIM
+                else:
+                    lines.append((FG_DIM, f"  · {kind}{ts}"))
+                    tcol = FG_DIM
+
+                raw_text = (blk.get("text") or "").strip()
+                if kind in ("tool_call", "tool_result", "thinking") and len(raw_text) > 500:
+                    raw_text = raw_text[:500].rstrip() + " … (press v for full log)"
+                in_diff = False
+                for para in raw_text.splitlines() or [""]:
+                    ps = para.strip()
+                    if not ps:
+                        lines.append((tcol, ""))
+                        continue
+                    lcol = tcol
+                    if kind == "assistant":
+                        if ps.startswith("```"):
+                            lang = ps[3:].strip().lower()
+                            in_diff = (not in_diff) and (lang == "diff")
+                            lcol = FG_DIM
+                        elif in_diff:
+                            if ps.startswith("-") and not ps.startswith("---"):
+                                lcol = FG_RED
+                            elif ps.startswith("+") and not ps.startswith("+++"):
+                                lcol = FG_GREEN
+                        elif ps.startswith("You: "):
+                            lcol = FG_RED
+                        elif ps.startswith("SITREP ") or ps.startswith("SITREP·"):
+                            lcol = FG_GREEN
+                    wrapped = textwrap.wrap(
+                        para,
+                        width=body_w,
+                        replace_whitespace=False,
+                        drop_whitespace=False,
+                        break_long_words=True,
+                        break_on_hyphens=False,
+                    )
+                    for wl in wrapped[:30]:
+                        lines.append((lcol, f"    {wl}"))
+                    if len(wrapped) > 30:
+                        lines.append((FG_DIM, "    … (truncated; press v for full log)"))
+                lines.append((FG_DIM, ""))
+            if data.get("truncated"):
+                lines.append((FG_AMBER, "  … showing first 500 entries — press v to open full log in pager."))
+        self.history_detail_lines = lines
+        self.history_detail_cache_key = key
+        return lines
+
+    def open_history_handoff(self, item):
+        self.history_handoff_item = item
+        self.history_handoff_targets = load_handoff_targets(item.get("tool", ""), item.get("account", ""))
+        self.history_handoff_sel = 0
+        self.history_handoff_scroll = 0
+        self.status_msg = ""
+
+    def _switch_tab(self, new_tab):
+        new_tab = new_tab % len(TABS)
+        if new_tab == TAB_SESSIONS and self.tab == TAB_SESSIONS and self.inspect_win is not None:
+            self.inspect_win = None
+        if new_tab == TAB_HISTORY and self.tab == TAB_HISTORY:
+            if self.history_handoff_item is not None:
+                self.history_handoff_item = None
+            elif self.history_detail is not None:
+                self.history_detail = None
+            elif self.history_date_key is not None:
+                self.history_date_key = None
+        self.history_handoff_item = None if new_tab != TAB_HISTORY else self.history_handoff_item
+        self.history_searching = False
+        self.history_date_editing = False
+        self.tab = new_tab
+        self.status_msg = ""
+        if self.tab == TAB_HISTORY:
+            self.ensure_history_loaded()
+
+    def _activate_command(self, idx):
+        if not (0 <= idx < len(self.commands)):
+            return
+        it = self.commands[idx]
+        if it["cmd"]:
+            self.pending_cmd = it["cmd"]
+            self.running = False
+        elif it.get("hint"):
+            self.sel[0] = idx
+            self.status_msg = it["hint"]
 
     def open_session_inspector(self, win_item):
         self.inspect_win = win_item
@@ -623,24 +2168,291 @@ class MenuApp:
         self.status_msg = ""
 
     def current_items_len(self):
-        if self.tab == 0:
+        if self.tab == TAB_COMMANDS:
             return len(self.commands)
-        if self.tab == 1:
+        if self.tab == TAB_SESSIONS:
             if self.inspect_win is not None:
                 return len(self.inspect_agents)
             return len(self.sessions)
-        if self.tab == 2:
-            return len(CONFIG_SCHEMA) + 1  # +1 for Reload tmux config action
+        if self.tab == TAB_HISTORY:
+            if self.history_handoff_item is not None:
+                return len(self.history_handoff_targets)
+            if self.history_detail is not None:
+                return len(self.history_detail_lines)
+            if self.history_date_key is not None:
+                grp = self._current_date_group()
+                return len(grp["items"]) if grp else 0
+            return len(self.history_date_groups)
+        if self.tab == TAB_CONFIG:
+            return len(self._config_items())
         return 0
+
+    def _effective_modes(self):
+        def pick(pv, prv, gv):
+            for v in (pv, prv, gv):
+                if v and v != "inherit":
+                    return v
+            return "off"
+        return {
+            "doctrine": pick(self.pane_modes.get("doctrine"), self.proj_modes.get("doctrine"), self.settings.get("doctrine", "off")),
+            "mental-model": pick(self.pane_modes.get("mental-model"), self.proj_modes.get("mental-model"), self.settings.get("mental-model", "off")),
+            "style-ste": self.settings.get("style-ste", "off"),
+            "code-do178c": self.settings.get("code-do178c", "off"),
+            "search-hygiene": self.settings.get("search-hygiene", "off"),
+            "memory-summary": self.settings.get("memory-summary", "off"),
+            "sitrep": self.settings.get("sitrep", "off"),
+        }
+
+    def _config_items(self):
+        pane_tag = self.ctx.get("pane") or "pane"
+        mode_keys = {"style-ste", "code-do178c", "search-hygiene", "memory-summary", "sitrep", "doctrine", "mental-model"}
+        label_map = {"doctrine": "global-doctrine", "mental-model": "global-model"}
+        items = [
+            {"scope": "pane", "section": "pane", "key": "pane-doctrine", "label": "Doctrine", "field": "doctrine",
+             "desc": f"MDMP / F3EAD / OODA (pane {pane_tag} only)",
+             "choices": ["inherit"] + DOCTRINE_CHOICES, "default": "inherit"},
+            {"scope": "pane", "section": "pane", "key": "pane-model", "label": "Mental Model", "field": "mental-model",
+             "desc": f"7 on-demand models (pane {pane_tag} only)",
+             "choices": ["inherit"] + MODEL_CHOICES, "default": "inherit"},
+            {"scope": "project", "section": "project", "key": "proj-doctrine", "label": "Doctrine", "field": "doctrine",
+             "desc": "MDMP / F3EAD / OODA (project default)",
+             "choices": ["inherit"] + DOCTRINE_CHOICES, "default": "inherit"},
+            {"scope": "project", "section": "project", "key": "proj-model", "label": "Mental Model", "field": "mental-model",
+             "desc": "7 on-demand models (project default)",
+             "choices": ["inherit"] + MODEL_CHOICES, "default": "inherit"},
+            {"scope": "action", "section": "project", "key": "clear-modes", "label": "clear-modes", "field": "clear-modes",
+             "desc": "Remove pane & project Doctrine/Model overrides (reset to inherit)",
+             "choices": [], "default": ""},
+        ]
+        for key, desc, choices, default in CONFIG_SCHEMA:
+            sec = "global-modes" if key in mode_keys else "fleet"
+            items.append({"scope": "global", "section": sec, "key": key, "label": label_map.get(key, key),
+                          "field": key, "desc": desc, "choices": choices, "default": default})
+        items.append({"scope": "action", "section": "fleet", "key": "reload-tmux", "label": "reload-tmux",
+                      "field": "reload-tmux", "desc": "↻ Reload tmux config (~/.tmux.conf)", "choices": [], "default": ""})
+        return items
+
+    def _config_rows(self, citems):
+        pane_tag = self.ctx.get("pane") or "pane"
+        sec_meta = {
+            "pane": (f"This Pane ({pane_tag} only · overrides project & global)", FG_CYAN),
+            "project": (f"This Project ({self.proj_name} · all panes on inherit)", FG_PURPLE),
+            "global-modes": ("Global Modes (all projects)", FG_GREEN),
+            "fleet": ("Fleet & Resource Settings", FG_BLUE),
+        }
+        rows, item_to_row, last_sec = [], [], None
+        for idx, it in enumerate(citems):
+            sec = it.get("section")
+            if sec != last_sec and sec in sec_meta:
+                title, col = sec_meta[sec]
+                rows.append(("header", title, col))
+                last_sec = sec
+            item_to_row.append(len(rows))
+            rows.append(("item", idx, it))
+        return rows, item_to_row
+
+    def _get_config_val(self, it):
+        sc = it["scope"]
+        if sc == "pane":
+            return self.pane_modes.get(it["field"], "inherit") or "inherit"
+        if sc == "project":
+            return self.proj_modes.get(it["field"], "inherit") or "inherit"
+        if sc == "global":
+            return self.settings.get(it["field"], it["default"])
+        return ""
+
+    def _set_config_val(self, it, val):
+        sc = it["scope"]
+        if sc == "pane":
+            save_pane_mode(self.ctx, it["field"], val)
+            self.pane_modes[it["field"]] = val
+            self.status_msg = f"Pane {self.ctx.get('pane') or ''} {it['field']} = {val} (applies next prompt)"
+        elif sc == "project":
+            save_project_mode(self.proj_key, it["field"], val)
+            if val == "inherit":
+                self.proj_modes.pop(it["field"], None)
+            else:
+                self.proj_modes[it["field"]] = val
+            self.status_msg = f"Project {self.proj_name} {it['field']} = {val} (applies to all LLMs here)"
+        elif sc == "global":
+            save_setting(it["field"], val)
+            self.settings[it["field"]] = val
+            self.status_msg = f"Saved {it['field']} = {val} in ~/.config/agents/settings"
+
+    @staticmethod
+    def _resolve_mode_val(pv, prv, gv):
+        for v in (pv, prv, gv):
+            if v and v != "inherit":
+                return v
+        return "off"
+
+    def _recompute_agent_eff(self, ag):
+        g_doc = self.settings.get("doctrine", "off")
+        g_mod = self.settings.get("mental-model", "off")
+        ag["eff_doctrine"] = self._resolve_mode_val(ag.get("pane_doctrine"), ag.get("proj_doctrine"), g_doc)
+        ag["eff_model"] = self._resolve_mode_val(ag.get("pane_model"), ag.get("proj_model"), g_mod)
+
+    def _cycle_agent_mode(self, idx, field):
+        if not (0 <= idx < len(self.inspect_agents)):
+            return
+        ag = self.inspect_agents[idx]
+        choices = DOCTRINE_CHOICES if field == "doctrine" else MODEL_CHOICES
+        eff_key = "eff_doctrine" if field == "doctrine" else "eff_model"
+        pane_key = "pane_doctrine" if field == "doctrine" else "pane_model"
+        eff = ag.get(eff_key, "off")
+        nxt = choices[(choices.index(eff) + 1) % len(choices)] if eff in choices else choices[1]
+        save_pane_mode(self.ctx, field, nxt, pane_id=ag["pane_id"])
+        ag[pane_key] = nxt
+        self._recompute_agent_eff(ag)
+        if ag["pane_id"] == self.ctx.get("pane"):
+            self.pane_modes[field] = nxt
+        self.status_msg = f"Pane p{ag['pane_idx']} ({ag['pane_id']}) {field} = {nxt} (applies next prompt)"
+
+    def _clear_agent_mode(self, idx, field=None, action="off"):
+        if not (0 <= idx < len(self.inspect_agents)):
+            return
+        ag = self.inspect_agents[idx]
+        fields = (field,) if field else ("doctrine", "mental-model")
+        if action == "toggle_clear":
+            any_active = any(
+                ag.get("eff_doctrine" if f == "doctrine" else "eff_model", "off") != "off"
+                for f in fields
+            )
+            any_pane_ovr = any(
+                ag.get("pane_doctrine" if f == "doctrine" else "pane_model", "inherit") not in ("", "inherit")
+                for f in fields
+            )
+            if any_active:
+                action = "off"
+            elif any_pane_ovr:
+                action = "delete"
+            else:
+                self.status_msg = f"Pane p{ag['pane_idx']} already off (no pane override)"
+                return
+        val = "inherit" if action == "delete" else "off"
+        for f in fields:
+            pane_key = "pane_doctrine" if f == "doctrine" else "pane_model"
+            save_pane_mode(self.ctx, f, val, pane_id=ag["pane_id"])
+            ag[pane_key] = val
+            if ag["pane_id"] == self.ctx.get("pane"):
+                self.pane_modes[f] = val
+        self._recompute_agent_eff(ag)
+        what = field if field else "Doctrine & Model"
+        verb = "Deleted pane override for" if action == "delete" else "Switched off"
+        self.status_msg = f"{verb} {what} on p{ag['pane_idx']} ({ag['pane_id']}) → D:{ag['eff_doctrine']} M:{ag['eff_model']}"
+
+    def _delete_agent_project_modes(self, idx):
+        if not (0 <= idx < len(self.inspect_agents)):
+            return
+        ag = self.inspect_agents[idx]
+        pkey = ag.get("proj_key") or self.proj_key
+        if not pkey:
+            self.status_msg = "No project path found for this pane"
+            return
+        clear_project_modes(pkey)
+        if pkey == self.proj_key:
+            self.proj_modes = {}
+        for other in self.inspect_agents:
+            if (other.get("proj_key") or self.proj_key) == pkey:
+                other["proj_doctrine"] = "inherit"
+                other["proj_model"] = "inherit"
+                self._recompute_agent_eff(other)
+        self.status_msg = f"Deleted project Doctrine/Model overrides for {_project_label(pkey)}"
+
+    def _cycle_history_project_mode(self, idx, field):
+        grp = self._current_date_group()
+        items = grp["items"] if grp else []
+        if not (0 <= idx < len(items)):
+            return
+        it = items[idx]
+        pkey = project_key_for(it["project"])
+        if not pkey:
+            return
+        pm = load_project_modes().get(pkey) or {}
+        eff = self._resolve_mode_val("", pm.get(field, "inherit"), self.settings.get(field, "off"))
+        choices = DOCTRINE_CHOICES if field == "doctrine" else MODEL_CHOICES
+        nxt = choices[(choices.index(eff) + 1) % len(choices)] if eff in choices else choices[1]
+        save_project_mode(pkey, field, nxt)
+        if pkey == self.proj_key:
+            self.proj_modes[field] = nxt
+        self.status_msg = f"Project {it['project_name']} {field} = {nxt} (applies to all LLMs there)"
+
+    def _copy_history_session_id(self, idx):
+        grp = self._current_date_group()
+        items = grp["items"] if grp else []
+        if not (0 <= idx < len(items)):
+            return
+        sid = session_id_for_copy(items[idx].get("id"))
+        if not sid:
+            self.status_msg = "No session id for this chat"
+        elif copy_to_clipboard(sid, self.ctx.get("sock", "")):
+            self.status_msg = f"⧉ Copied session id {sid}"
+        else:
+            self.status_msg = f"Copy failed (no clipboard): {sid}"
+
+    def _clear_history_project_mode(self, idx, field=None, action="off"):
+        grp = self._current_date_group()
+        items = grp["items"] if grp else []
+        if not (0 <= idx < len(items)):
+            return
+        it = items[idx]
+        pkey = project_key_for(it["project"])
+        if not pkey:
+            return
+        pm = load_project_modes().get(pkey) or {}
+        fields = (field,) if field else ("doctrine", "mental-model")
+        if action == "toggle_clear":
+            any_active = any(
+                self._resolve_mode_val("", pm.get(f, "inherit"), self.settings.get(f, "off")) != "off"
+                for f in fields
+            )
+            any_proj_ovr = any((pm.get(f) or "inherit") not in ("", "inherit") for f in fields)
+            if any_active:
+                action = "off"
+            elif any_proj_ovr:
+                action = "delete"
+            else:
+                self.status_msg = f"Project {it['project_name']} already off (no project override)"
+                return
+        val = "inherit" if action == "delete" else "off"
+        for f in fields:
+            save_project_mode(pkey, f, val)
+            if pkey == self.proj_key:
+                if val == "inherit":
+                    self.proj_modes.pop(f, None)
+                else:
+                    self.proj_modes[f] = val
+        pm_after = load_project_modes().get(pkey) or {}
+        eff_d = self._resolve_mode_val("", pm_after.get("doctrine", "inherit"), self.settings.get("doctrine", "off"))
+        eff_m = self._resolve_mode_val("", pm_after.get("mental-model", "inherit"), self.settings.get("mental-model", "off"))
+        what = field if field else "Doctrine & Model"
+        verb = "Deleted project override for" if action == "delete" else "Switched off"
+        self.status_msg = f"{verb} {what} on {it['project_name']} → D:{eff_d} M:{eff_m}"
 
     def clamp_sel(self):
         n = self.current_items_len()
-        if self.tab == 1 and self.inspect_win is not None:
+        if self.tab == TAB_SESSIONS and self.inspect_win is not None:
             if n <= 0:
                 self.inspect_sel = 0
                 self.inspect_scroll = 0
             else:
                 self.inspect_sel = max(0, min(self.inspect_sel, n - 1))
+            return
+        if self.tab == TAB_HISTORY and self.history_handoff_item is not None:
+            if n <= 0:
+                self.history_handoff_sel = 0
+                self.history_handoff_scroll = 0
+            else:
+                self.history_handoff_sel = max(0, min(self.history_handoff_sel, n - 1))
+            return
+        if self.tab == TAB_HISTORY and self.history_detail is not None:
+            return
+        if self.tab == TAB_HISTORY and self.history_date_key is not None:
+            if n <= 0:
+                self.history_date_sel = 0
+                self.history_date_scroll = 0
+            else:
+                self.history_date_sel = max(0, min(self.history_date_sel, n - 1))
             return
         if n <= 0:
             self.sel[self.tab] = 0
@@ -650,36 +2462,67 @@ class MenuApp:
 
     def activate_current(self):
         self.clamp_sel()
-        if self.tab == 1 and self.inspect_win is not None:
+        if self.tab == TAB_SESSIONS and self.inspect_win is not None:
             idx = self.inspect_sel
             if 0 <= idx < len(self.inspect_agents):
                 self.pending_cmd = self.inspect_agents[idx]["cmd"]
                 self.running = False
             return
-        idx = self.sel[self.tab]
-        if self.tab == 0 and 0 <= idx < len(self.commands):
-            self.pending_cmd = self.commands[idx][3]
+        if self.tab == TAB_HISTORY and self.history_handoff_item is not None:
+            idx = self.history_handoff_sel
+            if 0 <= idx < len(self.history_handoff_targets):
+                tgt = self.history_handoff_targets[idx]
+                self.pending_cmd = build_history_handoff_cmd(
+                    self.ctx, self.history_handoff_item, tgt["tool"], tgt["account"]
+                )
+                self.running = False
+            return
+        if self.tab == TAB_HISTORY and self.history_detail is not None:
+            self.pending_cmd = build_history_go_cmd(self.ctx, self.history_detail)
             self.running = False
-        elif self.tab == 1 and 0 <= idx < len(self.sessions):
+            return
+        if self.tab == TAB_HISTORY and self.history_date_key is not None:
+            grp = self._current_date_group()
+            items = grp["items"] if grp else []
+            idx = self.history_date_sel
+            if 0 <= idx < len(items):
+                self.pending_cmd = build_history_go_cmd(self.ctx, items[idx])
+                self.running = False
+            return
+        idx = self.sel[self.tab]
+        if self.tab == TAB_COMMANDS and 0 <= idx < len(self.commands):
+            self._activate_command(idx)
+        elif self.tab == TAB_SESSIONS and 0 <= idx < len(self.sessions):
             item = self.sessions[idx]
             if item.get("kind") == "window":
                 self.open_session_inspector(item)
             else:
                 self.pending_cmd = item["cmd"]
                 self.running = False
-        elif self.tab == 2:
-            if idx < len(CONFIG_SCHEMA):
-                key, _desc, choices, default = CONFIG_SCHEMA[idx]
-                cur = self.settings.get(key, default)
-                nxt = choices[(choices.index(cur) + 1) % len(choices)] if cur in choices else choices[0]
-                save_setting(key, nxt)
-                self.settings[key] = nxt
-                self.status_msg = f"Saved {key} = {nxt} in ~/.config/agents/settings"
-            else:
-                sock = shlex.quote(self.ctx["sock"]) if self.ctx["sock"] else ""
-                tbin = shlex.quote(TMUX_BIN) + (f" -S {sock}" if sock else " -L agents")
-                self.pending_cmd = f"{tbin} source-file {shlex.quote(os.path.join(HOME, '.tmux.conf'))} \\; display-message 'tmux config reloaded'"
-                self.running = False
+        elif self.tab == TAB_HISTORY and 0 <= idx < len(self.history_date_groups):
+            self.open_history_date(self.history_date_groups[idx])
+        elif self.tab == TAB_CONFIG:
+            citems = self._config_items()
+            if 0 <= idx < len(citems):
+                it = citems[idx]
+                if it["scope"] == "action":
+                    if it["field"] == "clear-modes":
+                        save_pane_mode(self.ctx, "doctrine", "inherit")
+                        save_pane_mode(self.ctx, "mental-model", "inherit")
+                        self.pane_modes = {"doctrine": "inherit", "mental-model": "inherit"}
+                        clear_project_modes(self.proj_key)
+                        self.proj_modes = {}
+                        self.status_msg = f"Cleared pane & project Doctrine/Model overrides for {self.proj_name}"
+                    else:
+                        sock = shlex.quote(self.ctx["sock"]) if self.ctx["sock"] else ""
+                        tbin = shlex.quote(TMUX_BIN) + (f" -S {sock}" if sock else " -L agents")
+                        self.pending_cmd = f"{tbin} source-file {shlex.quote(os.path.join(HOME, '.tmux.conf'))} \\; display-message 'tmux config reloaded'"
+                        self.running = False
+                else:
+                    choices = it["choices"]
+                    cur = self._get_config_val(it)
+                    nxt = choices[(choices.index(cur) + 1) % len(choices)] if cur in choices else choices[0]
+                    self._set_config_val(it, nxt)
 
     def render(self):
         w, h = get_term_size()
@@ -688,8 +2531,26 @@ class MenuApp:
         self.row_map = {}
         self.back_rect = None
         self.jump_rect = None
+        self.hist_proj_rect = None
+        self.hist_tool_rect = None
+        self.hist_dates_rect = None
+        self.hist_search_rect = None
+        self.dp_day_rects = []
+        self.dp_btn_rects = []
+        self.hist_resume_rect = None
+        self.hist_handoff_rect = None
+        self.hist_pager_rect = None
+        self.agent_doc_rects = {}
+        self.agent_mod_rects = {}
+        self.agent_clr_rects = {}
+        self.hist_doc_rects = {}
+        self.hist_mod_rects = {}
+        self.hist_clr_rects = {}
+        self.hist_copy_rects = {}
+        self.scrollbar_rect = None      # (top_row, bot_row, col, total, visible, mode)
 
         # Row 1: Pill tab bar matching reference look
+        gap = "  " if w >= 78 else " "
         line1 = f"{BG_MAIN} "
         col = 2
         for i, name in enumerate(TABS):
@@ -704,11 +2565,12 @@ class MenuApp:
                 line1 += f"{BG_TAB_OFF}{FG_AMBER} {num} {FG_TEXT}{name} {RESET}{BG_MAIN}"
             col += len(pill_plain)
             if i < len(TABS) - 1:
-                line1 += "  "
-                col += 2
+                line1 += gap
+                col += len(gap)
         right_hint = "Esc to close "
-        pad = max(1, w - col - len(right_hint) + 1)
-        line1 += (" " * pad) + f"{FG_DIM}{right_hint}{RESET}"
+        if col + len(right_hint) <= w + 1:
+            pad = max(1, w - col - len(right_hint) + 1)
+            line1 += (" " * pad) + f"{FG_DIM}{right_hint}{RESET}"
         out.append(line1 + "\x1b[K")
 
         # Row 2: Divider
@@ -719,29 +2581,119 @@ class MenuApp:
         body_rows = max(1, h - 4)
         self.clamp_sel()
 
-        if self.tab == 0:
+        if self.tab == TAB_COMMANDS:
             self._render_commands(out, w, body_top, body_rows)
-        elif self.tab == 1:
+        elif self.tab == TAB_SESSIONS:
             self._render_sessions(out, w, body_top, body_rows)
-        elif self.tab == 2:
+        elif self.tab == TAB_HISTORY:
+            self._render_history(out, w, body_top, body_rows)
+        elif self.tab == TAB_CONFIG:
             self._render_config(out, w, body_top, body_rows)
         else:
             self._render_about(out, w, body_top, body_rows)
 
-        # Row h-1: divider / status feedback
+        # Row h-1: divider / status feedback / contextual metadata bar
         if self.status_msg:
             msg = trunc(self.status_msg, w - 2)
             out.append(f"\x1b[{h - 1};1H{BG_MAIN}{FG_GREEN} {msg}{' ' * max(0, w - len(msg) - 1)}{RESET}")
+        elif self.tab == TAB_COMMANDS and len(self.command_rows) > body_rows:
+            sc = self.scroll[TAB_COMMANDS]
+            up = "▲" if sc > 0 else " "
+            dn = "▼" if sc + body_rows < len(self.command_rows) else " "
+            pos = f" {up}{dn} {self.sel[TAB_COMMANDS] + 1}/{len(self.commands)} "
+            left_bar = max(0, w - len(pos) - 2)
+            out.append(
+                f"\x1b[{h - 1};1H{BG_MAIN}{FG_DIM}{'─' * left_bar}"
+                f"{FG_MUTED}{pos}{FG_DIM}{'─' * max(0, w - left_bar - len(pos))}{RESET}"
+            )
+        elif self.tab == TAB_HISTORY and self.history_detail is not None:
+            vis = max(1, body_rows - 3)
+            tot = len(self.history_detail_lines)
+            if tot > vis:
+                sc = self.history_detail_scroll
+                up = "▲" if sc > 0 else " "
+                dn = "▼" if sc + vis < tot else " "
+                pct = int(round((sc + vis) * 100 / max(1, tot)))
+                pos = f" {up}{dn} {min(100, pct)}% ({tot} lines) "
+                left_bar = max(0, w - len(pos) - 2)
+                out.append(
+                    f"\x1b[{h - 1};1H{BG_MAIN}{FG_DIM}{'─' * left_bar}"
+                    f"{FG_MUTED}{pos}{FG_DIM}{'─' * max(0, w - left_bar - len(pos))}{RESET}"
+                )
+            else:
+                out.append(f"\x1b[{h - 1};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
+        elif self.tab == TAB_HISTORY and self.history_date_key is not None:
+            grp = self._current_date_group()
+            items = grp["items"] if grp else []
+            if items:
+                idx = max(0, min(self.history_date_sel, len(items) - 1))
+                it = items[idx]
+                meta_parts = []
+                if it["account"]:
+                    meta_parts.append(it["account"])
+                if it["models"]:
+                    meta_parts.append(it["models"])
+                if it["cost_usd"]:
+                    meta_parts.append(f"${it['cost_usd']:.2f}")
+                elif it["tokens_in"] or it["tokens_out"]:
+                    meta_parts.append(f"in {_fmt_tokens_short(it['tokens_in'])} / out {_fmt_tokens_short(it['tokens_out'])}")
+                meta_parts.append(it["short_project"])
+                list_vis = max(1, (body_rows - 2) // 2)
+                sc = self.history_date_scroll
+                up = "▲" if sc > 0 else " "
+                dn = "▼" if sc + list_vis < len(items) else " "
+                pos = f" {up}{dn} {idx + 1}/{len(items)} "
+                info_avail = max(4, w - len(pos) - 2)
+                info = trunc(" · ".join(meta_parts), info_avail)
+                pad = max(1, w - 1 - len(info) - len(pos))
+                out.append(
+                    f"\x1b[{h - 1};1H{BG_MAIN} {FG_MUTED}{info}{' ' * pad}{FG_BLUE}{pos}{RESET}"
+                )
+            else:
+                out.append(f"\x1b[{h - 1};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
+        elif self.tab == TAB_HISTORY and self.history_date_groups:
+            idx = self.sel[TAB_HISTORY]
+            grp = self.history_date_groups[idx]
+            pnames = grp["proj_names"]
+            p_preview = ", ".join(pnames[:6]) + (f" +{len(pnames) - 6}" if len(pnames) > 6 else "")
+            list_vis = max(1, body_rows - 2)
+            sc = self.scroll[TAB_HISTORY]
+            up = "▲" if sc > 0 else " "
+            dn = "▼" if sc + list_vis < len(self.history_date_groups) else " "
+            pos = f" {up}{dn} {idx + 1}/{len(self.history_date_groups)} days "
+            info_avail = max(4, w - len(pos) - 2)
+            info = trunc(f"Projects: {p_preview}", info_avail)
+            pad = max(1, w - 1 - len(info) - len(pos))
+            out.append(
+                f"\x1b[{h - 1};1H{BG_MAIN} {FG_MUTED}{info}{' ' * pad}{FG_BLUE}{pos}{RESET}"
+            )
         else:
             out.append(f"\x1b[{h - 1};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
 
         # Row h: footer bar
-        if self.tab == 1 and self.inspect_win is not None:
-            footer = " Enter/Click: open pane   ←/Esc: back   g: jump tab   r: refresh   q: close"
-        elif self.tab == 1:
-            footer = " Enter/Click: inspect agents   g: jump tab   r: refresh   1-4: tabs   Esc: close"
+        if self.tab == TAB_SESSIONS and self.inspect_win is not None:
+            footer = " Enter: open   d/m/Click: mode   x: off   c: delete   C: del proj   ←/Esc: back"
+        elif self.tab == TAB_SESSIONS:
+            footer = " Enter/Click: inspect agents   g: jump tab   r: refresh   1-5: tabs   Esc: close"
+        elif self.tab == TAB_HISTORY and self.history_handoff_item is not None:
+            footer = " ↑/↓: pick LLM   Enter/Click: hand off compact brief   ←/Esc: back"
+        elif self.tab == TAB_HISTORY and self.history_detail is not None:
+            tools_lbl = "hide tools" if self.history_detail_tools else "show tools"
+            footer = f" ↑/↓: scroll   Enter/o: go   H: hand off   v: pager   t: {tools_lbl}   ←/Esc: back"
+        elif self.tab == TAB_HISTORY and self.history_date_editing:
+            footer = " ←/→/↑/↓: day   [/]: month   Click/Enter: Start→End   Space: apply   t: today   c: Top 10   Esc: back"
+        elif self.tab == TAB_HISTORY and self.history_searching:
+            footer = " Type to filter (project/title/tool/model)   Enter: apply   Esc: clear search"
+        elif self.tab == TAB_HISTORY and self.history_date_key is not None:
+            footer = " Enter: go   d/m/Click: mode   x/X: off/del   y/⧉: copy id   H: handoff   i: view   ←/Esc: back"
+        elif self.tab == TAB_HISTORY:
+            footer = " Enter/Click: open   d: dates   /: search   p: proj   t: tool   c: clear   1-5: tabs"
+        elif self.tab == TAB_CONFIG:
+            footer = " ↑/↓: select   Enter/Click: cycle   x: off   c/Del: delete   1-5: tabs   Esc: close"
+        elif self.tab == TAB_COMMANDS:
+            footer = " ↑/↓ PgUp/Dn: scroll   Enter/Click or Alt+key: run   1-5: tabs   q/Esc: close"
         else:
-            footer = " ←/→ Tab: tabs   ↑/↓: select   Enter/Click: run   1-4: jump   q/Esc: close"
+            footer = " ←/→ Tab: tabs   ↑/↓: select   Enter/Click: run   1-5: jump   q/Esc: close"
         footer = trunc(footer, w)
         out.append(f"\x1b[{h};1H{BG_MAIN}{FG_MUTED}{footer}{' ' * max(0, w - len(footer))}{RESET}")
 
@@ -760,28 +2712,58 @@ class MenuApp:
         return sc
 
     def _render_commands(self, out, w, top, rows):
-        sc = self._adjust_scroll(len(self.commands), rows)
+        if not self.commands:
+            for r in range(rows):
+                out.append(f"\x1b[{top + r};1H{BG_MAIN}{' ' * w}{RESET}")
+            return
+        sel_idx = self.sel[0]
+        row_idx = self.cmd_to_row[sel_idx]
+        lead_row = (
+            row_idx - 1
+            if row_idx > 0 and self.command_rows[row_idx - 1][0] == "header"
+            else row_idx
+        )
+        sc = self.scroll[0]
+        if lead_row < sc:
+            sc = lead_row
+        elif row_idx >= sc + rows:
+            sc = row_idx - rows + 1
+        sc = max(0, min(sc, max(0, len(self.command_rows) - rows)))
+        self.scroll[0] = sc
+
+        name_w = 23
+        key_w = 14
+        desc_w = max(0, w - 2 - name_w - key_w - 2)
+
         for r in range(rows):
-            idx = sc + r
+            d_idx = sc + r
             y = top + r
-            if idx >= len(self.commands):
+            if d_idx >= len(self.command_rows):
                 out.append(f"\x1b[{y};1H{BG_MAIN}{' ' * w}{RESET}")
                 continue
-            self.row_map[y] = idx
-            name, key, desc, _cmd = self.commands[idx]
-            selected = idx == self.sel[self.tab]
+            kind, payload, it = self.command_rows[d_idx]
+            if kind == "header":
+                title = trunc(payload, max(4, w - 6))
+                fill = max(0, w - 2 - len(title) - 3)
+                out.append(
+                    f"\x1b[{y};1H{BG_MAIN}  {FG_PURPLE}{BOLD}{title}{RESET}{BG_MAIN} "
+                    f"{FG_DIM}{'─' * fill}  {RESET}"
+                )
+                continue
+            cmd_idx = payload
+            self.row_map[y] = cmd_idx
+            selected = cmd_idx == sel_idx
             bg = BG_SEL if selected else BG_MAIN
             ptr = f"{FG_BLUE}▸ " if selected else "  "
-            name_w = 24
-            key_w = 13
-            desc_w = max(0, w - 2 - name_w - key_w - 2)
-            name_s = trunc(name, name_w).ljust(name_w)
-            key_s = trunc(key, key_w).ljust(key_w)
-            desc_s = trunc(desc, desc_w).ljust(desc_w)
+            name_s = trunc(it["name"], name_w).ljust(name_w)
+            key_s = trunc(it["key"], key_w).ljust(key_w)
+            desc_s = trunc(it["desc"], desc_w).ljust(desc_w)
             name_col = f"{FG_WHITE}{BOLD}" if selected else FG_TEXT
+            key_col = f"{FG_AMBER}{BOLD}" if selected else FG_AMBER
+            desc_col = FG_TEXT if selected else FG_MUTED
             out.append(
                 f"\x1b[{y};1H{bg}{ptr}{name_col}{name_s}{RESET}{bg}"
-                f"{FG_AMBER}{key_s}{FG_MUTED}{desc_s}  {RESET}"
+                f"{key_col}{key_s}{RESET}{bg}{desc_col}{desc_s}  {RESET}"
             )
 
     def _render_sessions(self, out, w, top, rows):
@@ -897,22 +2879,68 @@ class MenuApp:
             exp_cols = 2 if ag["express"] else 1
             prov_name = ag["provider"].upper()
             acct_part = f" {ag['account']}" if ag["account"] else ""
-            prov_w = 15 - (exp_cols - 1)
-            prov_str = trunc(f"{prov_name}{acct_part}", prov_w).ljust(prov_w)
-            model_str = trunc(ag["model"], 14).ljust(14)
+            show_modes = w >= 72
+            prov_w = (13 if show_modes else 15) - (exp_cols - 1)
+            model_w = 10 if show_modes else 14
             badge_str = ag["badge"].rjust(10)
-            tok_w = max(0, w - 2 - 3 - exp_cols - prov_w - 1 - 14 - 1 - 10 - 2)
-            tok_str = trunc(ag["tokens"], tok_w).ljust(tok_w)
+            prov_str = trunc(f"{prov_name}{acct_part}", prov_w).ljust(prov_w)
+            model_str = trunc(ag["model"], model_w).ljust(model_w)
 
-            out.append(
-                f"\x1b[{y1};1H{bg}{ptr_col}{ptr}"
-                f"{FG_DIM}{pane_tag}"
-                f"{FG_AMBER}{exp_ch}"
-                f"{ag['prov_col']}{BOLD}{prov_str}{RESET}{bg} "
-                f"{FG_TEXT}{model_str} "
-                f"{FG_CYAN}{tok_str}"
-                f"{ag['badge_col']}{badge_str}  {RESET}"
-            )
+            if show_modes:
+                eff_d = ag.get("eff_doctrine", "off")
+                eff_m = ag.get("eff_model", "off")
+                p_d = ag.get("pane_doctrine", "inherit")
+                p_m = ag.get("pane_model", "inherit")
+                d_lbl = f" D:{eff_d} "
+                m_lbl = f" M:{MODEL_SHORT.get(eff_m, eff_m)} "
+                doc_w = 9
+                mod_w = 10
+                show_clr = w >= 76
+                clr_w = 3 if show_clr else 0
+                d_pill = trunc(d_lbl, doc_w).ljust(doc_w)
+                m_pill = trunc(m_lbl, mod_w).ljust(mod_w)
+                d_col = FG_DIM if eff_d == "off" else (f"{FG_GREEN}{BOLD}" if p_d not in ("", "inherit") else FG_CYAN)
+                m_col = FG_DIM if eff_m == "off" else (f"{FG_PURPLE}{BOLD}" if p_m not in ("", "inherit") else FG_CYAN)
+                any_active = eff_d != "off" or eff_m != "off"
+                any_ovr = p_d not in ("", "inherit") or p_m not in ("", "inherit")
+                clr_col = FG_RED if any_active else (FG_AMBER if any_ovr else FG_DIM)
+                clr_space = (clr_w + 1) if show_clr else 0
+                fixed_w = 2 + 3 + exp_cols + prov_w + 1 + model_w + 1 + doc_w + 1 + mod_w + 1 + clr_space + 10 + 1
+                tok_w = max(0, w - fixed_w)
+                tok_str = trunc(ag["tokens"], tok_w).ljust(tok_w)
+                c_doc = 1 + 2 + 3 + exp_cols + prov_w + 1 + model_w + 1 + tok_w
+                self.agent_doc_rects[y1] = (c_doc, c_doc + doc_w - 1, idx)
+                c_mod = c_doc + doc_w + 1
+                self.agent_mod_rects[y1] = (c_mod, c_mod + mod_w - 1, idx)
+                clr_chunk = ""
+                if show_clr:
+                    c_clr = c_mod + mod_w + 1
+                    self.agent_clr_rects[y1] = (c_clr, c_clr + clr_w - 1, idx)
+                    clr_chunk = f"{BG_TAB_OFF}{clr_col} ✕ {RESET}{bg} "
+                out.append(
+                    f"\x1b[{y1};1H{bg}{ptr_col}{ptr}"
+                    f"{FG_DIM}{pane_tag}"
+                    f"{FG_AMBER}{exp_ch}"
+                    f"{ag['prov_col']}{BOLD}{prov_str}{RESET}{bg} "
+                    f"{FG_TEXT}{model_str} "
+                    f"{FG_CYAN}{tok_str}"
+                    f"{BG_TAB_OFF}{d_col}{d_pill}{RESET}{bg} "
+                    f"{BG_TAB_OFF}{m_col}{m_pill}{RESET}{bg} "
+                    f"{clr_chunk}"
+                    f"{ag['badge_col']}{badge_str} {RESET}"
+                )
+            else:
+                tok_w = max(0, w - 2 - 3 - exp_cols - prov_w - 1 - model_w - 1 - 10 - 2)
+                tok_str = trunc(ag["tokens"], tok_w).ljust(tok_w)
+                out.append(
+                    f"\x1b[{y1};1H{bg}{ptr_col}{ptr}"
+                    f"{FG_DIM}{pane_tag}"
+                    f"{FG_AMBER}{exp_ch}"
+                    f"{ag['prov_col']}{BOLD}{prov_str}{RESET}{bg} "
+                    f"{FG_TEXT}{model_str} "
+                    f"{FG_CYAN}{tok_str}"
+                    f"{ag['badge_col']}{badge_str}  {RESET}"
+                )
 
             if y2 < top + rows:
                 task_prefix = "      Task: "
@@ -928,43 +2956,750 @@ class MenuApp:
             y = list_top + r
             out.append(f"\x1b[{y};1H{BG_MAIN}{' ' * w}{RESET}")
 
-    def _render_config(self, out, w, top, rows):
-        summary_lines = 3
-        list_rows = max(1, rows - summary_lines)
-        total = len(CONFIG_SCHEMA) + 1
-        sc = self._adjust_scroll(total, list_rows)
+    def _render_history(self, out, w, top, rows):
+        self.ensure_history_loaded()
+        if self.history_date_editing:
+            self._render_history_date_picker(out, w, top, rows)
+            return
+        if self.history_handoff_item is not None:
+            self._render_history_handoff(out, w, top, rows)
+            return
+        if self.history_detail is not None:
+            self._render_history_detail(out, w, top, rows)
+            return
+        if self.history_date_key is not None:
+            self._render_history_date(out, w, top, rows)
+            return
+
+        # Level 1: Filter bar + Consolidated per-date list (newest date first, Top 10 by default)
+        proj_max = 12 if w >= 78 else 8
+        proj_lbl_val = _project_label(self.history_proj_filter) if self.history_proj_filter else f"All({len(self.history_projects)})"
+        proj_pill = f" Proj: {trunc(proj_lbl_val, proj_max)} "
+        tool_lbl_val = self.history_tool_filter if self.history_tool_filter else "All"
+        tool_pill = f" Tool: {tool_lbl_val} "
+
+        dates_max = 26 if self.history_date_editing else (16 if w >= 78 else 11)
+        if self.history_date_editing:
+            d_disp = trunc(self.history_date_input, max(1, dates_max - 10))
+            dates_pill = f" Dates: {d_disp}█ "
+            dates_bg = BG_TAB_ON
+            dates_fg = f"{FG_WHITE}{BOLD}"
+        elif self.history_date_mode != "top":
+            dates_pill = f" Dates: {trunc(self.history_date_range_label, max(4, dates_max - 9))} "
+            dates_bg = BG_TAB_ON
+            dates_fg = f"{FG_WHITE}{BOLD}"
+        else:
+            dates_pill = f" Dates: {self.history_date_range_label} "
+            dates_bg = BG_TAB_OFF
+            dates_fg = FG_TEXT
+
+        shown_n = len(self.history_filtered)
+        days_n = len(self.history_date_groups)
+        cnt_str = f"{days_n}d · {shown_n} chats"
+
+        col = 2
+        self.hist_proj_rect = (top, col, col + len(proj_pill) - 1)
+        col += len(proj_pill) + 1
+        self.hist_tool_rect = (top, col, col + len(tool_pill) - 1)
+        col += len(tool_pill) + 1
+        self.hist_dates_rect = (top, col, col + len(dates_pill) - 1)
+        col += len(dates_pill) + 1
+
+        search_max = max(6, w - col - len(cnt_str) - 3)
+        if self.history_searching:
+            q_disp = trunc(self.history_query, max(1, search_max - 5))
+            search_pill = f" / {q_disp}█ "
+            search_bg = BG_TAB_ON
+            search_fg = f"{FG_WHITE}{BOLD}"
+        elif self.history_query:
+            q_disp = trunc(self.history_query, max(1, search_max - 4))
+            search_pill = f" / {q_disp} "
+            search_bg = BG_SEL
+            search_fg = FG_CYAN
+        else:
+            search_pill = trunc(" / search ", search_max)
+            search_bg = BG_TAB_OFF
+            search_fg = FG_DIM
+        self.hist_search_rect = (top, col, col + len(search_pill) - 1)
+        col += len(search_pill)
+
+        proj_bg = BG_TAB_ON if self.history_proj_filter else BG_TAB_OFF
+        proj_fg = f"{FG_WHITE}{BOLD}" if self.history_proj_filter else FG_TEXT
+        tool_bg = BG_TAB_ON if self.history_tool_filter else BG_TAB_OFF
+        tool_fg = f"{FG_WHITE}{BOLD}" if self.history_tool_filter else FG_TEXT
+
+        pad_cnt = max(1, w - col - len(cnt_str))
+        hdr = (
+            f"\x1b[{top};1H{BG_MAIN} "
+            f"{proj_bg}{proj_fg}{proj_pill}{RESET}{BG_MAIN} "
+            f"{tool_bg}{tool_fg}{tool_pill}{RESET}{BG_MAIN} "
+            f"{dates_bg}{dates_fg}{dates_pill}{RESET}{BG_MAIN} "
+            f"{search_bg}{search_fg}{search_pill}{RESET}{BG_MAIN}"
+            f"{' ' * pad_cnt}{FG_MUTED}{cnt_str} \x1b[K{RESET}"
+        )
+        out.append(hdr)
+
+        # Row top + 1: divider
+        if rows >= 2:
+            out.append(f"\x1b[{top + 1};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
+
+        list_top = top + 2
+        list_rows = max(0, rows - 2)
+        groups = self.history_date_groups
+        if not groups:
+            empty_msg = (
+                "  No matching sessions. Press c to clear filters or r to refresh."
+                if self.history_all
+                else "  No logged sessions found yet. Run `afc-logs run` to collect project logs."
+            )
+            for r in range(list_rows):
+                y = list_top + r
+                msg = trunc(empty_msg, w) if r == 1 else ""
+                out.append(f"\x1b[{y};1H{BG_MAIN}{FG_MUTED}{msg.ljust(w)}{RESET}")
+            return
+
+        sc = self._adjust_scroll(len(groups), list_rows)
+        has_sb = len(groups) > list_rows and list_rows > 0
+        sb_cells = _scrollbar_cells(len(groups), list_rows, sc)
+        if has_sb:
+            self.scrollbar_rect = (list_top, list_top + list_rows - 1, w, len(groups), list_rows, "history_dates")
+
+        sb_w = 1 if has_sb else 0
+        cw = max(20, w - sb_w)
+        date_w = 19 if cw >= 74 else 12
+        cnt_w = 10
+        chev = " › "
+        meta_w = max(6, cw - 2 - date_w - 1 - cnt_w - 1 - len(chev))
 
         for r in range(list_rows):
             idx = sc + r
-            y = top + r
-            if idx >= total:
+            y = list_top + r
+            sb_str = f"{BG_MAIN}{sb_cells[r][0]}{sb_cells[r][1]}" if has_sb else ""
+            if idx >= len(groups):
+                out.append(f"\x1b[{y};1H{BG_MAIN}{' ' * cw}{sb_str}{RESET}")
+                continue
+            self.row_map[y] = idx
+            grp = groups[idx]
+            selected = idx == self.sel[TAB_HISTORY]
+            bg = BG_SEL if selected else BG_MAIN
+            ptr = f"{FG_BLUE}▸ " if selected else "  "
+            d_txt = grp["label"] if cw >= 74 else grp["short_label"]
+            date_s = trunc(d_txt, date_w).ljust(date_w)
+            n_ch = grp["count"]
+            cnt_s = trunc(f"{n_ch} chat{'s' if n_ch != 1 else ''}", cnt_w).ljust(cnt_w)
+            p_n = grp["proj_count"]
+            p_lbl = f"{p_n} proj"
+            meta_txt = f"{p_lbl} · {grp['tools_summary']}" if grp["tools_summary"] else p_lbl
+            meta_s = trunc(meta_txt, meta_w).ljust(meta_w)
+            date_col = f"{FG_WHITE}{BOLD}" if selected else FG_TEXT
+            cnt_col = f"{FG_CYAN}{BOLD}" if selected else FG_CYAN
+            meta_col = FG_TEXT if selected else FG_MUTED
+            chev_col = FG_BLUE if selected else FG_DIM
+            out.append(
+                f"\x1b[{y};1H{bg}{ptr}"
+                f"{date_col}{date_s}{RESET}{bg} "
+                f"{cnt_col}{cnt_s}{RESET}{bg} "
+                f"{meta_col}{meta_s}{RESET}{bg}"
+                f"{chev_col}{chev}{sb_str}{RESET}"
+            )
+
+    def _render_history_date_picker(self, out, w, top, rows):
+        """Interactive calendar Date Range Picker (mouse click + keyboard arrows + presets + typed range)."""
+        today = datetime.datetime.now().astimezone().date()
+        # Clear body first
+        for r in range(rows):
+            out.append(f"\x1b[{top + r};1H{BG_MAIN}{' ' * w}{RESET}")
+
+        # Row top: [ ← History ]  ›  Date Range Picker      <range summary>
+        back_pill = " ← History "
+        self.back_rect = (top, 2, 2 + len(back_pill) - 1)
+        if self.dp_start and self.dp_end:
+            s_d, e_d = (self.dp_start, self.dp_end) if self.dp_start <= self.dp_end else (self.dp_end, self.dp_start)
+            span_d = (e_d - s_d).days + 1
+            sum_txt = f"{s_d.strftime('%b %d')} → {e_d.strftime('%b %d')} ({span_d}d)"
+        elif self.dp_start:
+            s_d, e_d = (self.dp_start, self.dp_cursor) if self.dp_start <= self.dp_cursor else (self.dp_cursor, self.dp_start)
+            span_d = (e_d - s_d).days + 1
+            sum_txt = f"{s_d.strftime('%b %d')} → {e_d.strftime('%b %d')} ({span_d}d)"
+        else:
+            sum_txt = f"Current: {self.history_date_range_label}"
+        title_s = "  ›  Date Range Picker"
+        used = 1 + len(back_pill) + len(title_s)
+        sum_s = trunc(sum_txt, max(0, w - used - 3))
+        pad = max(1, w - used - len(sum_s) - 1)
+        out.append(
+            f"\x1b[{top};1H{BG_MAIN} "
+            f"{BG_TAB_OFF}{FG_BLUE}{BOLD}{back_pill}{RESET}{BG_MAIN}"
+            f"{FG_WHITE}{BOLD}{title_s}{RESET}{BG_MAIN}"
+            f"{' ' * pad}{FG_CYAN}{sum_s} \x1b[K{RESET}"
+        )
+        if rows >= 2:
+            out.append(f"\x1b[{top + 1};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
+        if rows < 4:
+            return
+
+        # Active visual range bounds for live calendar highlight
+        hi_s = hi_e = None
+        if self.dp_start and self.dp_end:
+            hi_s, hi_e = (self.dp_start, self.dp_end) if self.dp_start <= self.dp_end else (self.dp_end, self.dp_start)
+        elif self.dp_start:
+            hi_s, hi_e = (self.dp_start, self.dp_cursor) if self.dp_start <= self.dp_cursor else (self.dp_cursor, self.dp_start)
+
+        # Left column: Month nav + Weekday header + 6 week rows (total width = 28 cols, starts at col 3)
+        cal_x = 3
+        cal_top = top + 2
+        month_lbl = datetime.date(self.dp_year, self.dp_month, 1).strftime("%B %Y")
+        prev_btn = " ◀ "
+        next_btn = " ▶ "
+        mid_w = 28 - len(prev_btn) - len(next_btn)
+        m_pad_l = max(0, (mid_w - len(month_lbl)) // 2)
+        m_pad_r = max(0, mid_w - len(month_lbl) - m_pad_l)
+        self.dp_btn_rects.append((cal_top, cal_x, cal_x + len(prev_btn) - 1, "prev_month", None))
+        nx_col = cal_x + len(prev_btn) + mid_w
+        self.dp_btn_rects.append((cal_top, nx_col, nx_col + len(next_btn) - 1, "next_month", None))
+        out.append(
+            f"\x1b[{cal_top};{cal_x}H"
+            f"{BG_TAB_OFF}{FG_BLUE}{BOLD}{prev_btn}{RESET}{BG_MAIN}"
+            f"{' ' * m_pad_l}{FG_WHITE}{BOLD}{month_lbl}{RESET}{BG_MAIN}{' ' * m_pad_r}"
+            f"{BG_TAB_OFF}{FG_BLUE}{BOLD}{next_btn}{RESET}"
+        )
+
+        # Weekday header
+        if cal_top + 1 < top + rows:
+            out.append(f"\x1b[{cal_top + 1};{cal_x}H{BG_MAIN}{FG_MUTED} Mo  Tu  We  Th  Fr  Sa  Su {RESET}")
+
+        weeks = _month_calendar_weeks(self.dp_year, self.dp_month)
+        for wi, week in enumerate(weeks):
+            ry = cal_top + 2 + wi
+            if ry >= top + rows:
+                break
+            line_parts = [f"\x1b[{ry};{cal_x}H"]
+            for di, d in enumerate(week):
+                cx = cal_x + di * 4
+                if d is None:
+                    line_parts.append(f"{BG_MAIN}    ")
+                    continue
+                self.dp_day_rects.append((ry, cx, cx + 3, d))
+                cell = f"{d.day:2d}"
+                is_cur = (d == self.dp_cursor)
+                is_endpt = (d == self.dp_start or d == self.dp_end)
+                is_in = (hi_s is not None and hi_e is not None and hi_s <= d <= hi_e)
+                is_today = (d == today)
+                if is_cur:
+                    line_parts.append(f"{BG_TAB_ON}{FG_WHITE}{BOLD} {cell} {RESET}")
+                elif is_endpt:
+                    line_parts.append(f"{BG_SEL}{FG_GREEN}{BOLD}[{cell}]{RESET}")
+                elif is_in:
+                    line_parts.append(f"{BG_SEL}{FG_CYAN} {cell} {RESET}")
+                elif is_today:
+                    line_parts.append(f"{BG_MAIN}{FG_AMBER}{BOLD} {cell} {RESET}")
+                else:
+                    line_parts.append(f"{BG_MAIN}{FG_TEXT} {cell} {RESET}")
+            out.append("".join(line_parts))
+
+        # Helper to draw a row of clickable pill buttons starting at (ry, start_x)
+        def draw_pills(ry, start_x, max_x, specs):
+            if ry >= top + rows or start_x >= max_x:
+                return
+            cx = start_x
+            for lbl, act, payload, active, fg_col in specs:
+                pill = f" {lbl} "
+                if cx + len(pill) > max_x:
+                    break
+                bg_c = BG_TAB_ON if active else BG_TAB_OFF
+                fg_c = f"{FG_WHITE}{BOLD}" if active else fg_col
+                out.append(f"\x1b[{ry};{cx}H{bg_c}{fg_c}{pill}{RESET}")
+                self.dp_btn_rects.append((ry, cx, cx + len(pill) - 1, act, payload))
+                cx += len(pill) + 1
+
+        this_month_spec = f"{today.year:04d}-{today.month:02d}"
+        cur_lbl = self.history_date_range_label
+        if w >= 72:
+            rx = 35
+            rw = max(16, w - rx - 1)
+            # Side panel: Selection status + Quick presets + Type box + Apply/Reset
+            s_txt = self.dp_start.isoformat() if self.dp_start else "(click or Enter a day)"
+            if self.dp_end:
+                e_txt = self.dp_end.isoformat()
+            elif self.dp_start:
+                e_txt = f"{self.dp_cursor.isoformat()}  (click/Enter)"
+            else:
+                e_txt = "(pick 2nd date)"
+            step_txt = (
+                "Step 2: Pick End date (same day = 1 day)"
+                if (self.dp_start and not self.dp_end)
+                else "Step 1: Pick Start date on calendar"
+            )
+            if cal_top < top + rows:
+                out.append(f"\x1b[{cal_top};{rx}H{BG_MAIN}{FG_PURPLE}{BOLD}{trunc(step_txt, rw)}{RESET}")
+            if cal_top + 1 < top + rows:
+                out.append(f"\x1b[{cal_top + 1};{rx}H{BG_MAIN}{FG_MUTED}Start: {FG_GREEN if self.dp_start else FG_DIM}{BOLD if self.dp_start else ''}{trunc(s_txt, max(4, rw - 7))}{RESET}")
+            if cal_top + 2 < top + rows:
+                out.append(f"\x1b[{cal_top + 2};{rx}H{BG_MAIN}{FG_MUTED}End:   {FG_CYAN if self.dp_start else FG_DIM}{trunc(e_txt, max(4, rw - 7))}{RESET}")
+            if cal_top + 4 < top + rows:
+                out.append(f"\x1b[{cal_top + 4};{rx}H{BG_MAIN}{FG_MUTED}Quick presets:{RESET}")
+            draw_pills(cal_top + 5, rx, w - 1, [
+                ("Top 10", "preset", "top10", self.history_date_mode == "top", FG_TEXT),
+                ("Last 7d", "preset", "7d", cur_lbl == "Last 7d", FG_TEXT),
+                ("Last 30d", "preset", "30d", cur_lbl == "Last 30d", FG_TEXT),
+            ])
+            draw_pills(cal_top + 7, rx, w - 1, [
+                ("This Month", "preset", this_month_spec, cur_lbl == this_month_spec, FG_TEXT),
+                ("All Dates", "preset", "all", self.history_date_mode == "all", FG_TEXT),
+            ])
+            if cal_top + 9 < top + rows:
+                if self.history_date_input:
+                    in_s = f" {trunc(self.history_date_input, max(4, rw - 11))}█ "
+                    out.append(f"\x1b[{cal_top + 9};{rx}H{BG_MAIN}{FG_MUTED}Type: {BG_TAB_ON}{FG_WHITE}{BOLD}{in_s}{RESET}")
+                else:
+                    hint_s = trunc("YYYY-MM-DD..YYYY-MM-DD", max(4, rw - 7))
+                    out.append(f"\x1b[{cal_top + 9};{rx}H{BG_MAIN}{FG_MUTED}Type: {FG_DIM}{hint_s}{RESET}")
+            draw_pills(cal_top + 11, rx, w - 1, [
+                ("✓ Apply Range", "apply", None, bool(self.dp_start or self.history_date_input), FG_GREEN),
+                ("✕ Reset (Top 10)", "reset", None, False, FG_AMBER),
+            ])
+            leg_y = cal_top + 2 + len(weeks) + 1
+            if leg_y < top + rows:
+                out.append(f"\x1b[{leg_y};{cal_x}H{BG_MAIN}{FG_AMBER}{BOLD}Today{RESET}{BG_MAIN}{FG_DIM} · {FG_GREEN}[Day]{FG_DIM} Start/End · [/] Mo{RESET}")
+        else:
+            # Compact stacked layout (< 72 cols)
+            py = cal_top + 2 + len(weeks) + 1
+            if py < top + rows:
+                if self.history_date_input:
+                    in_s = f" {trunc(self.history_date_input, max(4, w - 12))}█ "
+                    out.append(f"\x1b[{py};3H{BG_MAIN}{FG_MUTED}Type: {BG_TAB_ON}{FG_WHITE}{BOLD}{in_s}{RESET}")
+                else:
+                    st_s = f"Start: {self.dp_start.isoformat() if self.dp_start else '—'}  End: {self.dp_end.isoformat() if self.dp_end else '—'}"
+                    out.append(f"\x1b[{py};3H{BG_MAIN}{FG_CYAN}{trunc(st_s, w - 4)}{RESET}")
+            draw_pills(py + 1, 3, w - 1, [
+                ("Top 10", "preset", "top10", self.history_date_mode == "top", FG_TEXT),
+                ("7d", "preset", "7d", cur_lbl == "Last 7d", FG_TEXT),
+                ("30d", "preset", "30d", cur_lbl == "Last 30d", FG_TEXT),
+                ("Month", "preset", this_month_spec, cur_lbl == this_month_spec, FG_TEXT),
+                ("All", "preset", "all", self.history_date_mode == "all", FG_TEXT),
+                ("Apply", "apply", None, bool(self.dp_start or self.history_date_input), FG_GREEN),
+            ])
+
+    def _render_history_date(self, out, w, top, rows):
+        """Level 2: All sessions for the selected date rendered as 2-row Task cards."""
+        grp = self._current_date_group()
+        items = grp["items"] if grp else []
+
+        # Row top: [ ← History ]  ›  Nov 25, 2026 (Wed)  (14 chats · 8 proj)
+        back_lbl = " ← History "
+        self.back_rect = (top, 2, 2 + len(back_lbl) - 1)
+        filt_bits = []
+        if self.history_proj_filter:
+            filt_bits.append(_project_label(self.history_proj_filter))
+        if self.history_tool_filter:
+            filt_bits.append(self.history_tool_filter)
+        if self.history_query:
+            filt_bits.append(f"/{self.history_query}")
+        filt_tag = f" [{' · '.join(filt_bits)}]" if filt_bits else ""
+        n_ch = len(items)
+        p_n = grp["proj_count"] if grp else 0
+        title_raw = f"›  {grp['label']}  ({n_ch} chat{'s' if n_ch != 1 else ''} · {p_n} proj){filt_tag}"
+        mid_avail = max(4, w - (2 + len(back_lbl)) - 2)
+        title_txt = trunc(title_raw, mid_avail)
+        hdr = (
+            f"\x1b[{top};1H{BG_MAIN} "
+            f"{BG_TAB_OFF}{FG_BLUE}{BOLD}{back_lbl}{RESET}{BG_MAIN} "
+            f"{FG_WHITE}{BOLD}{title_txt}{RESET}{BG_MAIN}\x1b[K{RESET}"
+        )
+        out.append(hdr)
+
+        # Row top + 1: divider
+        if rows >= 2:
+            out.append(f"\x1b[{top + 1};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
+
+        list_top = top + 2
+        list_rows = max(0, rows - 2)
+        if not items:
+            for r in range(list_rows):
+                y = list_top + r
+                msg = "  No matching sessions on this date. Press c to clear filters or ← for dates." if r == 1 else ""
+                out.append(f"\x1b[{y};1H{BG_MAIN}{FG_MUTED}{trunc(msg, w).ljust(w)}{RESET}")
+            return
+
+        # Each session renders as a 2-row Task card matching the Sessions Inspector:
+        #   Line 1: ▸ 3f9a1c2e CLAUDE nick   ProjectNia      claude-opus-5-5  T:252k $38.49  Nov 25 05:44 ┃
+        #   Line 2:       Task: Gamified per-subject teaching materials                          ┃
+        card_h = 2
+        cards_vis = max(1, list_rows // card_h)
+        sc = self.history_date_scroll
+        if self.history_date_sel < sc:
+            sc = self.history_date_sel
+        elif self.history_date_sel >= sc + cards_vis:
+            sc = self.history_date_sel - cards_vis + 1
+        sc = max(0, min(sc, max(0, len(items) - cards_vis)))
+        self.history_date_scroll = sc
+
+        has_sb = len(items) > cards_vis and list_rows > 0
+        sb_cells = _scrollbar_cells(len(items), list_rows, sc, vis_units=cards_vis)
+        if has_sb:
+            self.scrollbar_rect = (list_top, list_top + list_rows - 1, w, len(items), cards_vis, "history_cards")
+
+        sb_w = 1 if has_sb else 0
+        cw = max(20, w - sb_w)
+        prov_w = 13 if cw >= 74 else 11
+        proj_w = 15 if cw >= 74 else 11
+        model_w = 15 if cw >= 74 else 9
+        when_w = 12
+        sid_w = 8 if cw >= 64 else 0   # short session id column (first 8 chars of the thread id)
+        sid_gap = 3 if sid_w else 0    # " ⧉ " copy icon after the id
+        stats_w = max(0, cw - 2 - sid_w - sid_gap - prov_w - 1 - proj_w - 1 - model_w - 1 - when_w - 2)
+        all_pm = load_project_modes()
+        g_doc = self.settings.get("doctrine", "off")
+        g_mod = self.settings.get("mental-model", "off")
+        show_hist_modes = cw >= 64
+
+        used_rows = 0
+        for slot in range(cards_vis):
+            idx = sc + slot
+            y1 = list_top + slot * card_h
+            y2 = y1 + 1
+            if y1 >= top + rows:
+                break
+            sb1 = f"{BG_MAIN}{sb_cells[y1 - list_top][0]}{sb_cells[y1 - list_top][1]}" if has_sb else ""
+            sb2 = f"{BG_MAIN}{sb_cells[y2 - list_top][0]}{sb_cells[y2 - list_top][1]}" if (has_sb and y2 < top + rows) else ""
+
+            if idx >= len(items):
+                out.append(f"\x1b[{y1};1H{BG_MAIN}{' ' * cw}{sb1}{RESET}")
+                if y2 < top + rows:
+                    out.append(f"\x1b[{y2};1H{BG_MAIN}{' ' * cw}{sb2}{RESET}")
+                used_rows += card_h
+                continue
+
+            it = items[idx]
+            selected = idx == self.history_date_sel
+            bg = BG_SEL if selected else BG_MAIN
+            self.row_map[y1] = idx
+            if y2 < top + rows:
+                self.row_map[y2] = idx
+
+            ptr = f"{FG_BLUE}▸ " if selected else "  "
+            sid_s = trunc(it.get("short_id") or "", sid_w).ljust(sid_w) if sid_w else ""
+            sid_col = FG_TEXT if selected else FG_DIM
+            if sid_w:
+                # id + icon both copy: cols 3..(3 + sid_w + 1)
+                self.hist_copy_rects[y1] = (3, 3 + sid_w + 1, idx)
+            prov_name = it["tool"].upper()
+            acct_part = f" {it['account']}" if it["account"] else ""
+            prov_s = trunc(f"{prov_name}{acct_part}", prov_w).ljust(prov_w)
+            proj_s = trunc(it["project_name"], proj_w).ljust(proj_w)
+            primary_model = (it["models"].split(",", 1)[0].strip() if it["models"] else "")
+            model_s = trunc(primary_model, model_w).ljust(model_w)
+
+            tok_parts = []
+            tot_tok = (it.get("tokens_in") or 0) + (it.get("tokens_out") or 0)
+            if tot_tok > 0:
+                tok_parts.append(f"T:{_fmt_tokens_short(tot_tok)}")
+            if it.get("cost_usd"):
+                tok_parts.append(f"${it['cost_usd']:.2f}")
+            stats_s = trunc(" ".join(tok_parts), stats_w).ljust(stats_w)
+            when_s = trunc(it["when_short"], when_w).rjust(when_w)
+
+            proj_col = f"{FG_CYAN}{BOLD}" if selected else FG_CYAN
+            when_col = FG_TEXT if selected else FG_MUTED
+            out.append(
+                f"\x1b[{y1};1H{bg}{ptr}"
+                f"{sid_col}{sid_s}{(' ' + FG_BLUE + '⧉' + RESET + bg + ' ') if sid_w else ''}"
+                f"{it['prov_col']}{BOLD}{prov_s}{RESET}{bg} "
+                f"{proj_col}{proj_s}{RESET}{bg} "
+                f"{FG_TEXT}{model_s} "
+                f"{FG_CYAN}{stats_s} "
+                f"{when_col}{when_s} "
+                f"{sb1}{RESET}"
+            )
+
+            if y2 < top + rows:
+                task_prefix = "      Task: "
+                t_col = FG_WHITE if selected else FG_MUTED
+                if show_hist_modes:
+                    pkey = project_key_for(it["project"])
+                    pm = all_pm.get(pkey) if pkey else None
+                    pr_d = (pm.get("doctrine") or "inherit") if isinstance(pm, dict) else "inherit"
+                    pr_m = (pm.get("mental-model") or "inherit") if isinstance(pm, dict) else "inherit"
+                    eff_d = self._resolve_mode_val("", pr_d, g_doc)
+                    eff_m = self._resolve_mode_val("", pr_m, g_mod)
+                    doc_w, mod_w, clr_w = 9, 10, 3
+                    d_pill = trunc(f" D:{eff_d} ", doc_w).ljust(doc_w)
+                    m_pill = trunc(f" M:{MODEL_SHORT.get(eff_m, eff_m)} ", mod_w).ljust(mod_w)
+                    d_col = FG_DIM if eff_d == "off" else (f"{FG_GREEN}{BOLD}" if pr_d != "inherit" else FG_CYAN)
+                    m_col = FG_DIM if eff_m == "off" else (f"{FG_PURPLE}{BOLD}" if pr_m != "inherit" else FG_CYAN)
+                    any_active = eff_d != "off" or eff_m != "off"
+                    any_ovr = pr_d != "inherit" or pr_m != "inherit"
+                    clr_col = FG_RED if any_active else (FG_AMBER if any_ovr else FG_DIM)
+                    # Layout: task_prefix(12) + task_s + ' '(1) + d_pill(9) + ' '(1) + m_pill(10) + ' '(1) + clr(3) + ' '(1)
+                    task_w = max(4, cw - len(task_prefix) - 1 - doc_w - 1 - mod_w - 1 - clr_w - 1)
+                    task_s = trunc(it["title"], task_w).ljust(task_w)
+                    c_doc = 1 + len(task_prefix) + task_w + 1
+                    self.hist_doc_rects[y2] = (c_doc, c_doc + doc_w - 1, idx)
+                    c_mod = c_doc + doc_w + 1
+                    self.hist_mod_rects[y2] = (c_mod, c_mod + mod_w - 1, idx)
+                    c_clr = c_mod + mod_w + 1
+                    self.hist_clr_rects[y2] = (c_clr, c_clr + clr_w - 1, idx)
+                    out.append(
+                        f"\x1b[{y2};1H{bg}{FG_DIM}{task_prefix}{t_col}{task_s} "
+                        f"{BG_TAB_OFF}{d_col}{d_pill}{RESET}{bg} "
+                        f"{BG_TAB_OFF}{m_col}{m_pill}{RESET}{bg} "
+                        f"{BG_TAB_OFF}{clr_col} ✕ {RESET}{bg} "
+                        f"{sb2}{RESET}"
+                    )
+                else:
+                    task_w = max(4, cw - len(task_prefix) - 2)
+                    task_s = trunc(it["title"], task_w).ljust(task_w)
+                    out.append(
+                        f"\x1b[{y2};1H{bg}{FG_DIM}{task_prefix}{t_col}{task_s}  {sb2}{RESET}"
+                    )
+            used_rows += card_h
+
+        for r in range(used_rows, list_rows):
+            y = list_top + r
+            sb_tail = f"{BG_MAIN}{sb_cells[r][0]}{sb_cells[r][1]}" if has_sb else ""
+            out.append(f"\x1b[{y};1H{BG_MAIN}{' ' * cw}{sb_tail}{RESET}")
+
+    def _render_history_handoff(self, out, w, top, rows):
+        """Provider/account picker to pass a cut-off session brief from acf.db to another LLM."""
+        item = self.history_handoff_item
+        targets = self.history_handoff_targets
+
+        back_lbl = " ← Back "
+        self.back_rect = (top, 2, 2 + len(back_lbl) - 1)
+        mid_avail = max(4, w - (2 + len(back_lbl)) - 2)
+        title_txt = trunc(f"⇄  Hand off: {item['title']}", mid_avail)
+        hdr = (
+            f"\x1b[{top};1H{BG_MAIN} "
+            f"{BG_TAB_OFF}{FG_BLUE}{BOLD}{back_lbl}{RESET}{BG_MAIN} "
+            f"{FG_WHITE}{BOLD}{title_txt}{RESET}{BG_MAIN}\x1b[K{RESET}"
+        )
+        out.append(hdr)
+
+        if rows >= 2:
+            src_lbl = f"{item['tool'].upper()}" + (f" ({item['account']})" if item.get("account") else "")
+            sub = trunc(f"  From {src_lbl} · {item['project_name']} · builds compact pickup brief from acf.db + git", w)
+            out.append(f"\x1b[{top + 1};1H{BG_MAIN}{FG_MUTED}{sub.ljust(w)}{RESET}")
+
+        if rows >= 3:
+            out.append(f"\x1b[{top + 2};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
+
+        list_top = top + 3
+        list_rows = max(0, rows - 3)
+        if not targets:
+            for r in range(list_rows):
+                y = list_top + r
+                msg = "  No installed agent CLIs found on PATH." if r == 1 else ""
+                out.append(f"\x1b[{y};1H{BG_MAIN}{FG_MUTED}{msg.ljust(w)}{RESET}")
+            return
+
+        sc = self.history_handoff_scroll
+        if self.history_handoff_sel < sc:
+            sc = self.history_handoff_sel
+        elif self.history_handoff_sel >= sc + list_rows:
+            sc = self.history_handoff_sel - list_rows + 1
+        sc = max(0, min(sc, max(0, len(targets) - list_rows)))
+        self.history_handoff_scroll = sc
+
+        for r in range(list_rows):
+            y = list_top + r
+            idx = sc + r
+            if idx >= len(targets):
                 out.append(f"\x1b[{y};1H{BG_MAIN}{' ' * w}{RESET}")
                 continue
             self.row_map[y] = idx
-            selected = idx == self.sel[self.tab]
+            tgt = targets[idx]
+            selected = idx == self.history_handoff_sel
             bg = BG_SEL if selected else BG_MAIN
             ptr = f"{FG_BLUE}▸ " if selected else "  "
-            if idx < len(CONFIG_SCHEMA):
-                key, desc, _choices, default = CONFIG_SCHEMA[idx]
-                cur = self.settings.get(key, default)
-                val_col = FG_GREEN if cur in ("on", "unified", "enforce") else (FG_AMBER if cur in ("compact", "ask", "report") else FG_CYAN)
+            prov_s = tgt["tool"].upper().ljust(10)
+            acct_s = trunc(tgt["account"], 14).ljust(14)
+            tag = "(same provider/account — fresh brief)" if tgt["same"] else "pick up cut-off topic in new tab"
+            tag_w = max(4, w - 2 - 10 - 1 - 14 - 2 - 2)
+            tag_s = trunc(tag, tag_w).ljust(tag_w)
+            tcol = FG_TEXT if selected else FG_MUTED
+            out.append(
+                f"\x1b[{y};1H{bg}{ptr}"
+                f"{tgt['prov_col']}{BOLD}{prov_s}{RESET}{bg} "
+                f"{FG_WHITE if selected else FG_TEXT}{acct_s}{RESET}{bg}  "
+                f"{tcol}{tag_s}  {RESET}"
+            )
+
+    def _render_history_detail(self, out, w, top, rows):
+        item = self.history_detail
+        data = self.history_detail_data or {}
+
+        # Row top: [ ← Nov 25, 2026 ]  title  [ ⇄ Hand off ] [ ↻ Go ] [ ▤ Pager ]
+        back_lbl = f" ← {trunc(item.get('date_short') or 'History', 12)} " if self.history_date_key is not None else " ← History "
+        handoff_lbl = " ⇄ Hand off " if w >= 74 else " ⇄ Handoff "
+        resume_lbl = " ↻ Resume " if w >= 74 else " ↻ Go "
+        pager_lbl = " ▤ Pager " if w >= 74 else " ▤ "
+        self.back_rect = (top, 2, 2 + len(back_lbl) - 1)
+        pager_start = max(2 + len(back_lbl) + 6, w - len(pager_lbl))
+        resume_start = max(2 + len(back_lbl) + 4, pager_start - len(resume_lbl) - 1)
+        handoff_start = max(2 + len(back_lbl) + 2, resume_start - len(handoff_lbl) - 1)
+        self.hist_handoff_rect = (top, handoff_start, handoff_start + len(handoff_lbl) - 1)
+        self.hist_resume_rect = (top, resume_start, resume_start + len(resume_lbl) - 1)
+        self.hist_pager_rect = (top, pager_start, pager_start + len(pager_lbl) - 1)
+
+        mid_start = 2 + len(back_lbl) + 1
+        mid_avail = max(4, handoff_start - mid_start - 1)
+        title_txt = trunc(item["title"], mid_avail)
+        pad_mid = max(1, handoff_start - mid_start - len(title_txt))
+        hdr = (
+            f"\x1b[{top};1H{BG_MAIN} "
+            f"{BG_TAB_OFF}{FG_BLUE}{BOLD}{back_lbl}{RESET}{BG_MAIN} "
+            f"{FG_WHITE}{BOLD}{title_txt}{RESET}{BG_MAIN}"
+            f"{' ' * pad_mid}"
+            f"{BG_TAB_OFF}{FG_AMBER}{handoff_lbl}{RESET}{BG_MAIN} "
+            f"{BG_TAB_OFF}{FG_GREEN}{resume_lbl}{RESET}{BG_MAIN} "
+            f"{BG_TAB_OFF}{FG_CYAN}{pager_lbl}{RESET}{BG_MAIN}\x1b[K{RESET}"
+        )
+        out.append(hdr)
+
+        # Row top + 1: Metadata strip
+        if rows >= 2:
+            parts = [item["project_name"], item["tool"].upper()]
+            if item["account"]:
+                parts[-1] += f" ({item['account']})"
+            if item["models"]:
+                parts.append(trunc(item["models"], 24))
+            parts.append(item["when_short"])
+            u_cnt = data.get("users", 0)
+            a_cnt = data.get("assistants", 0)
+            t_cnt = data.get("tools", 0)
+            if u_cnt or a_cnt or t_cnt:
+                parts.append(f"{u_cnt}u · {a_cnt}a · {t_cnt}⚙")
+            if item.get("cost_usd"):
+                parts.append(f"${item['cost_usd']:.2f}")
+            elif data.get("tokens_in") or data.get("tokens_out"):
+                parts.append(f"in {_fmt_tokens_short(data.get('tokens_in'))} out {_fmt_tokens_short(data.get('tokens_out'))}")
+            meta_line = trunc("  " + "  ·  ".join(parts), w)
+            out.append(f"\x1b[{top + 1};1H{BG_MAIN}{FG_MUTED}{meta_line.ljust(w)}{RESET}")
+
+        # Row top + 2: Divider
+        if rows >= 3:
+            out.append(f"\x1b[{top + 2};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
+
+        body_top = top + 3
+        body_rows = max(0, rows - 3)
+        lines = self._build_history_detail_lines(max(16, w - 1))
+        max_sc = max(0, len(lines) - max(1, body_rows))
+        self.history_detail_scroll = max(0, min(self.history_detail_scroll, max_sc))
+        sc = self.history_detail_scroll
+        has_sb = len(lines) > body_rows and body_rows > 0
+        sb_cells = _scrollbar_cells(len(lines), body_rows, sc)
+        if has_sb:
+            self.scrollbar_rect = (body_top, body_top + body_rows - 1, w, len(lines), body_rows, "history_detail")
+
+        for r in range(body_rows):
+            y = body_top + r
+            idx = sc + r
+            if idx >= len(lines):
+                out.append(f"\x1b[{y};1H{BG_MAIN}{' ' * w}{RESET}")
+            else:
+                col_seq, text = lines[idx]
+                out.append(f"\x1b[{y};1H{BG_MAIN}{col_seq}{text}{RESET}{BG_MAIN}\x1b[K{RESET}")
+            if has_sb:
+                sb_col, sb_ch = sb_cells[r]
+                out.append(f"\x1b[{y};{w}H{BG_MAIN}{sb_col}{sb_ch}{RESET}")
+
+    def _render_config(self, out, w, top, rows):
+        summary_lines = 4
+        list_rows = max(1, rows - summary_lines)
+        citems = self._config_items()
+        cfg_rows, item_to_row = self._config_rows(citems)
+        total = len(cfg_rows)
+        sel_idx = max(0, min(self.sel[self.tab], max(0, len(citems) - 1)))
+        self.sel[self.tab] = sel_idx
+        row_idx = item_to_row[sel_idx] if item_to_row else 0
+        lead_row = row_idx - 1 if row_idx > 0 and cfg_rows[row_idx - 1][0] == "header" else row_idx
+        sc = self.scroll[self.tab]
+        if lead_row < sc:
+            sc = lead_row
+        elif row_idx >= sc + list_rows:
+            sc = row_idx - list_rows + 1
+        sc = max(0, min(sc, max(0, total - list_rows)))
+        self.scroll[self.tab] = sc
+
+        has_sb = total > list_rows and list_rows > 0
+        sb_cells = _scrollbar_cells(total, list_rows, sc)
+        if has_sb:
+            self.scrollbar_rect = (top, top + list_rows - 1, w, total, list_rows, "config")
+        sb_w = 1 if has_sb else 0
+        cw = max(20, w - sb_w)
+
+        for r in range(list_rows):
+            d_idx = sc + r
+            y = top + r
+            sb_str = f"{BG_MAIN}{sb_cells[r][0]}{sb_cells[r][1]}" if has_sb else ""
+            if d_idx >= total:
+                out.append(f"\x1b[{y};1H{BG_MAIN}{' ' * cw}{sb_str}{RESET}")
+                continue
+            kind, payload, extra = cfg_rows[d_idx]
+            if kind == "header":
+                title = trunc(payload, max(4, cw - 6))
+                fill = max(0, cw - 2 - len(title) - 3)
+                out.append(
+                    f"\x1b[{y};1H{BG_MAIN}  {extra}{BOLD}{title}{RESET}{BG_MAIN} "
+                    f"{FG_DIM}{'─' * fill}  {sb_str}{RESET}"
+                )
+                continue
+            idx = payload
+            it = extra
+            self.row_map[y] = idx
+            selected = idx == sel_idx
+            bg = BG_SEL if selected else BG_MAIN
+            ptr = f"{FG_BLUE}▸ " if selected else "  "
+            if it["scope"] == "action":
+                lbl = "✕ Clear pane & project Doctrine/Model overrides" if it["field"] == "clear-modes" else it["desc"]
+                acol = FG_AMBER if it["field"] == "clear-modes" else FG_BLUE
+                txt = trunc(lbl, cw - 4).ljust(cw - 2)
+                out.append(f"\x1b[{y};1H{bg}{ptr}{acol}{BOLD}{txt}{sb_str}{RESET}")
+            else:
+                cur = self._get_config_val(it)
+                if cur == "off":
+                    val_col = FG_DIM
+                elif cur == "inherit":
+                    val_col = FG_MUTED
+                elif cur in ("on", "unified", "enforce", "mdmp", "f3ead", "ooda"):
+                    val_col = FG_GREEN
+                elif cur in ("compact", "ask", "report"):
+                    val_col = FG_AMBER
+                else:
+                    val_col = FG_CYAN
                 key_w = 16
-                val_w = 12
-                desc_w = max(0, w - 2 - key_w - val_w - 2)
-                key_s = trunc(key, key_w).ljust(key_w)
+                val_w = 18
+                desc_w = max(0, cw - 2 - key_w - val_w - 2)
+                key_s = trunc(it.get("label") or it["key"], key_w).ljust(key_w)
                 val_s = trunc(f"[{cur}]", val_w).ljust(val_w)
-                desc_s = trunc(desc, desc_w).ljust(desc_w)
-                kcol = f"{FG_WHITE}{BOLD}" if selected else FG_TEXT
+                desc_s = trunc(it["desc"], desc_w).ljust(desc_w)
+                kcol = f"{FG_WHITE}{BOLD}" if selected else (FG_CYAN if it["scope"] == "pane" else (FG_PURPLE if it["scope"] == "project" else FG_TEXT))
                 out.append(
                     f"\x1b[{y};1H{bg}{ptr}{kcol}{key_s}{RESET}{bg}"
-                    f"{val_col}{BOLD}{val_s}{RESET}{bg}{FG_MUTED}{desc_s}  {RESET}"
+                    f"{val_col}{BOLD}{val_s}{RESET}{bg}{FG_MUTED}{desc_s}  {sb_str}{RESET}"
                 )
-            else:
-                txt = trunc("↻ Reload tmux config (~/.tmux.conf)", w - 4).ljust(w - 2)
-                out.append(f"\x1b[{y};1H{bg}{ptr}{FG_BLUE}{BOLD}{txt}{RESET}")
 
-        # Live cgroup summary strip at bottom of Config tab
+        # Effective modes + live cgroup summary strip at bottom of Config tab
         y0 = top + list_rows
+        eff = self._effective_modes()
+        if w >= 86:
+            eff_line = (
+                f"  Active ({self.proj_name}): "
+                f"D={eff['doctrine']} · M={eff['mental-model']} · "
+                f"STE={eff['style-ste']} · DO-178C={eff['code-do178c']} · "
+                f"Hyg={eff['search-hygiene']} · Mem={eff['memory-summary']} · Sit={eff['sitrep']}"
+            )
+        elif w >= 72:
+            eff_line = (
+                f"  Active: D={eff['doctrine']} M={eff['mental-model']} "
+                f"STE={eff['style-ste']} DO-178C={eff['code-do178c']} "
+                f"Hyg={eff['search-hygiene']} Mem={eff['memory-summary']} Sit={eff['sitrep']}"
+            )
+        else:
+            eff_line = (
+                f"  Active: D={eff['doctrine']} M={eff['mental-model']} "
+                f"STE={eff['style-ste']} DO-178C={eff['code-do178c']}"
+            )
         cpu = fmt_cpu_max(self.cg.get("cpu.max", ""))
         mem_cur = fmt_bytes(self.cg.get("memory.current", ""))
         mem_hi = fmt_bytes(self.cg.get("memory.high", ""))
@@ -974,11 +3709,13 @@ class MenuApp:
         if y0 < top + rows:
             out.append(f"\x1b[{y0};1H{BG_MAIN}{FG_DIM}{'─' * w}{RESET}")
         if y0 + 1 < top + rows:
-            s1 = trunc(f"  agents.slice   CPU: {cpu}   RAM: {mem_cur} / {mem_hi} soft / {mem_max} max", w)
-            out.append(f"\x1b[{y0 + 1};1H{BG_MAIN}{FG_CYAN}{s1.ljust(w)}{RESET}")
+            out.append(f"\x1b[{y0 + 1};1H{BG_MAIN}{FG_GREEN}{trunc(eff_line, w).ljust(w)}{RESET}")
         if y0 + 2 < top + rows:
-            s2 = trunc(f"  Tasks: {pids}   IOWeight: {io_w}   autonice: {self.autonice}   (Enter/Click toggles)", w)
-            out.append(f"\x1b[{y0 + 2};1H{BG_MAIN}{FG_MUTED}{s2.ljust(w)}{RESET}")
+            s1 = trunc(f"  agents.slice   CPU: {cpu}   RAM: {mem_cur} / {mem_hi} soft / {mem_max} max", w)
+            out.append(f"\x1b[{y0 + 2};1H{BG_MAIN}{FG_CYAN}{s1.ljust(w)}{RESET}")
+        if y0 + 3 < top + rows:
+            s2 = trunc(f"  Tasks: {pids}   IOWeight: {io_w}   autonice: {self.autonice}", w)
+            out.append(f"\x1b[{y0 + 3};1H{BG_MAIN}{FG_MUTED}{s2.ljust(w)}{RESET}")
 
     def _render_about(self, out, w, top, rows):
         a = self.about
@@ -1039,24 +3776,128 @@ class MenuApp:
                 out.append(f"\x1b[{y};1H{BG_MAIN}{' ' * w}{RESET}")
 
     def _set_active_sel(self, idx):
-        if self.tab == 1 and self.inspect_win is not None:
+        if self.tab == TAB_SESSIONS and self.inspect_win is not None:
             self.inspect_sel = max(0, min(idx, max(0, len(self.inspect_agents) - 1)))
+        elif self.tab == TAB_HISTORY and self.history_handoff_item is not None:
+            self.history_handoff_sel = max(0, min(idx, max(0, len(self.history_handoff_targets) - 1)))
+        elif self.tab == TAB_HISTORY and self.history_detail is not None:
+            _, h = get_term_size()
+            vis = max(1, h - 7)
+            max_sc = max(0, len(self.history_detail_lines) - vis)
+            self.history_detail_scroll = max(0, min(idx, max_sc))
+        elif self.tab == TAB_HISTORY and self.history_date_key is not None:
+            grp = self._current_date_group()
+            n = len(grp["items"]) if grp else 0
+            self.history_date_sel = max(0, min(idx, max(0, n - 1)))
         else:
             self.sel[self.tab] = max(0, min(idx, max(0, self.current_items_len() - 1)))
 
     def _get_active_sel(self):
-        if self.tab == 1 and self.inspect_win is not None:
+        if self.tab == TAB_SESSIONS and self.inspect_win is not None:
             return self.inspect_sel
+        if self.tab == TAB_HISTORY and self.history_handoff_item is not None:
+            return self.history_handoff_sel
+        if self.tab == TAB_HISTORY and self.history_detail is not None:
+            return self.history_detail_scroll
+        if self.tab == TAB_HISTORY and self.history_date_key is not None:
+            return self.history_date_sel
         return self.sel[self.tab]
+
+    def _scroll_from_bar(self, row):
+        if not self.scrollbar_rect:
+            return
+        top_r, bot_r, _sb_col, total, visible, mode = self.scrollbar_rect
+        span = max(1, bot_r - top_r)
+        frac = max(0.0, min(1.0, (row - top_r) / span))
+        max_sc = max(0, total - visible)
+        sc = int(round(frac * max_sc))
+        if mode == "history_detail":
+            self.history_detail_scroll = sc
+        elif mode == "history_cards":
+            self.history_date_scroll = sc
+            self.history_date_sel = max(0, min(total - 1, sc + int(round(frac * max(0, visible - 1)))))
+        elif mode == "history_dates":
+            self.scroll[TAB_HISTORY] = sc
+            self.sel[TAB_HISTORY] = max(0, min(total - 1, sc + int(round(frac * max(0, visible - 1)))))
+        elif mode == "config":
+            self.scroll[TAB_CONFIG] = sc
+            citems = self._config_items()
+            cfg_rows, _ = self._config_rows(citems)
+            target_r = max(0, min(len(cfg_rows) - 1, sc + int(round(frac * max(0, visible - 1)))))
+            for r_i in range(target_r, len(cfg_rows)):
+                if cfg_rows[r_i][0] == "item":
+                    self.sel[TAB_CONFIG] = cfg_rows[r_i][1]
+                    break
+            else:
+                for r_i in range(target_r, -1, -1):
+                    if cfg_rows[r_i][0] == "item":
+                        self.sel[TAB_CONFIG] = cfg_rows[r_i][1]
+                        break
 
     def handle_mouse(self, btn, col, row, pressed):
         # Scroll wheel (64 = up, 65 = down)
+        if self.tab == TAB_HISTORY and self.history_date_editing:
+            if btn == 64:
+                self._dp_shift_month(-1)
+                return
+            if btn == 65:
+                self._dp_shift_month(1)
+                return
+            if btn & 32:
+                for ry, cs, ce, d_obj in self.dp_day_rects:
+                    if row == ry and cs <= col <= ce:
+                        self.dp_cursor = d_obj
+                        return
+                return
+            if btn == 0 and pressed == "M":
+                if self.back_rect and row == self.back_rect[0] and self.back_rect[1] <= col <= self.back_rect[2]:
+                    self.history_date_editing = False
+                    self.status_msg = ""
+                    return
+                for ry, cs, ce, d_obj in self.dp_day_rects:
+                    if row == ry and cs <= col <= ce:
+                        self._dp_pick_date(d_obj)
+                        return
+                for ry, cs, ce, act, payload in self.dp_btn_rects:
+                    if row == ry and cs <= col <= ce:
+                        if act == "prev_month":
+                            self._dp_shift_month(-1)
+                        elif act == "next_month":
+                            self._dp_shift_month(1)
+                        elif act == "preset":
+                            self._apply_history_date_spec(payload)
+                        elif act == "apply":
+                            self._dp_apply_current()
+                        elif act == "reset":
+                            self._apply_history_date_spec("top10")
+                        return
+                # Allow clicking top tab bar even while picker is open
+                if row == 1:
+                    for sc, ec, tab_idx in self.tab_rects:
+                        if sc <= col <= ec:
+                            self.history_date_editing = False
+                            self._switch_tab(tab_idx)
+                            return
+                    w, _ = get_term_size()
+                    if col >= w - 13:
+                        self.running = False
+                return
+            return
+
+        step = 3 if (self.tab == TAB_HISTORY and self.history_detail is not None) else 1
         if btn == 64:
-            self._set_active_sel(self._get_active_sel() - 1)
+            self._set_active_sel(self._get_active_sel() - step)
             return
         if btn == 65:
-            self._set_active_sel(self._get_active_sel() + 1)
+            self._set_active_sel(self._get_active_sel() + step)
             return
+
+        # Left-button drag on scrollbar (btn == 32)
+        if btn == 32 and self.scrollbar_rect:
+            top_r, bot_r, sb_col = self.scrollbar_rect[:3]
+            if col >= sb_col - 1 and top_r <= row <= bot_r:
+                self._scroll_from_bar(row)
+                return
 
         # Motion hover (btn & 32): highlight hovered row smoothly
         if btn & 32:
@@ -1064,15 +3905,69 @@ class MenuApp:
                 self._set_active_sel(self.row_map[row])
             return
 
+        # Left or right click press on inline Doctrine / Mental Model / ✕ pills
+        if btn in (0, 2) and pressed == "M":
+            if self.tab == TAB_SESSIONS and self.inspect_win is not None:
+                rect = self.agent_doc_rects.get(row)
+                if rect and rect[0] <= col <= rect[1]:
+                    self.inspect_sel = rect[2]
+                    if btn == 0:
+                        self._cycle_agent_mode(rect[2], "doctrine")
+                    else:
+                        self._clear_agent_mode(rect[2], field="doctrine", action="toggle_clear")
+                    return
+                rect = self.agent_mod_rects.get(row)
+                if rect and rect[0] <= col <= rect[1]:
+                    self.inspect_sel = rect[2]
+                    if btn == 0:
+                        self._cycle_agent_mode(rect[2], "mental-model")
+                    else:
+                        self._clear_agent_mode(rect[2], field="mental-model", action="toggle_clear")
+                    return
+                rect = self.agent_clr_rects.get(row)
+                if rect and rect[0] <= col <= rect[1]:
+                    self.inspect_sel = rect[2]
+                    self._clear_agent_mode(rect[2], field=None, action="toggle_clear" if btn == 0 else "delete")
+                    return
+            if self.tab == TAB_HISTORY and self.history_date_key is not None and self.history_detail is None and self.history_handoff_item is None:
+                rect = self.hist_doc_rects.get(row)
+                if rect and rect[0] <= col <= rect[1]:
+                    self.history_date_sel = rect[2]
+                    if btn == 0:
+                        self._cycle_history_project_mode(rect[2], "doctrine")
+                    else:
+                        self._clear_history_project_mode(rect[2], field="doctrine", action="toggle_clear")
+                    return
+                rect = self.hist_mod_rects.get(row)
+                if rect and rect[0] <= col <= rect[1]:
+                    self.history_date_sel = rect[2]
+                    if btn == 0:
+                        self._cycle_history_project_mode(rect[2], "mental-model")
+                    else:
+                        self._clear_history_project_mode(rect[2], field="mental-model", action="toggle_clear")
+                    return
+                rect = self.hist_clr_rects.get(row)
+                if rect and rect[0] <= col <= rect[1]:
+                    self.history_date_sel = rect[2]
+                    self._clear_history_project_mode(rect[2], field=None, action="toggle_clear" if btn == 0 else "delete")
+                    return
+                rect = self.hist_copy_rects.get(row)
+                if rect and rect[0] <= col <= rect[1]:
+                    self.history_date_sel = rect[2]
+                    self._copy_history_session_id(rect[2])
+                    return
+
         # Left click press (btn == 0, pressed == 'M')
         if btn == 0 and pressed == "M":
+            if self.scrollbar_rect:
+                top_r, bot_r, sb_col = self.scrollbar_rect[:3]
+                if col >= sb_col - 1 and top_r <= row <= bot_r:
+                    self._scroll_from_bar(row)
+                    return
             if row == 1:
                 for s_col, e_col, t_idx in self.tab_rects:
                     if s_col <= col <= e_col:
-                        if t_idx == 1 and self.tab == 1 and self.inspect_win is not None:
-                            self.inspect_win = None
-                        self.tab = t_idx
-                        self.status_msg = ""
+                        self._switch_tab(t_idx)
                         return
                 # Click on "Esc to close" at top-right
                 w, _ = get_term_size()
@@ -1080,7 +3975,14 @@ class MenuApp:
                     self.running = False
                 return
             if self.back_rect and row == self.back_rect[0] and self.back_rect[1] <= col <= self.back_rect[2]:
-                self.inspect_win = None
+                if self.tab == TAB_HISTORY and self.history_handoff_item is not None:
+                    self.history_handoff_item = None
+                elif self.tab == TAB_HISTORY and self.history_detail is not None:
+                    self.history_detail = None
+                elif self.tab == TAB_HISTORY and self.history_date_key is not None:
+                    self.history_date_key = None
+                else:
+                    self.inspect_win = None
                 self.status_msg = ""
                 return
             if self.jump_rect and row == self.jump_rect[0] and self.jump_rect[1] <= col <= self.jump_rect[2]:
@@ -1088,7 +3990,42 @@ class MenuApp:
                     self.pending_cmd = self.inspect_win["cmd"]
                     self.running = False
                 return
+            if self.tab == TAB_HISTORY and self.history_detail is not None and self.history_handoff_item is None:
+                if self.hist_handoff_rect and row == self.hist_handoff_rect[0] and self.hist_handoff_rect[1] <= col <= self.hist_handoff_rect[2]:
+                    self.open_history_handoff(self.history_detail)
+                    return
+                if self.hist_resume_rect and row == self.hist_resume_rect[0] and self.hist_resume_rect[1] <= col <= self.hist_resume_rect[2]:
+                    self.pending_cmd = build_history_go_cmd(self.ctx, self.history_detail)
+                    self.running = False
+                    return
+                if self.hist_pager_rect and row == self.hist_pager_rect[0] and self.hist_pager_rect[1] <= col <= self.hist_pager_rect[2]:
+                    self.pending_cmd = build_history_pager_cmd(self.ctx, self.history_detail)
+                    self.running = False
+                    return
+            if self.tab == TAB_HISTORY and self.history_detail is None and self.history_date_key is None:
+                if self.hist_proj_rect and row == self.hist_proj_rect[0] and self.hist_proj_rect[1] <= col <= self.hist_proj_rect[2]:
+                    self.history_searching = False
+                    self.history_date_editing = False
+                    self._cycle_history_project(1)
+                    self.status_msg = ""
+                    return
+                if self.hist_tool_rect and row == self.hist_tool_rect[0] and self.hist_tool_rect[1] <= col <= self.hist_tool_rect[2]:
+                    self.history_searching = False
+                    self.history_date_editing = False
+                    self._cycle_history_tool(1)
+                    self.status_msg = ""
+                    return
+                if self.hist_dates_rect and row == self.hist_dates_rect[0] and self.hist_dates_rect[1] <= col <= self.hist_dates_rect[2]:
+                    self.open_history_date_picker()
+                    return
+                if self.hist_search_rect and row == self.hist_search_rect[0] and self.hist_search_rect[1] <= col <= self.hist_search_rect[2]:
+                    self.history_date_editing = False
+                    self.history_searching = True
+                    self.status_msg = ""
+                    return
             if row in self.row_map:
+                self.history_searching = False
+                self.history_date_editing = False
                 self._set_active_sel(self.row_map[row])
                 self.activate_current()
 
@@ -1101,8 +4038,118 @@ class MenuApp:
             if m:
                 self.handle_mouse(int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4))
             return
+        # Inside History visual Calendar Date-Range Picker (supports arrows/click + direct typing)
+        if self.tab == TAB_HISTORY and self.history_date_editing and self.history_detail is None:
+            if data in ("\x1b", "\x1b\x1b", "\x1b[99~"):
+                if self.history_date_input:
+                    self.history_date_input = ""
+                    self.status_msg = ""
+                elif self.dp_start and not self.dp_end:
+                    self.dp_start = None
+                    self.status_msg = "Cleared start date — pick Start date or Esc to close"
+                else:
+                    self.history_date_editing = False
+                    self.status_msg = ""
+                return
+            if data == "\x03":
+                self.running = False
+                return
+            if data in ("\r", "\n"):
+                if self.history_date_input.strip():
+                    self._apply_history_date_spec(self.history_date_input)
+                else:
+                    self._dp_pick_date(self.dp_cursor)
+                return
+            if data in ("\x7f", "\x08"):
+                if self.history_date_input:
+                    self.history_date_input = self.history_date_input[:-1]
+                elif self.dp_start:
+                    self.dp_start = None
+                    self.dp_end = None
+                    self.status_msg = "Cleared selection"
+                return
+            if data == "\x15":  # Ctrl+U
+                self.history_date_input = ""
+                return
+            if data == "\x1b[D":
+                self._dp_move_cursor(-1)
+                return
+            if data == "\x1b[C":
+                self._dp_move_cursor(1)
+                return
+            if data == "\x1b[A":
+                self._dp_move_cursor(-7)
+                return
+            if data == "\x1b[B":
+                self._dp_move_cursor(7)
+                return
+            if data == "\x1b[5~":  # PgUp -> previous month
+                self._dp_shift_month(-1)
+                return
+            if data == "\x1b[6~":  # PgDn -> next month
+                self._dp_shift_month(1)
+                return
+            if not self.history_date_input:
+                if data == "[":
+                    self._dp_shift_month(-1)
+                    return
+                if data == "]":
+                    self._dp_shift_month(1)
+                    return
+                if data == " ":
+                    self._dp_apply_current()
+                    return
+                if data in ("t", "T"):
+                    today = datetime.datetime.now().astimezone().date()
+                    self.dp_cursor = today
+                    self.dp_year, self.dp_month = today.year, today.month
+                    self.status_msg = f"Jumped to today ({today.isoformat()})"
+                    return
+                if data in ("c", "C"):
+                    self._apply_history_date_spec("top10")
+                    return
+            if len(data) == 1 and data.isprintable():
+                self.history_date_input += data
+                return
+            return
+        # Inside History inline search mode
+        if self.tab == TAB_HISTORY and self.history_searching and self.history_detail is None:
+            if data in ("\x1b", "\x1b\x1b", "\x1b[99~"):
+                self.history_searching = False
+                if self.history_query:
+                    self.history_query = ""
+                    self._apply_history_filter()
+                self.status_msg = ""
+                return
+            if data == "\x03":
+                self.running = False
+                return
+            if data in ("\r", "\n"):
+                self.history_searching = False
+                self.status_msg = ""
+                return
+            if data in ("\x7f", "\x08"):
+                if self.history_query:
+                    self.history_query = self.history_query[:-1]
+                    self._apply_history_filter()
+                return
+            if data == "\x15":  # Ctrl+U
+                self.history_query = ""
+                self._apply_history_filter()
+                return
+            if data == "\x1b[A":
+                self._set_active_sel(self._get_active_sel() - 1)
+                return
+            if data == "\x1b[B":
+                self._set_active_sel(self._get_active_sel() + 1)
+                return
+            if len(data) == 1 and data.isprintable():
+                self.history_query += data
+                self._apply_history_filter()
+                return
+            return
         # Inside Session Inspector: Esc / Backspace / Left / h returns to Sessions list
-        if self.tab == 1 and self.inspect_win is not None:
+        if self.tab == TAB_SESSIONS and self.inspect_win is not None:
             if data in ("\x1b", "\x7f", "\x08", "\x1b[D", "h"):
                 self.inspect_win = None
                 self.status_msg = ""
@@ -1115,42 +4162,238 @@ class MenuApp:
                 self.inspect_agents = load_window_agents(self.ctx, self.inspect_win)
                 self.status_msg = f"Refreshed {self.inspect_win['win_name']} ({len(self.inspect_agents)} panes)"
                 return
-        if data in ("\x1b", "q", "Q", "\x03"):
+            if data in ("d", "D"):
+                self.clamp_sel()
+                self._cycle_agent_mode(self.inspect_sel, "doctrine")
+                return
+            if data in ("m", "M"):
+                self.clamp_sel()
+                self._cycle_agent_mode(self.inspect_sel, "mental-model")
+                return
+            if data in ("x", "X"):
+                self.clamp_sel()
+                self._clear_agent_mode(self.inspect_sel, field=None, action="off")
+                return
+            if data in ("c", "\x1b[3~"):
+                self.clamp_sel()
+                self._clear_agent_mode(self.inspect_sel, field=None, action="delete")
+                return
+            if data == "C":
+                self.clamp_sel()
+                self._delete_agent_project_modes(self.inspect_sel)
+                return
+        # Inside History Handoff Provider Picker
+        if self.tab == TAB_HISTORY and self.history_handoff_item is not None:
+            if data in ("\x1b", "\x7f", "\x08", "\x1b[D", "h"):
+                self.history_handoff_item = None
+                self.status_msg = ""
+                return
+        # Inside History Thread Inspector
+        if self.tab == TAB_HISTORY and self.history_detail is not None and self.history_handoff_item is None:
+            if data in ("\x1b", "\x7f", "\x08", "\x1b[D", "h"):
+                self.history_detail = None
+                self.status_msg = ""
+                return
+            if data == "H":
+                self.open_history_handoff(self.history_detail)
+                return
+            if data in ("o", "O"):
+                self.pending_cmd = build_history_go_cmd(self.ctx, self.history_detail)
+                self.running = False
+                return
+            if data in ("v", "V"):
+                self.pending_cmd = build_history_pager_cmd(self.ctx, self.history_detail)
+                self.running = False
+                return
+            if data in ("t", "T"):
+                self.history_detail_tools = not self.history_detail_tools
+                self._reload_history_detail()
+                self.history_detail_scroll = 0
+                self.status_msg = "Showing tool calls & thinking" if self.history_detail_tools else "Showing conversation only"
+                return
+            if data in ("r", "R"):
+                self._reload_history_detail()
+                self.status_msg = "Reloaded thread from acf.db"
+                return
+            if data == " ":
+                _, h = get_term_size()
+                self._set_active_sel(self._get_active_sel() + max(1, h - 8))
+                self.status_msg = ""
+                return
+        # Inside History Date view (Level 2): Esc / Backspace / Left / h returns to Dates list
+        if self.tab == TAB_HISTORY and self.history_date_key is not None and self.history_detail is None:
+            if data in ("\x1b", "\x7f", "\x08", "\x1b[D", "h"):
+                self.history_date_key = None
+                self.status_msg = ""
+                return
+        if data in ("\x1b", "\x1b\x1b", "\x1b[99~", "q", "Q", "\x03"):
             self.running = False
         elif data in ("\t", "\x1b[C", "l"):
-            if self.tab == 1 and self.inspect_win is None and data in ("\x1b[C", "l"):
+            if self.tab == TAB_SESSIONS and self.inspect_win is None and data in ("\x1b[C", "l"):
                 # Right arrow on a window row drills into its agents
                 self.clamp_sel()
-                idx = self.sel[1]
+                idx = self.sel[TAB_SESSIONS]
                 if 0 <= idx < len(self.sessions) and self.sessions[idx].get("kind") == "window":
                     self.open_session_inspector(self.sessions[idx])
                     return
-            self.tab = (self.tab + 1) % len(TABS)
-            self.status_msg = ""
+            if self.tab == TAB_HISTORY and self.history_detail is None and self.history_handoff_item is None and data in ("\x1b[C", "l"):
+                self.clamp_sel()
+                if self.history_date_key is None:
+                    idx = self.sel[TAB_HISTORY]
+                    if 0 <= idx < len(self.history_date_groups):
+                        self.open_history_date(self.history_date_groups[idx])
+                        return
+                else:
+                    grp = self._current_date_group()
+                    items = grp["items"] if grp else []
+                    idx = self.history_date_sel
+                    if 0 <= idx < len(items):
+                        self.open_history_detail(items[idx])
+                        return
+            self._switch_tab(self.tab + 1)
         elif data in ("\x1b[Z", "\x1b[D", "h"):
-            self.tab = (self.tab - 1) % len(TABS)
-            self.status_msg = ""
-        elif data in ("1", "2", "3", "4"):
-            nxt_tab = int(data) - 1
-            if nxt_tab == 1 and self.tab == 1 and self.inspect_win is not None:
-                self.inspect_win = None
-            self.tab = nxt_tab
-            self.status_msg = ""
+            self._switch_tab(self.tab - 1)
+        elif len(data) == 1 and data.isdigit() and 1 <= int(data) <= len(TABS):
+            self._switch_tab(int(data) - 1)
         elif data in ("\x1b[A", "k"):
             self._set_active_sel(self._get_active_sel() - 1)
+            self.status_msg = ""
         elif data in ("\x1b[B", "j"):
             self._set_active_sel(self._get_active_sel() + 1)
+            self.status_msg = ""
+        elif data == "\x1b[5~":  # PageUp
+            _, h = get_term_size()
+            is_cards = (self.tab == TAB_HISTORY and self.history_date_key is not None and self.history_detail is None) or (self.tab == TAB_SESSIONS and self.inspect_win is not None)
+            step = max(1, (h - 6) // 2) if is_cards else max(1, h - 6)
+            self._set_active_sel(self._get_active_sel() - step)
+            self.status_msg = ""
+        elif data == "\x1b[6~":  # PageDown
+            _, h = get_term_size()
+            is_cards = (self.tab == TAB_HISTORY and self.history_date_key is not None and self.history_detail is None) or (self.tab == TAB_SESSIONS and self.inspect_win is not None)
+            step = max(1, (h - 6) // 2) if is_cards else max(1, h - 6)
+            self._set_active_sel(self._get_active_sel() + step)
+            self.status_msg = ""
+        elif data in ("\x1b[H", "\x1b[1~", "\x1bOH"):  # Home
+            self._set_active_sel(0)
+            self.status_msg = ""
+        elif data in ("\x1b[F", "\x1b[4~", "\x1bOF"):  # End
+            self._set_active_sel(max(0, self.current_items_len() - 1))
+            self.status_msg = ""
         elif data in ("\r", "\n", " "):
             self.activate_current()
-        elif data in ("g", "G") and self.tab == 1 and self.inspect_win is None:
+        elif self.tab == TAB_COMMANDS and data in self.hotkey_map:
+            self._activate_command(self.hotkey_map[data])
+        elif self.tab == TAB_COMMANDS and len(data) == 2 and data[0] == "\x1b" and data[1] in "0123456789":
+            sock = shlex.quote(self.ctx["sock"]) if self.ctx["sock"] else ""
+            tbin = shlex.quote(TMUX_BIN) + (f" -S {sock}" if sock else " -L agents")
+            sess = shlex.quote(self.ctx["session"])
+            if data[1] == "0" and self.pane_ctx.get("in_council"):
+                chair = shlex.quote(self.pane_ctx.get("chair_target") or self.ctx["pane"])
+                self.pending_cmd = f"{tbin} send-keys -t {chair} M-o"
+            else:
+                num = 10 if data[1] == "0" else int(data[1])
+                self.pending_cmd = f"{tbin} select-window -t {sess}:={num}"
+            self.running = False
+        elif data in ("g", "G") and self.tab == TAB_SESSIONS and self.inspect_win is None:
             self.clamp_sel()
-            idx = self.sel[1]
+            idx = self.sel[TAB_SESSIONS]
             if 0 <= idx < len(self.sessions):
                 self.pending_cmd = self.sessions[idx]["cmd"]
                 self.running = False
-        elif data in ("r", "R") and self.tab == 1:
+        elif data in ("r", "R") and self.tab == TAB_SESSIONS:
             self.sessions = load_sessions(self.ctx)
             self.status_msg = "Refreshed sessions"
+        elif self.tab == TAB_CONFIG and data in ("x", "X", "c", "C", "\x7f", "\x08", "\x1b[3~"):
+            self.clamp_sel()
+            citems = self._config_items()
+            idx = self.sel[TAB_CONFIG]
+            if 0 <= idx < len(citems):
+                it = citems[idx]
+                is_off = data in ("x", "X")
+                if it["scope"] in ("pane", "project"):
+                    self._set_config_val(it, "off" if is_off else "inherit")
+                elif it["scope"] == "global" and "off" in it["choices"]:
+                    self._set_config_val(it, "off")
+        elif self.tab == TAB_HISTORY and self.history_detail is None and self.history_handoff_item is None:
+            if data in ("d", "D") and self.history_date_key is not None:
+                self.clamp_sel()
+                self._cycle_history_project_mode(self.history_date_sel, "doctrine")
+            elif data in ("m", "M") and self.history_date_key is not None:
+                self.clamp_sel()
+                self._cycle_history_project_mode(self.history_date_sel, "mental-model")
+            elif data == "x" and self.history_date_key is not None:
+                self.clamp_sel()
+                self._clear_history_project_mode(self.history_date_sel, field=None, action="off")
+            elif data in ("X", "\x1b[3~") and self.history_date_key is not None:
+                self.clamp_sel()
+                self._clear_history_project_mode(self.history_date_sel, field=None, action="delete")
+            elif data in ("y", "Y") and self.history_date_key is not None:
+                self.clamp_sel()
+                self._copy_history_session_id(self.history_date_sel)
+            elif data == "H" and self.history_date_key is not None:
+                self.clamp_sel()
+                grp = self._current_date_group()
+                items = grp["items"] if grp else []
+                idx = self.history_date_sel
+                if 0 <= idx < len(items):
+                    self.open_history_handoff(items[idx])
+            elif data in ("i", "I") and self.history_date_key is not None:
+                self.clamp_sel()
+                grp = self._current_date_group()
+                items = grp["items"] if grp else []
+                idx = self.history_date_sel
+                if 0 <= idx < len(items):
+                    self.open_history_detail(items[idx])
+            elif data in ("d", "D") and self.history_date_key is None:
+                self.open_history_date_picker()
+            elif data in ("/", "s", "S") and self.history_date_key is None:
+                self.history_date_editing = False
+                self.history_searching = True
+                self.status_msg = ""
+            elif data == "p":
+                self._cycle_history_project(1)
+                self.status_msg = ""
+            elif data == "P":
+                self._cycle_history_project(-1)
+                self.status_msg = ""
+            elif data == "t":
+                self._cycle_history_tool(1)
+                self.status_msg = ""
+            elif data == "T":
+                self._cycle_history_tool(-1)
+                self.status_msg = ""
+            elif data in ("c", "C"):
+                self.history_proj_filter = ""
+                self.history_tool_filter = ""
+                self.history_query = ""
+                self.history_date_mode = "top"
+                self.history_date_start = None
+                self.history_date_end = None
+                self.history_date_range_label = "Top 10"
+                self.history_date_input = ""
+                self.history_date_editing = False
+                self.ensure_history_loaded()
+                self._apply_history_filter()
+                self.status_msg = "Cleared History filters (Dates: Top 10)"
+            elif data in ("o", "O") and self.history_date_key is not None:
+                self.clamp_sel()
+                grp = self._current_date_group()
+                items = grp["items"] if grp else []
+                idx = self.history_date_sel
+                if 0 <= idx < len(items):
+                    self.pending_cmd = build_history_go_cmd(self.ctx, items[idx])
+                    self.running = False
+            elif data in ("v", "V") and self.history_date_key is not None:
+                self.clamp_sel()
+                grp = self._current_date_group()
+                items = grp["items"] if grp else []
+                idx = self.history_date_sel
+                if 0 <= idx < len(items):
+                    self.pending_cmd = build_history_pager_cmd(self.ctx, items[idx])
+                    self.running = False
+            elif data in ("r", "R"):
+                self.ensure_history_loaded(force=True)
+                self.status_msg = f"Refreshed history ({len(self.history_all)} chats across {len(self.history_projects)} projects)"
 
     @staticmethod
     def _pop_tokens(buf, fd):
@@ -1259,11 +4502,12 @@ def main():
             sock,
             "display-popup", "-E",
             *(["-c", client] if client else []),
-            "-x", "C", "-y", "C", "-w", "84", "-h", "24",
+            "-x", "C", "-y", "C", "-w", "84", "-h", "32",
             "-b", "rounded", "-S", "fg=#7aa2f7", "-T", " [ACF] ",
             inner,
         )
-        return subprocess.run(cmd).returncode
+        # Interactive popup blocks until the user closes the menu (no short timeout).
+        return subprocess.run(cmd, timeout=None).returncode
     ctx = {
         "sock": args[0] if len(args) > 0 else "",
         "client": args[1] if len(args) > 1 else "",

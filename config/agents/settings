@@ -9,7 +9,8 @@
 #start-agent claude   # what a new project tab starts: claude, or ask = a list to pick from (Claude,
                       # Gemini, Codex, Antigravity, Copilot, OpenCode, a terminal); a tab the saved layout brings back keeps its agent
 #log-md off           # chat log: off = one file per project (logs/acf/acf.db); on = also one readable .md file per thread
-#rules enforce        # TokenOps projects (afc-rules): enforce = a broken hard rule sends the agent back, once a turn;
+#rules enforce        # ACF rule engine (afc-rules): enforces TokenOps rules plus core CLS/SAS standards across all
+                      # projects. enforce = a broken hard rule sends the agent back, once a turn;
                       # report = only shown in the pane header and logs/acf/rules.log; off = no reminder, no check
 #rules-recap on       # one line under each reply: the rule check's verdict and what the turn did (you see it, the model does not)
 #mem-wall 90          # no new agent or project tab once the fleet's real memory reaches this share of
@@ -23,3 +24,10 @@
                       # unified = provider-agnostic ACF CLI UI (afc-chat: task checklist + 1-line bash bar
                       # across Claude, Codex, Gemini and Antigravity, keeping tmux scrollback/scrollbar)
 #claude-view classic  # legacy alias for view (used when view is unset)
+#doctrine off         # global default Doctrine: off | mdmp | f3ead | ooda (overridable per-project & per-pane)
+#mental-model off     # global default Mental Model: off | ooda | first-principles | six-hats | 80-20 | rca | occam | 5x5
+#style-ste on         # CLS (~80% ASD-STE100 + Diagram First): core default on, enforced at turn end (on | off)
+#code-do178c on       # SAS (DO-178C-Lite coding discipline): core default on, enforced at turn end (on | off)
+#search-hygiene off   # Search hygiene: built-in Grep + capped rg + Rule-of-3 helper promotion (on | off)
+#memory-summary off   # Hybrid memory: auto-inject compact <=50-line logs/acf/SUMMARY.md on turn 1 across providers (on | off)
+#sitrep off           # Reply footer: You: echo + SITREP · D:<doctrine> · M:<model> · <phase> · Done/Open/Next (on | off)

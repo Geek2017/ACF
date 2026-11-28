@@ -1,0 +1,230 @@
+#!/usr/bin/env -S python3 -I
+"""afc-collab: agent names, @name context and collab mode for the fleet's panes.
+
+  afc-collab name [--all | PANE]       give unnamed panes a short random name (tmux hooks run --all)
+  afc-collab list                      every agent: @name, tool, tab, pane, collab on/off
+  afc-collab on | stop | status [PANE] collab mode for the pane's tab (default: this pane)
+  afc-collab send @name|@all TEXT...   message a peer of this project (collab must be on)
+  afc-collab inbox [@name|PANE]        show queued unread messages from collab.db (same project)
+  afc-collab log [N]                   show last N collab messages for this project (default 20)
+  afc-collab peek @name [LINES]        a peer's recent screen (same project only)
+  afc-collab install [--dry-run]       the /collab command for each Claude account and Gemini home
+
+In a chat: /collab, /collab stop, /collab status (Codex: type collab, collab stop; it allows no
+custom slash commands). Mention @owl in a prompt to hand that agent's screen to this one.
+Agents reach only the agents of their own project: same project tab and same project folder
+(a git worktree counts as its repository). Anything else is refused with the reason.
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(HERE, "..", "lib", "afc"), os.path.join(os.path.expanduser("~"), ".local", "lib", "afc")):
+    if _lib not in sys.path:
+        sys.path.insert(0, _lib)
+import collab  # noqa: E402
+
+
+def usage(code=2):
+    print(__doc__.strip(), file=sys.stderr if code else sys.stdout)
+    return code
+
+
+def _env_tool():
+    if any(k.startswith("CODEX_") for k in os.environ):
+        return "codex"
+    if "CLAUDECODE" in os.environ or "CLAUDE_CONFIG_DIR" in os.environ:
+        return "claude"
+    if "GEMINI_CLI_HOME" in os.environ:
+        return "gemini"
+    if any(k.startswith("ANTIGRAVITY_") for k in os.environ):
+        return "agy"
+    if any(k.startswith("OPENCODE_") for k in os.environ):
+        return "opencode"
+    if any(k.startswith("COPILOT_") for k in os.environ):
+        return "copilot"
+    return ""
+
+
+def here():
+    pane = collab.resolve_pane(pane_id=os.environ.get("TMUX_PANE"), tool=_env_tool(), cwd=os.getcwd())
+    if not pane:
+        raise collab.CollabError("not inside a fleet pane ($TMUX_PANE is not set or pane closed); give --from @name or a pane id")
+    return pane
+
+
+def cmd_name(args):
+    if args and args[0] != "--all":
+        names = collab.assign_names(only=args[0])
+        if args[0] not in names:
+            raise collab.CollabError(f"no pane {args[0]}")
+        print(names[args[0]])
+        return 0
+    names = collab.assign_names()
+    if not args:
+        print(names.get(os.environ.get("TMUX_PANE", ""), "") or f"{len(names)} panes named")
+    return 0
+
+
+def cmd_list(_args):
+    collab.assign_names()
+    for p in collab.list_panes():
+        print(f"@{p['agent']:<7} {collab.agent_tool(p['pid']):<11} {collab.tab_label(p):<24} "
+              f"{p['pane']:<6} collab {p['collab'] or 'off'}")
+    return 0
+
+
+def caller_pane():
+    """This process's own fleet pane, or None when it runs outside the fleet."""
+    try:
+        return here()
+    except collab.CollabError:
+        return None
+
+
+def pane_of(spec, panes):
+    """A pane given as %id or @name, or CollabError."""
+    hit = collab.find_pane(panes, spec) if spec.startswith("%") else collab.find_name(panes, collab.check_name(spec))
+    if not hit:
+        raise collab.CollabError(f"no agent or pane {spec}")
+    return hit
+
+
+def scoped(spec, what):
+    """The pane `spec` names, checked: an agent inside the fleet may only act on its own project.
+
+    Outside the fleet (a plain terminal) the folder you run it from must be that pane's project.
+    """
+    panes = collab.list_panes()
+    hit = pane_of(spec, panes)
+    me = collab.find_pane(panes, caller_pane() or "")
+    if me:
+        if hit["pane"] != me["pane"] and not collab.same_project(me, hit):
+            raise collab.CollabError(f"{spec} belongs to another project (tab {collab.tab_label(hit)}); "
+                                     f"you can only {what} in your own project")
+    elif collab.project_root(os.getcwd()) != collab.project_root(hit["path"]):
+        raise collab.CollabError(f"{spec} works in {hit['path']}; run this from that project's folder to {what} there")
+    return hit
+
+
+def cmd_send(args):
+    rest, from_pane = list(args), None
+    if len(rest) >= 2 and rest[0] in ("--from", "--pane"):
+        sender = scoped(rest[1], "send")
+        mine = caller_pane()
+        if mine and sender["pane"] != mine:
+            raise collab.CollabError(f"--from {rest[1]} is not this pane; an agent can only send as itself")
+        from_pane, rest = sender["pane"], rest[2:]
+    if len(rest) < 2 or not rest[0].startswith("@"):
+        return usage()
+    reached = collab.send(from_pane or here(), rest[0], " ".join(rest[1:]))
+    print("sent to " + ", ".join("@" + n for n in reached))
+    return 0
+
+
+def cmd_peek(args):
+    if not args or len(args) > 2:
+        return usage()
+    if len(args) == 2 and not (args[1].isdigit() and 10 <= int(args[1]) <= 2000):
+        raise collab.CollabError(f"LINES must be a number from 10 to 2000, not '{args[1]}'")
+    panes = collab.list_panes()
+    me = collab.find_pane(panes, here())
+    if not me:
+        raise collab.CollabError("this pane is not in the fleet")
+    if me.get("collab") != "on":
+        raise collab.CollabError(f"collab mode is off in tab {collab.tab_label(me)}; the user turns it on with /collab")
+    name = collab.check_name(args[0])
+    hit = collab.check_peer(me, collab.find_name(panes, name), name)
+    print(collab.peek(hit["pane"], int(args[1]) if len(args) == 2 else collab.PEEK_LINES))
+    return 0
+
+
+def cmd_inbox(args):
+    if len(args) > 1:
+        return usage()
+    if args:
+        target = scoped(args[0], "read inbox")
+    else:
+        panes = collab.list_panes()
+        target = collab.find_pane(panes, here())
+        if not target:
+            raise collab.CollabError("this pane is not in the fleet")
+    msgs = collab.peek_inbox(target["pane"], project=collab.group_key(target))
+    if not msgs:
+        print(f"@{target['agent'] or target['pane']}: inbox empty")
+        return 0
+    for m in msgs:
+        print(f"#{m['id']} from @{m['from_agent']}: {m['body']}")
+    return 0
+
+
+def cmd_log(args):
+    if len(args) > 1 or (args and not (args[0].isdigit() and 1 <= int(args[0]) <= 100)):
+        raise collab.CollabError("N must be a number from 1 to 100")
+    panes = collab.list_panes()
+    me = collab.find_pane(panes, here())
+    if not me:
+        raise collab.CollabError("this pane is not in the fleet")
+    n = int(args[0]) if args else 20
+    rows = collab.recent_log(collab.group_key(me), limit=n)
+    if not rows:
+        print(f"no collab messages yet in tab {collab.tab_label(me)}")
+        return 0
+    import datetime
+    for r in rows:
+        ts = datetime.datetime.fromtimestamp(r["ts"]).strftime("%H:%M:%S")
+        body = r["body"].replace("\n", " ⏎ ")
+        print(f"#{r['id']} {ts} [{r['status']}] @{r['from_agent']} -> @{r['to_agent']}: {body}")
+    return 0
+
+
+def _caller_is_agent():
+    """True when invoked from any agent CLI env OR inside a tmux pane running an agent process."""
+    if _env_tool():
+        return True
+    mine = caller_pane()
+    if mine:
+        me = collab.find_pane(collab.list_panes(), mine)
+        if me and collab.agent_tool(me["pid"]) != "agent":
+            return True
+    return False
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        return usage(0 if argv else 2)
+    cmd, args = argv[0], argv[1:]
+    if cmd == "name":
+        return cmd_name(args)
+    if cmd == "list":
+        return cmd_list(args)
+    if cmd in ("on", "start", "stop", "off", "status"):
+        target_pane = scoped(args[0], "change collab mode")["pane"] if args else here()
+        if cmd in ("on", "start") and _caller_is_agent():
+            raise collab.CollabError("only the user (master control) can enable collab; ask the user to run /collab on")
+        print(collab.command(target_pane, cmd))
+        return 0
+    if cmd == "send":
+        return cmd_send(args)
+    if cmd == "inbox":
+        return cmd_inbox(args)
+    if cmd == "log":
+        return cmd_log(args)
+    if cmd == "peek":
+        return cmd_peek(args)
+    if cmd == "install":
+        for line in collab.install(dry="--dry-run" in args):
+            print(line)
+        return 0
+    return usage()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except collab.CollabError as e:
+        print(f"afc-collab: {e}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"afc-collab: {e}", file=sys.stderr)
+        sys.exit(1)

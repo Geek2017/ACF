@@ -84,6 +84,15 @@ toast() {
 }
 
 export PATH="$HOME/.local/bin:$PATH"
+# Keep agent builds and repo copies off RAM-backed /tmp (tmpfs): default TMPDIR to SSD.
+if [[ -z "${TMPDIR:-}" || "$TMPDIR" == "/tmp" || "$TMPDIR" == "/tmp/" ]]; then
+  _afc_tmp="${AGENTS_TMPDIR:-$HOME/.cache/tmp}"
+  if mkdir -p "$_afc_tmp" 2>/dev/null; then
+    chmod 700 "$_afc_tmp" 2>/dev/null || true
+    export TMPDIR="$_afc_tmp"
+  fi
+  unset _afc_tmp
+fi
 SOCK="${AGENTS_SOCK:-agents}"   # AGENTS_SOCK: scratch server for tests
 SESSION=agents
 LIST="${AGENTS_LIST:-$HOME/.config/agents/projects}"
@@ -268,8 +277,8 @@ mem_high() {  # the limit in bytes, or nothing at all
   [[ "$h" =~ ^[0-9]+$ ]] || h=$(systemctl --user show agents.slice -p MemoryHigh --value 2>/dev/null || true)
   [[ "$h" =~ ^[0-9]+$ ]] && printf '%s\n' "$h"
 }
-mem_anon() {  # the fleet's memory that cannot be freed, in bytes
-  awk '$1 == "anon" { print $2; exit }' "$STAT" 2>/dev/null
+mem_anon() {  # the fleet's non-evictable memory (anon + shmem/tmpfs), in bytes
+  awk '$1 == "anon" { a = $2; seen = 1 } $1 == "shmem" { sh = $2 } END { if (seen) print a + sh }' "$STAT" 2>/dev/null
 }
 mem_room() {  # 0 = there is room for another agent, 1 = the wall is up (MEM_WALL_SAID says why)
   local pct used high
@@ -693,6 +702,8 @@ tool_run() {  # tool account [args...]: that agent on that account
   shift 2; tool_share "$tool" "$dir"; var=$(tool_var "$tool")
   # Gemini's effort (afc-gemini-effort): put the level set last back, in case a Gemini dropped it
   if [[ "$tool" == gemini ]]; then "$HOME/.local/bin/afc-gemini-effort" --home "$dir" ensure >/dev/null 2>&1 || true; fi
+  # Shift+Tab: the fleet adds bypass to Gemini's and Antigravity's mode cycle (agents --btab)
+  if [[ ( "$tool" == gemini || "$tool" == agy ) && -n "${TMUX_PANE:-}" ]]; then t set -p -t "$TMUX_PANE" @btab "$tool" 2>/dev/null || true; fi
   if [[ "$tool" == agy ]]; then env "HOME=$dir" GEMINI_FORCE_FILE_STORAGE=true "$(tool_bin "$tool")" "$@"   # HOME is always set
   elif [[ "$tool" == opencode ]]; then "$(tool_bin "$tool")" "$@"                                            # no folder switch
   elif [[ "$dir" == "$(tool_default "$tool")" ]]; then env -u "$var" "$(tool_bin "$tool")" "$@"
@@ -816,6 +827,8 @@ scan_procs() {
   local pid ppid comm tool name dir k
   KIDS=(); COMM=(); ACCT=(); SEEN=(); TRK=()
   GEMINI_HOOKED=""; if grep -qs 'agents --mark' "$HOME/.gemini/settings.json"; then GEMINI_HOOKED=1; fi
+  # afc-rules' Antigravity hook marks busy (PreInvocation) and done (Stop) itself
+  AGY_HOOKED=""; if grep -qs 'afc-rules hook agy' "$HOME/.gemini/config/hooks.json"; then AGY_HOOKED=1; fi
   while read -r pid ppid comm; do
     [[ -n "$pid" ]] || continue
     COMM[$pid]=$comm; KIDS[$ppid]+="$pid "
@@ -952,9 +965,11 @@ pane_line() {  # pane pid, flag, pane id -> that split's P line; fails while its
         if [[ "$out" == *$TAB* ]]; then rf=${out#*$TAB}; fi
       fi
     fi
-    # Codex and Antigravity have no hooks that tell the fleet a turn began: the watcher reads that
-    # from the record each keeps (activity). Which pane, which agent, which file:
-    if [[ "$kind" == codex || "$kind" == agy || ( "$kind" == copilot && -n "$rf" ) || ( "$kind" == gemini && -z "$GEMINI_HOOKED" ) ]]; then TRK[$3]="$kind$TAB$p$TAB$rf"; fi
+    # Codex has no hook that tells the fleet a turn began, nor Antigravity without afc-rules' hook: the
+    # watcher reads that from the record each keeps (activity). Antigravity writes its chat file while
+    # idle too, and holds other panes' chat files open, so the hook is the only true signal for it.
+    # Which pane, which agent, which file:
+    if [[ "$kind" == codex || ( "$kind" == agy && -z "$AGY_HOOKED" ) ||( "$kind" == copilot && -n "$rf" ) || ( "$kind" == gemini && -z "$GEMINI_HOOKED" ) ]]; then TRK[$3]="$kind$TAB$p$TAB$rf"; fi
     fi
   else
     kind=term; cwd=$(readlink "$PROC/$1/cwd" 2>/dev/null || true)
@@ -1164,7 +1179,7 @@ overview() {
 }
 
 # Tab signals for the agents that have no hooks to give them (Codex says only "done", Antigravity
-# nothing, Gemini nothing unless its settings carry the hooks): the watcher reads them from the record
+# nothing without afc-rules' hook, Gemini nothing unless its settings carry the hooks): the watcher reads them from the record
 # each keeps, for the panes layout_scan noted in TRK.
 #   Codex        its session file names the start and the end of every turn (task_started, task_complete)
 #   Antigravity, keep no such marks: the chat file being written is taken as working, and five looks
@@ -1404,7 +1419,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       echo "Fleet is not running."
     fi
     if [[ -r "$STAT" ]]; then
-      read -r anon file < <(awk '$1=="anon"{a=$2} $1=="file"{f=$2} END{print a+0, f+0}' "$STAT")
+      read -r anon file < <(awk '$1=="anon"||$1=="shmem"{a+=$2} $1=="file"{f=$2} END{print a+0, f+0}' "$STAT")
       high=$(systemctl --user show agents.slice -p MemoryHigh --value)
       max=$(systemctl --user show agents.slice -p MemoryMax --value)
       echo "fleet memory: $(numfmt --to=iec "$anon") real + $(numfmt --to=iec "$file") file cache" \
@@ -1563,12 +1578,18 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       opencode)        if [[ "$uview" == unified ]]; then chat_run opencode "$acct" auto || true; else tool_run opencode "$acct" --standalone || true; fi ;;
       opencode-bypass) if [[ "$uview" == unified ]]; then chat_run opencode "$acct" bypass || true; else tool_run opencode "$acct" --standalone --auto || true; fi ;;
       handoff)
-        # Alt+G to another tool, "this chat": agents --pane handoff 0 <tool> <account>. The log of the
-        # chat that is handed on was noted for this pane by --switch.
-        tool="${4:?tool}"; acct="${5:-}"; ask=()
-        note="${XDG_RUNTIME_DIR:-/tmp}/afc-handoff-${TMUX_PANE#%}"; file=$(cat "$note" 2>/dev/null || true); rm -f "$note"
+        # Alt+G to another tool, "this chat", or History handoff:
+        #   agents --pane handoff 0 <tool> [account] [handoff-file]
+        tool="${4:?tool}"; acct="${5:-}"; file="${6:-}"; ask=()
+        if [[ -z "$file" ]]; then
+          note="${XDG_RUNTIME_DIR:-/tmp}/afc-handoff-${TMUX_PANE#%}"; file=$(cat "$note" 2>/dev/null || true); rm -f "$note"
+        fi
         if [[ -r "$file" ]]; then
-          ask=("The work in this folder was being done with another agent. The log of that conversation is the file $file . Read the last part of it first, and earlier parts only as far as you need them. Then tell me in a few lines where the work stands, and wait for my next message.")
+          if [[ "$(basename "$file")" == handoff-* ]]; then
+            ask=("Pick up this cut-off session from another agent. Read the compact handoff brief in $file first (it contains the goal, files touched, git state, and exact cut-off point; full history stays in logs/acf/acf.db via afc-logs show). Summarize in a few short bullets where the work stopped and what comes next, then wait for my next message.")
+          else
+            ask=("The work in this folder was being done with another agent. The log of that conversation is the file $file . Read the last part of it first, and earlier parts only as far as you need them. Then tell me in a few lines where the work stands, and wait for my next message.")
+          fi
           echo "Handing on the chat in $file"
         else echo "No log of the earlier chat was found: this is a new chat."; fi
         tool_dir "$tool" "$acct" >/dev/null 2>&1 || acct=$(tool_current "$tool" || true)
@@ -1725,10 +1746,10 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       [[ -n "$c" ]] || continue
       pgrep -P "$c" -f '/\.claude/shell-snapshots/' >/dev/null && continue
       t set -p -t "$pane" @busy 0 \; set -pu -t "$pane" @bgshell
-      t list-clients -F '#{window_id}' | grep -qxF "$win" || t set -w -t "$pane" @unseen 1 \; set -g status-interval 1
+      t list-clients -F '#{window_id}' | grep -qxF "$win" || t set -w -t "$pane" @unseen 1 \; set -g status-interval 2
     done
     [[ -r "$STAT" ]] || exit 0
-    anon=$(awk '$1=="anon"{print $2}' "$STAT")
+    anon=$(mem_anon)
     high=$(cat "${STAT%/*}/memory.high" 2>/dev/null)
     printf '%s / %s\n' "$(numfmt --to=iec "$anon")" "$(numfmt --to=iec "$high" 2>/dev/null || echo "?")"
     ;;
@@ -1783,7 +1804,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
           [[ "$w" == "$win" ]] || continue
           shown=1; if [[ ",$flags," == *,focused,* ]]; then watched=1; fi
         done < <(tmux list-clients -F '#{window_id} #{client_flags}' 2>/dev/null || true)
-        if (( ! shown )); then tmux set -w -t "$TMUX_PANE" @unseen 1 \; set -g status-interval 1; fi
+        if (( ! shown )); then tmux set -w -t "$TMUX_PANE" @unseen 1 \; set -g status-interval 2; fi
         # Not watched, and news (not a second "done" for one turn): a desktop notification. It is sent
         # by a job of the fleet's own (--notify), so the agent's hook returns at once.
         if (( ! watched )) && [[ "$was" != "$2" && -z "${AGENTS_NO_NOTIFY:-}" ]]; then
@@ -2194,6 +2215,44 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     echo "$done_n pane(s) restarted in the $want view, each in its own chat."
     if (( busy_n )); then echo "$busy_n left alone: working now. They get it at their next start, or run this again when they are done."; fi
     ;;
+  --btab)
+    # Shift+Tab in a Gemini or Antigravity split (tmux.conf sends it here when the split has @btab, which
+    # tool_run sets). Their own cycle has no bypass; the fleet adds it as the last step, as Claude has it:
+    #   Gemini       default > accept edits > plan > YOLO > default    (Ctrl+Y switches YOLO live)
+    #   Antigravity  default > accept-edits > plan > bypass > default  (bypass is a start flag only: the
+    #                split starts again on the same chat with --dangerously-skip-permissions, or without it)
+    # Any other split gets its Shift+Tab as it is. Usage: agents --btab <pane-id>
+    pane="${2:-}"
+    [[ "$pane" =~ ^%[0-9]+$ ]] || { echo "Usage: agents --btab <pane-id>" >&2; exit 2; }
+    say() { t display-message -d 4000 -t "$pane" "$1" 2>/dev/null || true; }
+    pass() { t send-keys -t "$pane" BTab 2>/dev/null || true; exit 0; }
+    pid=$(t display -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)
+    [[ "$pid" =~ ^[0-9]+$ ]] || exit 0
+    p=""; kind=""; read -r p kind < <(pane_agent "$pid") || true
+    if [[ "$kind" != gemini && "$kind" != agy ]]; then t set -pu -t "$pane" @btab 2>/dev/null || true; pass; fi   # no longer one of them
+    if is_afc_chat "$p"; then pass; fi   # the unified view has a cycle of its own
+    # The mode line is among the last lines of the screen, under the chat
+    low=$(t capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -8 || true)
+    if [[ "$kind" == gemini ]]; then
+      # Ctrl+Y: plan (or accept edits, when plan mode is off) > YOLO, and YOLO > default
+      case "$low" in *"Shift+Tab to manual"*|*"YOLO Ctrl+Y"*) t send-keys -t "$pane" C-y ;; *) pass ;; esac
+      exit 0
+    fi
+    pf "$p"; cmdstr=$(tr '\0' ' ' < "$PROC/$p/cmdline" 2>/dev/null || true)
+    on=0; [[ " $cmdstr " == *" --dangerously-skip-permissions "* ]] && on=1
+    (( on )) || [[ "$(printf '%s\n' "$low" | tail -1)" == *" plan · "* ]] || pass
+    want="on (no asking)"; mode=bypass; (( on )) && { want=off; mode=-; }
+    if [[ "$(t show -pv -t "$pane" @busy 2>/dev/null || true)" == 1 ]]; then
+      say "Antigravity is working: bypass $want starts it again, so press Shift+Tab once it is done"; exit 0
+    fi
+    pane_spec "$p" agy "$pid" || { say "Antigravity: its folder is gone, so it cannot start again"; exit 0; }
+    # The chat: the hook writes the pane's own (@agy_chat); then the one it was started on; the folder's newest last
+    chat=$(t show -pv -t "$pane" @agy_chat 2>/dev/null || true)
+    if [[ ! "$chat" =~ ^[A-Za-z0-9_.-]+$ ]]; then arg_after "$p" --conversation; chat=$PV; fi
+    [[ "$chat" =~ ^[A-Za-z0-9_.-]+$ ]] || chat=$RS_CHAT
+    t set -p -t "$pane" @busy 0 \; respawn-pane -k -t "$pane" -c "$RS_CWD" "$HOME/.local/bin/agents --pane restore 0 agy ${RS_ACCT:--} $chat $mode 0"
+    say "Antigravity: bypass $want, same chat"
+    ;;
   --new-chat)
     # The + in a split's header, or Alt+W: a new split (where the tab's 3 x 2 grid has room) with the same agent on
     # a new chat: same tool, account, mode (plan / bypass) and folder. This split and its chat stay as
@@ -2466,9 +2525,10 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
     if grep -qs 'agents --mark' "$HOME/.gemini/settings.json"; then ok "Gemini: hooks call agents --mark"; else note "Gemini: no agents --mark hook in ~/.gemini/settings.json: its tab signals are estimated from its chat file, and it sends no notification"; fi
     note "Codex needs no hook (the watcher reads each turn's start and end from its session file); Antigravity's tab signals are estimated"
     if [[ -x "$HOME/.local/bin/afc-rules" ]]; then
-      if "$HOME/.local/bin/afc-rules" doctor 2>/dev/null | grep -q '^Mode: off'; then ok "the project rule check (afc-rules) is off"
-      elif "$HOME/.local/bin/afc-rules" doctor >/dev/null 2>&1; then ok "the project rule check (afc-rules) has its hooks in all four tools"
-      else note "the project rule check (afc-rules) lacks hooks in some tools: afc-rules doctor says which"; fi
+      # the hooks carry the Config tab's modes (Doctrine, STE...) even with the rule check off
+      rmode=$("$HOME/.local/bin/afc-rules" doctor 2>/dev/null | sed -n 's/^Mode: \([a-z]*\).*/\1/p')
+      if "$HOME/.local/bin/afc-rules" doctor >/dev/null 2>&1; then ok "afc-rules has its hooks in every tool (Copilot: the prompt hook only), so the modes reach the agents; the rule check is ${rmode:-?} (afc-rules verify: per pane)"
+      else note "afc-rules lacks hooks in some tools, so the modes and the rule check miss those agents: afc-rules doctor says which"; fi
     fi
     echo "Background services"
     if [[ -n "$MAC" ]]; then
@@ -2531,7 +2591,7 @@ if (\$d.ShowDialog() -eq 'OK') { \$d.SelectedPath }" 600) || exit 0
       done < <(tool_accounts "$tool")
     done
     if [[ -r "$SETTINGS" ]]; then
-      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap|start-agent|log-md|mem-wall|ram-wall|cpu-wall|rules|rules-recap|splash|claude-view|view)$/ { printf " %s", $1 }' "$SETTINGS")
+      odd=$(awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^(notify-wait|notify-done|notify-after|limit-warn|start-gap|start-agent|log-md|mem-wall|ram-wall|cpu-wall|rules|rules-recap|splash|claude-view|view|doctrine|mental-model|style-ste|code-do178c|search-hygiene|memory-summary)$/ { printf " %s", $1 }' "$SETTINGS")
       if [[ -n "$odd" ]]; then no "unknown names in $SETTINGS:$odd"; else ok "settings: $SETTINGS"; fi
     fi
     echo
@@ -2630,6 +2690,12 @@ if ($p -and $s.AppActivate($p.Id)) { "ok" }' 10)" == ok ]]; then exit 0; fi
     # (in the project folder) holds "$$" and spaces, which tmux and shells mangle. Use the link.
     self="$HOME/.local/bin/agents"
     if [[ -n "$MAC" ]]; then
+      if [[ -z "$(t list-clients -t "$SESSION" 2>/dev/null || true)" && "$(setting splash on)" != off \
+            && -x "$HOME/.local/bin/afc-splash" ]]; then
+        "$HOME/.local/bin/afc-splash" --seconds 5 > "${TMPDIR:-/tmp}/afc-splash.log" 2>&1 < /dev/null &
+        sp=$!
+        for _ in $(seq 1 60); do kill -0 "$sp" 2>/dev/null || break; sleep 0.1; done
+      fi
       exec open -a Terminal "$self"   # a new Terminal window that runs it
     fi
     if [[ -n "$WSL" ]]; then

@@ -72,7 +72,7 @@ fi
 if [[ "$*" == *"NO_TODO_BASH"* ]]; then
   cat <<'JSONL'
 {"type":"system","subtype":"init","session_id":"cl-sess-notodo","model":"claude-opus-5-5"}
-{"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"tool_use","id":"nt1","name":"Bash","input":{"command":"cd \"/media/jmg/MyDrive/Codebase/OMS\" && grep -n \"getPricingForSkus\" -A22 amazon.js | head -30"}}],"usage":{"input_tokens":500,"output_tokens":40}}}
+{"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"tool_use","id":"nt1","name":"Bash","input":{"command":"cd \"/tmp/demo/Codebase/OMS\" && grep -n \"getPricingForSkus\" -A22 amazon.js | head -30"}}],"usage":{"input_tokens":500,"output_tokens":40}}}
 {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"nt1","content":"RAW_GREP_LINE_123","is_error":false}]},"tool_use_result":{"stdout":"RAW_GREP_LINE_123","stderr":""}}
 {"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"tool_use","id":"nt2","name":"Edit","input":{"file_path":"/tmp/scheduler-modern.ts"}}]}}
 {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"nt2","content":"ok","is_error":false}]}}
@@ -377,6 +377,27 @@ has "agents --view unified all switches panes back to unified" "$vout2" '3 pane\
 doc=$(sb "$H/.local/bin/agents" --doctor 2>&1 || true)
 has   "agents --doctor reports unified view ok" "$doc" 'ok +View: unified \(afc-chat\)'
 hasnt "agents --doctor reports no unknown setting for view" "$doc" 'unknown names in .*settings:.*view'
+
+# 4. format_markdown colors ```diff (- red, + green) and plain You:/SITREP lines (red/green)
+md_chk=$(python3 - "$CHAT" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("afc_chat_mod", sys.argv[1])
+spec = importlib.util.spec_from_loader("afc_chat_mod", loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules["afc_chat_mod"] = mod
+loader.exec_module(mod)
+mod.TTY_OUT = True
+sample = "```diff\n- You: push sandbox\n\n+ SITREP · D:MDMP · M:OODA · P5 ASSESS · Done: ok\n```\nYou: plain\nSITREP · D:MDMP · M:OODA"
+out = mod.format_markdown(sample, 100)
+red, green = mod.C["red"], mod.C["green"]
+assert f"\033[{red}m- You: push sandbox\033[0m" in out, out
+assert f"\033[{green}m+ SITREP · D:MDMP · M:OODA · P5 ASSESS · Done: ok\033[0m" in out, out
+assert f"\033[{red}mYou: plain\033[0m" in out, out
+assert f"\033[{green}mSITREP · D:MDMP · M:OODA\033[0m" in out, out
+print("MD_SITREP_OK")
+PY
+)
+has "format_markdown paints You:/- You: red and SITREP/+ SITREP green" "$md_chk" 'MD_SITREP_OK'
 
 echo
 echo "$n_pass passed, $n_fail failed."

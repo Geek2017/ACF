@@ -76,6 +76,8 @@ reply="$kind from @$who. read: [$seen]"
 [[ -f "$L/echo-name" ]] && reply="@$who: $reply"     # an LLM that copies the thread's "@name:" format
 # Win Stake's last round asks for a vote: everyone votes for @claude (Claude itself for @codex)
 if grep -q "Vote: @name" <<< "$prompt"; then v=claude; [[ "$who" == claude ]] && v=codex; reply="$reply"$'\n'"Vote: @$v"; fi
+# BP POI accept/decline decision: explicitly ACCEPT (since parser fails closed on ambiguous text)
+if grep -q "ACCEPT" <<< "$prompt" && grep -q "DECLINE" <<< "$prompt"; then reply="ACCEPT — go ahead."; fi
 [[ -f "$L/long" ]] && reply="$reply $(printf 'wordy%.0s ' $(seq 1 60))end"
 # an agent whose project's instructions add a greeting and a footer to every reply
 [[ -f "$L/footer" ]] && reply="My Lord. $reply"$'\n\n'"You: whatever the chair said"$'\n\n'"SITREP · ARMY/MDMP · P1 · Done: x · Open: y · Next: z"
@@ -388,11 +390,14 @@ is "... the check was one short question to it" "$(( probes_after - probes_befor
 has "a seat that answers the check joins as before" "$(run "/agent more codex:gpt-6-sol" "/agent del codex2")" 'joins the table'
 # ---- formats: Open Forum (the modes), British Parliamentary, Win Stake --------------------------------------
 : > "$T/log/argv"
+rm -f "$T/log"/prompt.*
 out=$(run "/format bp" "This house would ban homework")
 has "/format bp: the BP debate, and the chat says how it runs" "$out" 'Format: BP debate'
 has "... the benches are dealt in BP order, from the first seat" "$out" 'BP debate · Opening Government: @[a-z0-9-]+ \(PM\)'
-bp=$(for f in $(ls -tr "$T"/log/prompt.* | tail -8); do grep -oE 'You are the (Prime Minister|Leader of the Opposition|Deputy Prime Minister|Deputy Leader of the Opposition|Member of Government|Member of Opposition|Government Whip|Opposition Whip) \([A-Z]+\)' "$f"; done | grep -oE '\([A-Z]+\)' | tr -d '()' | tr '\n' ' ')
+bp=$(for f in $(ls -tr "$T"/log/prompt.*); do grep -oE 'You are the (Prime Minister|Leader of the Opposition|Deputy Prime Minister|Deputy Leader of the Opposition|Member of Government|Member of Opposition|Government Whip|Opposition Whip) \([A-Z]+\)' "$f"; done | grep -oE '\([A-Z]+\)' | tr -d '()' | tr '\n' ' ')
 has "... each speaker is told its role, in BP speaking order" "$bp" '^PM LO( DPM)?'
+has "... opposing-side POIs run during the BP debate" "$out" '✋ POI'
+has "... and speakers rebut the POIs" "$out" '↩ REBUTTAL'
 out=$(run "/format stake" "Which is better, tea or coffee?")
 has "/format stake: Win Stake" "$out" 'Format: Win Stake'
 has "... a council opens showing its format (BP, kept from the last run)" "$out" 'BP debate · mode'
@@ -533,12 +538,12 @@ CL=$(tm list-clients -F '#{client_name}' | head -1)
 has "Alt+K is bound to the council" "$(tm list-keys -T root)" 'M-k .*afc-council --open'
 if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCIL")" ]]; then
   tm send-keys -K -c "$CL" M-k; sleep 3
-  # Alt+K: the council about this project opens as a split in the project's own tab (operator, 2026-11-24)
-  is "Alt+K opens the council as a split in the project's tab, not a tab of its own" \
-    "$(tm list-panes -t agents:proj -F '#{@council_chat}' | grep -c '^1$') $(tm list-windows -F '#{window_name}' | grep -c '^council$')" "1 0"
+  # Alt+K: opens a full dedicated Council tab for this project (identical functionality to Alt+Shift+K)
+  is "Alt+K opens a dedicated Council tab for this project (leaving the project tab untouched)" \
+    "$(tm list-panes -t agents:proj -F '#{@council_chat}' | grep -c '^1$') $(tm list-windows -F '#{window_name}' | grep -c '^council$')" "0 1"
   is "... the project's tab keeps its name" "$(tm display -p -t agents:proj '#{window_name}' 2>/dev/null)" proj
-  tm send-keys -K -c "$CL" M-k; sleep 1.5
-  is "... Alt+K again brings that council to the front, not a second one" "$(tm list-panes -t agents:proj -F '#{@council_chat}' | grep -c '^1$')" 1
+  tm select-window -t agents:proj; tm send-keys -K -c "$CL" M-k; sleep 1.5
+  is "... Alt+K again focuses that council tab, not a second one" "$(tm list-windows -F '#{window_name}' | grep -c '^council$')" 1
   out=$(run "/format bp" "@claude quick check" "/format forum")
   has "direct @claude tag in BP format answers directly instead of refusing" "$out" 'ANSWER from @claude'
   run "/bench codex" > /dev/null
@@ -546,16 +551,16 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
   has "benched seat probe failure rolls back its model in settings.json" "$out" 'was not added: its plan or rate limit is spent'
   hasnt "... broken quota-test model was not left persisted" "$(cat "$T/proj/logs/council/settings.json")" 'quota-test'
   run "/seat codex" > /dev/null
-  sp=$(tm list-panes -t agents:proj -F '#{pane_id} #{@council_chat}' | awk '$2 == 1 {print $1}')
-  # Alt+O inside a shared-tab council split transitions cleanly into BOX mode (no literal #!#%# leak!)
-  tm select-pane -t "$sp"; tm send-keys -K -c "$CL" M-o; sleep 1.5
+  sp=$(tm list-panes -t ':council' -F '#{pane_id} #{@council_chat}' | awk '$2 == 1 {print $1}')
+  # Alt+O inside the Alt+K council tab toggles cleanly into One View with boxed chat (no #!#%# leak)
+  tm select-window -t ':council'; tm select-pane -t "$sp"; tm send-keys -K -c "$CL" M-o; sleep 1.5
   sbox=$(tm capture-pane -p -t "$sp")
-  hasnt "Alt+O in shared-tab council split switches cleanly into boxed chat (no #!#%# leak)" "$sbox" '#!#%#'
+  hasnt "Alt+O in Alt+K council switches cleanly without #!#%# leak" "$sbox" '#!#%#'
   has "... drawing the top chat box rule cleanly" "$(sed -n 1p <<< "$sbox")" '^─+$'
   tm send-keys -t "$sp" '/view grid' Enter; sleep 0.8
   tm send-keys -t "$sp" '/quit' Enter
-  for _ in $(seq 1 30); do [[ "$(tm display -p -t agents:proj '#{window_panes}')" == 1 ]] && break; sleep 0.3; done
-  is "... /quit closes that split, and the project's tab stays as it was" "$(tm display -p -t agents:proj '#{window_panes}')" 1
+  for _ in $(seq 1 30); do [[ "$(tm list-windows -F '#{window_name}' | grep -c '^council$')" == 0 ]] && break; sleep 0.3; done
+  is "... /quit closes the council tab, and the project's tab stays as it was" "$(tm display -p -t agents:proj '#{window_panes}')" 1
   is "... and clears window @council option on the project tab" "$(tm show-options -wqv -t agents:proj @council)" ""
   # The grid: a council in a tab of its own (as Alt+Shift+K opens one), here on the project to test it
   tm new-window -t agents: -n council -c "$T/proj" "$HOME/.local/bin/afc-council --from-pid $(tm display -p -t agents:proj '#{pane_pid}')"; sleep 3
@@ -676,7 +681,7 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
   has "... it shows who is thinking" "$(tm capture-pane -p -t "$vp" | grep -v '^$' | tail -1)" '@codex thinking  [0-9]+s$'
   sleep 6; rm -f "$T/slow.codex"
   # Alt+Q (or ✕) on the one view: a menu of who to take off the table; 3 is @gemini (seat order)
-  onehdr() { tm show-options -pqv -t "$(tm list-panes -t "$cw" -F '#{pane_id} #{@council_member}' | awk '$2 == ":all" {print $1}')" pane-border-format; }
+  onehdr() { local p; p=$(tm list-panes -t "$cw" -F '#{pane_id} #{@council_member}' | awk '$2 == ":all" {print $1}'); [[ -n "$p" ]] && tm show-options -pqv -t "$p" pane-border-format; }
   tm select-pane -t "$vp"; tm send-keys -K -c "$CL" M-q; sleep 0.8; tm send-keys -K -c "$CL" 3
   for _ in $(seq 1 40); do h1=$(onehdr); [[ -n "$h1" && "$h1" != *@gemini* ]] && break; sleep 0.25; done
   hasnt "Alt+Q on the one view: a menu of who to take off; 3 takes @gemini off the table" "$h1" '@gemini'
@@ -741,7 +746,8 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
   # menu command while user has a half-typed draft in the chat box: command runs and draft comes back
   tm send-keys -t "$chair" -l "half typed draft"; sleep 0.4
   tm select-pane -t "$(pane_of codex)"; tm send-keys -K -c "$CL" M-m; sleep 0.8; tm send-keys -K -c "$CL" h; hdr_has codex 'effort high'
-  tm select-pane -t "$chair"; sleep 0.6
+  tm select-pane -t "$chair"
+  for _ in $(seq 1 20); do grep -q 'half typed draft' <<< "$(tm capture-pane -p -t "$chair")" && break; sleep 0.2; done
   has "menu action while typing preserves the user's draft in the chat box" "$(tm capture-pane -p -t "$chair")" 'half typed draft'
   tm send-keys -t "$chair" C-u; sleep 0.3
   # multi-line paste via tmux paste-buffer -p: collapses to a pill (no premature submit, rules stay intact),
@@ -773,44 +779,50 @@ if [[ "$(readlink -f "$HOME/.local/bin/afc-council")" == "$(readlink -f "$COUNCI
   tm send-keys -t "$chair" "/quit" Enter; sleep 2.5
   is "/quit closes the whole council tab, grid and all" "$(tm list-windows -F '#{window_name}' | grep -c '^council$')" 0
 
-  # ---- Alt+K inside a shared project tab (real 140x43 split stress test) -------------------------------------
+  # ---- Alt+K full project council tab (identical functionality to Alt+Shift+K, scoped to project) --------
   tm resize-window -t proj -x 140 -y 43 2>/dev/null || true
   tm set-option -w -t proj @project proj
   code_pane=$(tm display -p -t proj '#{pane_id}')
   code_pid=$(tm display -p -t proj '#{pane_pid}')
+  code_w=$(tm display -p -t proj '#{pane_width}')
   tm run-shell -b "$HOME/.local/bin/afc-council --open agents '$code_pid'"
-  for _ in $(seq 1 40); do [[ "$(tm display -p -t proj '#{window_panes}')" == 2 ]] && break; sleep 0.25; done
-  is "Alt+K in a project tab opens council as a split in that same tab" "$(tm display -p -t proj '#{window_panes}')" 2
-  sp_pane=$(tm list-panes -t proj -F '#{pane_id} #{@council_chat}' | awk '$2 == "1" {print $1; exit}')
   for _ in $(seq 1 40); do
-    sp_pane=$(tm list-panes -t proj -F '#{pane_id} #{@council_chat}' | awk '$2 == "1" {print $1; exit}')
-    [[ -n "$sp_pane" ]] && break; sleep 0.25
+    cw2=$(tm list-windows -F '#{window_id} #{@council}' | awk '$2 == "1" {print $1; exit}')
+    [[ -n "$cw2" && "$(tm display -p -t "$cw2" '#{window_panes}' 2>/dev/null)" == 4 ]] && break
+    sleep 0.25
   done
-  has "... narrow split header shows compact mode, rounds, and perm (not clipped)" "$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)" 'mode: (ORDER|ROAST).* \([^)]+\).*perm: PLAN'
-  code_w=$(tm display -p -t "$code_pane" '#{pane_width}')
-  # Shift+Tab in the coding pane must NOT hijack or flip the council split's mode
-  before_mode=$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)
-  tm select-pane -t "$code_pane"; tm send-keys -K -c "$CL" BTab; sleep 0.6
-  is "Shift+Tab in a coding pane sharing a tab with council does not flip council mode" "$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)" "$before_mode"
-  # Shift+Tab inside the council split flips mode cleanly with ZERO #!# marker garbage left on screen
-  tm select-pane -t "$sp_pane"; tm send-keys -K -c "$CL" BTab
-  for _ in $(seq 1 20); do [[ "$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)" != "$before_mode" ]] && break; sleep 0.25; done
-  has "Shift+Tab in the council split switches mode" "$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)" 'mode: (ORDER|ROAST)'
-  hasnt "... leaving no raw #!# marker garbage on screen" "$(tm capture-pane -p -t "$sp_pane")" '#!#'
-  # Alt+O in the project split toggles one view inside the right column without touching the coding pane's width
-  tm send-keys -K -c "$CL" M-o
-  for _ in $(seq 1 40); do [[ "$(tm display -p -t proj '#{window_panes}')" == 3 ]] && break; sleep 0.25; done
-  is "Alt+O in a project split opens bubble one view inside the right column" "$(tm display -p -t proj '#{window_panes}')" 3
+  is "Alt+K in a project tab opens a dedicated full Council tab (leaving coding tab untouched)" "$(tm display -p -t proj '#{window_panes}')" 1
   is "... leaving the coding pane width completely untouched" "$(tm display -p -t "$code_pane" '#{pane_width}')" "$code_w"
+  is "... with full 4-pane grid identical to Alt+Shift+K" "$(tm display -p -t "$cw2" '#{window_panes}')" 4
+  sp_pane=$(tm show-options -wqv -t "$cw2" @council_chair 2>/dev/null)
+  # Second Alt+K from proj focuses the existing project council tab instead of spawning a duplicate
+  tm select-window -t proj
+  tm run-shell -b "$HOME/.local/bin/afc-council --open agents '$code_pid'"
+  sleep 0.6
+  is "Alt+K again focuses the existing project council tab (no duplicate)" "$(tm list-windows -F '#{@council}' | grep -c '^1$')" 1
+  # Shift+Tab inside the project council flips mode cleanly with ZERO #!# marker garbage left on screen
+  before_mode=$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)
+  tm select-window -t "$cw2"; tm select-pane -t "$sp_pane"; tm send-keys -K -c "$CL" BTab
+  for _ in $(seq 1 20); do [[ "$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)" != "$before_mode" ]] && break; sleep 0.25; done
+  has "Shift+Tab in Alt+K council switches mode" "$(tm show-options -pqv -t "$sp_pane" pane-border-format 2>/dev/null)" 'mode: (ORDER|ROAST)'
+  hasnt "... leaving no raw #!# marker garbage on screen" "$(tm capture-pane -p -t "$sp_pane")" '#!#'
+  # Both Alt+O and Alt+0 toggle Grid View <-> One View cleanly on Alt+K
   tm send-keys -K -c "$CL" M-o
-  for _ in $(seq 1 40); do [[ "$(tm display -p -t proj '#{window_panes}')" == 2 ]] && break; sleep 0.25; done
-  is "Alt+O again collapses cleanly back to the single-pane split" "$(tm display -p -t proj '#{window_panes}')" 2
-  # ✕ (agents --close) on the council split closes ONLY the council, keeps the coding pane, and clears @council
-  tm run-shell "$HOME/.local/bin/agents --close $sp_pane"
-  for _ in $(seq 1 40); do [[ "$(tm display -p -t proj '#{window_panes}')" == 1 ]] && break; sleep 0.25; done
-  is "closing the council split leaves the project coding pane intact" "$(tm display -p -t proj '#{window_panes}')" 1
-  is "... and clears stale @council from the project tab" "$(tm show-options -wqv -t proj @council 2>/dev/null)" ""
-  run "/mode order" > /dev/null
+  for _ in $(seq 1 40); do [[ "$(tm display -p -t "$cw2" '#{window_panes}')" == 2 ]] && break; sleep 0.25; done
+  is "Alt+O in Alt+K council toggles cleanly from Grid View to One View" "$(tm display -p -t "$cw2" '#{window_panes}')" 2
+  tm send-keys -K -c "$CL" M-0
+  for _ in $(seq 1 40); do [[ "$(tm display -p -t "$cw2" '#{window_panes}')" == 4 ]] && break; sleep 0.25; done
+  is "Alt+0 in Alt+K council toggles cleanly back from One View to Grid View" "$(tm display -p -t "$cw2" '#{window_panes}')" 4
+  # Meta+Alt+R (--restart-wipe) resets conversation & wipes memory while keeping all 4 panes/members
+  tm run-shell "$HOME/.local/bin/afc-council --restart-wipe '$cw2' '$sp_pane'"
+  sleep 1.2
+  is "Meta+Alt+R (--restart-wipe) keeps all council members & panes intact" "$(tm display -p -t "$cw2" '#{window_panes}')" 4
+  # Meta+Alt+Q (--end-all) ends the council and clears members in one shot without kicking 1-by-1
+  tm run-shell "$HOME/.local/bin/afc-council --end-all '$cw2' '$sp_pane'"
+  for _ in $(seq 1 40); do [[ "$(tm list-windows -F '#{@council}' | grep -c '^1$')" == 0 ]] && break; sleep 0.25; done
+  is "Meta+Alt+Q (--end-all) closes the council tab immediately" "$(tm list-windows -F '#{@council}' | grep -c '^1$')" 0
+  # Re-seat base seats in proj after --end-all so subsequent CLI tests have the original 3 seats
+  run "/seat claude" "/seat codex" "/seat gemini" "/mode order" > /dev/null
 else
   echo "  skip  Alt+K end to end (~/.local/bin/afc-council is not this folder's bin/afc-council)"
 fi
@@ -1067,11 +1079,20 @@ try:
         mt_f = g["Meeting"](T, s_members, s_conf)
         mt_f.rounds = 1
         mt_f.save = lambda: None
-        def fake_speak(m, task, phase, rnd=None, _calls=calls, _mt=mt_f):
+        def fake_speak(m, task, phase, prompt=None, rnd=None, bp_role=None, poi_by=None, bp_side=None, _calls=calls, _mt=mt_f):
             _calls.append((m.handle, phase))
             txt = "Vote: @codex" if phase == "stake" and m.handle == "claude" else (
                   "Vote: @claude" if phase == "stake" else "Verdict: done")
-            _mt.thread.append({"who": m.handle, "as": m.shown(), "name": m.name, "text": txt, "phase": phase})
+            ev = {"who": m.handle, "as": m.shown(), "name": m.name, "text": txt, "phase": phase}
+            if rnd:
+                ev["round"] = rnd
+            if bp_role:
+                ev["bp_role"] = bp_role
+            if poi_by:
+                ev["poi_by"] = poi_by
+            if bp_side:
+                ev["bp_side"] = bp_side
+            _mt.thread.append(ev)
         mt_f.speak = fake_speak
         mt_f.thread.append({"who": "chair", "name": "Chair", "text": "Decide this motion", "phase": "chair"})
         with _cl.redirect_stdout(_io.StringIO()):
@@ -1179,6 +1200,583 @@ try:
         assert "@council_perm_judge" in open(_tc_path).read(), "tmux.conf missing @council_perm_judge guard"
 finally:
     os.environ.pop("AFC_COUNCIL_FORCE_SUPRA", None)
+
+# 24. BP find() command safety: /model @<slug>, /remove @<slug>, /bench @<slug>, /model @supra-omnia + /remove all reset
+bp_c3 = {"agents": [], "format": "bp", "bp_cast": {"PM": "claude:claude-opus-5-5", "LO": "gemini:gemini-4-neon"}}
+for xm in (m1, m2, m3):
+    xm.seated = False
+mt_b3 = g["Meeting"](T, [m1, m2, m3], bp_c3)
+g["TABLE"][0] = mt_b3
+with _cl.redirect_stdout(_io.StringIO()):
+    g["command_line"]("/model @neon gemini-4-argon", mt_b3, bp_c3, fake_accts)
+assert bp_c3["bp_cast"]["LO"] == "gemini:gemini-4-argon", f"/model @neon did not update bp_cast: {bp_c3}"
+assert "gemini" not in (bp_c3.get("llm") or {}), f"/model @neon corrupted base llm conf: {bp_c3}"
+with _cl.redirect_stdout(_io.StringIO()):
+    g["command_line"]("/remove @argon", mt_b3, bp_c3, fake_accts)
+assert "LO" not in (bp_c3.get("bp_cast") or {}), f"/remove @argon did not clear LO from bp_cast: {bp_c3}"
+assert "bp_lo" not in (bp_c3.get("seats") or {}), f"/remove @argon wrote junk seat bp_lo: {bp_c3}"
+with _cl.redirect_stdout(_io.StringIO()):
+    g["command_line"]("/bench @opus", mt_b3, bp_c3, fake_accts)
+assert "PM" not in (bp_c3.get("bp_cast") or {}) and "bp_pm" not in (bp_c3.get("seats") or {}), f"/bench @opus broke: {bp_c3}"
+os.environ["AFC_COUNCIL_FORCE_SUPRA"] = "1"
+try:
+    s_c3 = {"agents": [], "seats": {"claude": False, "codex": False, "gemini": False}, "format": "bp", "bp_cast": {"PM": "claude:claude-opus-5-5"}}
+    s_m3 = g["build_members"](s_c3, fake_accts)
+    sup3 = next(x for x in s_m3 if x.handle == "supra-omnia")
+    mt_s3 = g["Meeting"](T, s_m3, s_c3)
+    g["TABLE"][0] = mt_s3
+    with _cl.redirect_stdout(_io.StringIO()):
+        g["command_line"]("/bp JUDGE codex:gpt-6-astra", mt_s3, s_c3, fake_accts)
+    assert sup3.tool == "codex" and s_c3.get("judge") == "codex:gpt-6-astra", f"judge override failed: {sup3.tool} {s_c3}"
+    with _cl.redirect_stdout(_io.StringIO()):
+        g["command_line"]("/model @supra-omnia gpt-6.1-sol", mt_s3, s_c3, fake_accts)
+    assert s_c3.get("judge") == "codex:gpt-6.1-sol", f"/model @supra-omnia left stale conf['judge']: {s_c3}"
+    with _cl.redirect_stdout(_io.StringIO()):
+        g["command_line"]("/remove all", mt_s3, s_c3, fake_accts)
+    assert not s_c3.get("judge") and sup3.tool == "claude", f"/remove all did not reset supra tool back to baseline: {sup3.tool} {s_c3}"
+finally:
+    os.environ.pop("AFC_COUNCIL_FORCE_SUPRA", None)
+
+# 25. BP turn validation & resume-without-reset + Rebuttals & POIs (opposing side only) + Gov LEFT / Opp RIGHT
+os.environ["AFC_COUNCIL_FORCE_SUPRA"] = "1"
+try:
+    tp_conf = {"agents": [], "seats": {t: False for t in ("claude", "codex", "gemini", "agy", "copilot", "opencode")},
+               "format": "bp", "bp_cast": {
+                   "PM": "claude:claude-opus-5-5", "LO": "gemini:gemini-4-neon",
+                   "DPM": "codex:gpt-6-astra", "DLO": "claude:claude-sonnet-5-5"}}
+    tp_accts = {"claude": ("c_acct", True, T), "codex": ("x_acct", True, T), "gemini": ("g_acct", True, T)}
+    tp_members = g["build_members"](tp_conf, tp_accts)
+    mt_tp = g["Meeting"](T, tp_members, tp_conf)
+    mt_tp.save = lambda: None
+    g["TABLE"][0] = mt_tp
+    # Verify opposing-side POI challenger selection (Gov never POIs Gov, Opp never POIs Opp)
+    cast4 = mt_tp.bp_cast()
+    assert [r[0] for r, _ in g["bp_poi_challengers"](cast4, "PM", 2)] == ["LO", "DLO"]
+    assert [r[0] for r, _ in g["bp_poi_challengers"](cast4, "LO", 2)] == ["DPM", "PM"]
+    assert [r[0] for r, _ in g["bp_poi_challengers"](cast4, "DPM", 1)] == ["DLO"]
+    assert [r[0] for r, _ in g["bp_poi_challengers"](cast4, "DLO", 1)] == ["PM"]
+    # Verify Gov LEFT / Opp RIGHT alignment helper & bubble side badges
+    assert g["_event_bp_side"]({"phase": "bp", "bp_role": "PM", "bp_side": "gov"}) == "gov"
+    assert g["_event_bp_side"]({"phase": "bp", "bp_role": "LO", "bp_side": "opp"}) == "opp"
+    assert g["_event_bp_side"]({"phase": "poi", "bp_role": "PM", "poi_by": "LO"}) == "opp"
+    assert g["_event_bp_side"]({"phase": "rebuttal", "bp_role": "PM", "poi_by": "LO"}) == "gov"
+    assert "#1 PM · OG" in g["mark"]({"phase": "bp", "bp_role": "PM", "bp_side": "gov"})
+    assert "#2 LO · OO" in g["mark"]({"phase": "bp", "bp_role": "LO", "bp_side": "opp"})
+    assert "POI RISE" in g["mark"]({"phase": "poi_bid", "bp_role": "PM", "poi_by": "LO", "bp_side": "opp"})
+    assert "ACCEPT" in g["mark"]({"phase": "poi_decision", "bp_role": "PM", "poi_by": "LO", "bp_side": "gov", "poi_accepted": True})
+    assert "DECLINE" in g["mark"]({"phase": "poi_decision", "bp_role": "PM", "poi_by": "LO", "bp_side": "gov", "poi_accepted": False})
+    assert "POI" in g["mark"]({"phase": "poi", "bp_role": "PM", "poi_by": "LO", "bp_side": "opp"})
+    assert "REBUTTAL" in g["mark"]({"phase": "rebuttal", "bp_role": "PM", "poi_by": "LO", "bp_side": "gov"})
+    # Verify bubble alignment in TTY mode: Opp (right=True) is right-padded, Gov (right=False) starts flush left
+    orig_tty = g["TTY"]
+    try:
+        g["TTY"] = True
+        b_gov = g["bubble"]("@opus 🎙 GOV", "[PM] gov case", "claude", right=False)
+        b_opp = g["bubble"]("@neon 🎙 OPP", "[LO] opp case", "gemini", right=True)
+        assert not b_gov.startswith(" "), f"Gov should be left-aligned: {b_gov!r}"
+        assert b_opp.startswith(" "), f"Opp should be right-aligned: {b_opp!r}"
+    finally:
+        g["TTY"] = orig_tty
+    # Trace exact authentic BP POI protocol:
+    #   speech -> poi_bid (rise only) -> poi_decision (ACCEPT or DECLINE) -> (ONLY if accepted) poi -> rebuttal
+    spoken_log = []
+    stop_on = [None]
+    decline_for = {"DPM"}   # DPM declines DLO's POI -> DLO must NOT state POI and no rebuttal runs!
+    pass_bid_for = {"DLO"}  # PM passes (does not rise) during DLO's speech -> no decision/POI/rebuttal!
+    orig_speak = g["Meeting"].speak
+    def fake_bp_speak(self, m, task, phase, prompt=None, rnd=None, bp_role=None, poi_by=None, bp_side=None):
+        key = (phase, bp_role or m.handle, poi_by or "", bp_side or "")
+        spoken_log.append(key)
+        is_pass = (phase == "poi_bid" and bp_role in pass_bid_for)
+        poi_acc = None
+        if phase == "poi_decision":
+            poi_acc = bp_role not in decline_for
+            txt = f"[{bp_role} · {'ACCEPT' if poi_acc else 'DECLINE'} {poi_by}] {'Yes, go ahead.' if poi_acc else 'No thank you, sit down.'}"
+        elif is_pass:
+            txt = f"[POI Rise {poi_by}→{bp_role}] PASS"
+        else:
+            txt = f"[{bp_role or 'JUDGE'}] {phase} by {m.handle}"
+        self.add(m, txt, phase, bp_role=bp_role, poi_by=poi_by, bp_side=bp_side,
+                 poi_pass=is_pass, poi_accepted=poi_acc)
+        if stop_on[0] and (phase, bp_role or m.handle) == stop_on[0]:
+            g["STOP"].set()
+    g["Meeting"].speak = fake_bp_speak
+    try:
+        mt_tp.thread.append({"who": "chair", "name": "Chair", "text": "Motion A", "phase": "chair"})
+        # 1) Stop right after LO rises for POI on PM (before PM accepts/declines!)
+        g["STOP"].clear()
+        stop_on[0] = ("poi_bid", "PM")
+        buf1 = _io.StringIO()
+        with _cl.redirect_stdout(buf1):
+            mt_tp.round(mt_tp.seated(), fresh=True)
+        assert spoken_log == [
+            ("bp", "PM", "", "gov"),
+            ("poi_bid", "PM", "LO", "opp"),
+        ], f"phase1 wrong: {spoken_log}"
+        assert "accept/decline LO's POI" in buf1.getvalue(), f"missing paused decision note: {buf1.getvalue()}"
+        # 2) Directed side question while paused does NOT reset BP turn progress
+        mt_tp.thread.append({"who": "chair", "name": "Chair", "text": "@opus clarify?", "phase": "chair", "to": ["bp_pm"]})
+        # 3) Resume -> PM ACCEPTS LO's POI, stop right after acceptance (before LO states POI!)
+        spoken_log.clear()
+        g["STOP"].clear()
+        stop_on[0] = ("poi_decision", "PM")
+        buf2 = _io.StringIO()
+        with _cl.redirect_stdout(buf2):
+            mt_tp.round(mt_tp.seated(), fresh=False)
+        assert spoken_log == [
+            ("poi_decision", "PM", "LO", "gov"),
+        ], f"resume1 wrong: {spoken_log}"
+        assert "POI LO→PM" in buf2.getvalue(), f"missing paused POI delivery note: {buf2.getvalue()}"
+        # 4) Resume -> LO delivers POI, PM rebuts, LO speaks + accepts DPM POI + rebuts,
+        #    DPM speaks + DECLINES DLO POI (DLO never states POI!), DLO speaks + PM PASSes -> fallback to DPM who also PASSes -> stop before Judge
+        spoken_log.clear()
+        g["STOP"].clear()
+        stop_on[0] = None
+        orig_fake = fake_bp_speak
+        def fake_stop_dlo_dpm(self, m, task, phase, prompt=None, rnd=None, bp_role=None, poi_by=None, bp_side=None):
+            orig_fake(self, m, task, phase, prompt=prompt, rnd=rnd, bp_role=bp_role, poi_by=poi_by, bp_side=bp_side)
+            if (phase, bp_role, poi_by) == ("poi_bid", "DLO", "DPM"):
+                g["STOP"].set()
+        g["Meeting"].speak = fake_stop_dlo_dpm
+        buf3 = _io.StringIO()
+        with _cl.redirect_stdout(buf3):
+            mt_tp.round(mt_tp.seated(), fresh=False)
+        g["Meeting"].speak = orig_fake
+        assert spoken_log == [
+            ("poi", "PM", "LO", "opp"),
+            ("rebuttal", "PM", "LO", "gov"),
+            ("bp", "LO", "", "opp"),
+            ("poi_bid", "LO", "DPM", "gov"),
+            ("poi_decision", "LO", "DPM", "opp"),
+            ("poi", "LO", "DPM", "gov"),
+            ("rebuttal", "LO", "DPM", "opp"),
+            ("bp", "DPM", "", "gov"),
+            ("poi_bid", "DPM", "DLO", "opp"),
+            ("poi_decision", "DPM", "DLO", "gov"),   # DECLINED -> NO ('poi', 'DPM', 'DLO') and NO rebuttal!
+            ("bp", "DLO", "", "opp"),
+            ("poi_bid", "DLO", "PM", "gov"),         # PM PASS -> opposing bench fallback lets DPM rise!
+            ("poi_bid", "DLO", "DPM", "gov"),        # DPM also PASS -> no decision, no POI, no rebuttal!
+        ], f"resume2 wrong: {spoken_log}"
+        assert "Next turn: Judge" in buf3.getvalue(), f"missing paused-before-judge note: {buf3.getvalue()}"
+        # 5) Resume again -> ZERO speakers/POIs re-run, straight to Judge verdict
+        spoken_log.clear()
+        g["STOP"].clear()
+        stop_on[0] = None
+        with _cl.redirect_stdout(_io.StringIO()):
+            mt_tp.round(mt_tp.seated(), fresh=False)
+        assert spoken_log == [("verdict", "supra-omnia", "", "")], f"judge-only resume wrong: {spoken_log}"
+        # 6) Resume again after complete -> does NOT re-run anything
+        spoken_log.clear()
+        buf4 = _io.StringIO()
+        with _cl.redirect_stdout(buf4):
+            mt_tp.round(mt_tp.seated(), fresh=False)
+        assert spoken_log == [] and "already complete" in buf4.getvalue(), f"completed BP re-ran: {spoken_log} {buf4.getvalue()}"
+        # 7) /bp poi off disables POIs for a new motion -> runs pure speeches + verdict from PM
+        with _cl.redirect_stdout(_io.StringIO()):
+            g["command_line"]("/bp poi off", mt_tp, tp_conf, tp_accts)
+        assert mt_tp.bp_poi_limit() == 0
+        mt_tp.thread.append({"who": "chair", "name": "Chair", "text": "Motion B", "phase": "chair"})
+        spoken_log.clear()
+        with _cl.redirect_stdout(_io.StringIO()):
+            mt_tp.round(mt_tp.seated(), fresh=True)
+        assert spoken_log == [
+            ("bp", "PM", "", "gov"),
+            ("bp", "LO", "", "opp"),
+            ("bp", "DPM", "", "gov"),
+            ("bp", "DLO", "", "opp"),
+            ("verdict", "supra-omnia", "", ""),
+        ], f"new motion with poi off wrong: {spoken_log}"
+    finally:
+        g["Meeting"].speak = orig_speak
+        g["STOP"].clear()
+finally:
+    os.environ.pop("AFC_COUNCIL_FORCE_SUPRA", None)
+
+# 26. Format switch (BP <-> Open Forum <-> Win Stake & rounds) keeps council count/roster unless kicked,
+# plus /disband (Meta+Alt+Q) and wipe_agent_memories (Meta+Alt+R)
+os.environ["AFC_COUNCIL_FORCE_SUPRA"] = "1"
+try:
+    sw_accts = {"claude": ("main", True, None), "codex": ("main", True, None), "gemini": ("main", True, None)}
+    sw_conf = {
+        "agents": [{"name": "Strategist", "tool": "claude", "persona": "Sharp strategist"}],
+        "seats": {"claude": False, "codex": False, "gemini": False},
+        "format": "bp",
+        "bp_cast": {
+            "PM": "claude:claude-opus-5-5", "LO": "gemini:gemini-4-neon",
+            "DPM": "codex:gpt-6-astra", "DLO": "claude:claude-sonnet-5-5",
+        },
+    }
+    sw_dir = tempfile.mkdtemp(dir=T)
+    sw_members = g["build_members"](sw_conf, sw_accts)
+    sw_mt = g["Meeting"](sw_dir, sw_members, sw_conf)
+    g["TABLE"][0] = sw_mt
+    # 4 BP slots + Strategist (fills MG) + Supra Omnia = 6 members
+    bp_handles = [x.handle for x in sw_mt.active_members()]
+    assert len(bp_handles) == 6 and bp_handles[-1] == "supra-omnia", f"BP initial roster wrong: {bp_handles}"
+    # Switching to Open Forum and Win Stake and changing rounds keeps the EXACT same count & handles!
+    for cmd_s in ("/format forum", "/rounds 2", "/format stake", "/rounds 4", "/format bp"):
+        with _cl.redirect_stdout(_io.StringIO()):
+            g["command_line"](cmd_s, sw_mt, sw_conf, sw_accts)
+        cur_handles = [x.handle for x in sw_mt.active_members()]
+        assert cur_handles == bp_handles, f"count/roster changed after {cmd_s}: {cur_handles} vs {bp_handles}"
+    # In Open Forum, find() still resolves bp_* members and round() hears all of them + supra verdict
+    with _cl.redirect_stdout(_io.StringIO()):
+        g["command_line"]("/format forum", sw_mt, sw_conf, sw_accts)
+    assert sw_mt.find("neon") is not None, "find() failed to resolve bp_lo in forum format"
+    # Kicking one BP member reduces count by 1 across ALL formats
+    with _cl.redirect_stdout(_io.StringIO()):
+        g["command_line"]("/kick @neon", sw_mt, sw_conf, sw_accts)
+    after_kick = [x.handle for x in sw_mt.active_members()]
+    assert len(after_kick) == 5 and "bp_lo" not in after_kick, f"kick did not reduce count: {after_kick}"
+    with _cl.redirect_stdout(_io.StringIO()):
+        g["command_line"]("/format bp", sw_mt, sw_conf, sw_accts)
+    assert [x.handle for x in sw_mt.active_members()] == after_kick, "count drifted after kick + format switch"
+    # wipe_agent_memories clears MEMORY.md while keeping CHARACTER.md
+    d_strat = g["ensure_agent"](sw_dir, "Strategist", "Sharp strategist")
+    g["remember"](d_strat, ["Remembered secret fact"])
+    assert "Remembered secret fact" in g["agent_text"](d_strat, "MEMORY.md")
+    wiped = g["wipe_agent_memories"](sw_dir, sw_mt.members)
+    assert wiped >= 1, f"expected wiped >= 1, got {wiped}"
+    assert g["agent_text"](d_strat, "MEMORY.md") == "", "MEMORY.md was not wiped"
+    assert "Sharp strategist" in g["agent_text"](d_strat, "CHARACTER.md"), "CHARACTER.md must be preserved"
+    # /disband (Meta+Alt+Q) removes/deletes all removable members in one shot and returns False to quit
+    with _cl.redirect_stdout(_io.StringIO()):
+        keep_go = g["command_line"]("/disband", sw_mt, sw_conf, sw_accts)
+    assert keep_go is False, "/disband must return False to end the council"
+    assert not sw_conf.get("bp_cast"), f"/disband left bp_cast: {sw_conf}"
+    assert not any(a.get("name") == "Strategist" for a in sw_conf.get("agents") or []), "/disband did not delete made agent"
+finally:
+    os.environ.pop("AFC_COUNCIL_FORCE_SUPRA", None)
+
+# 27. Audit bug-fix regressions: BP chamber columns for custom bp_* slots, LOCAL bp_poi,
+#     no phantom bp_judge when supra is seated, POI accept/decline & PASS parsing,
+#     motion preservation after directed side question, failed-step resume order, _bp_paused_noted, llm-usage
+assert "bp_poi" in g["LOCAL"], f"bp_poi must be in LOCAL: {g['LOCAL']}"
+assert g["parse_poi_accepted"]("[PM · ACCEPT LO] I won't decline a POI, go ahead.") is True
+assert g["parse_poi_accepted"]("[PM · DECLINE LO] No thank you, sit down.") is False
+assert g["parse_poi_accepted"]("No, moving on.") is False
+assert g["parse_poi_accepted"]("Not right now.") is False
+assert g["parse_poi_accepted"]("Yes, go ahead — I never refuse POIs.") is True
+assert g["parse_poi_pass"]("PASS — staying seated") is True
+assert g["parse_poi_pass"]("I pass.") is True
+assert g["parse_poi_pass"]("[POI Rise LO→PM] PASS") is True
+assert g["parse_poi_pass"]("Pass-through costs hurt consumers") is False
+assert g["parse_poi_pass"]("[POI Rise LO→PM] Point of Information on pass-through costs") is False
+
+os.environ["AFC_COUNCIL_FORCE_SUPRA"] = "1"
+try:
+    b27_accts = {"claude": ("main", True, None), "codex": ("main", True, None), "gemini": ("main", True, None)}
+    b27_conf = {
+        "agents": [],
+        "seats": {"claude": False, "codex": False, "gemini": False},
+        "format": "bp",
+        "judge": "codex:gpt-6-astra",
+        "bp_cast": {
+            "PM": "claude:claude-opus-5-5", "LO": "gemini:gemini-4-neon",
+            "DPM": "claude:claude-sonnet-5-5", "DLO": "gemini:gemini-4-argon",
+        },
+    }
+    b27_members = g["build_members"](b27_conf, b27_accts)
+    b27_mt = g["Meeting"](T, b27_members, b27_conf)
+    b27_mt.save = lambda: None
+    g["TABLE"][0] = b27_mt
+    # 27a) BP chamber grid layout works with custom provider:model bp_* slots
+    cols27 = g["bp_grid_columns"](b27_mt, b27_mt.active_members())
+    assert cols27 is not None, "bp_grid_columns returned None for custom bp_* slots"
+    assert [[x.handle for x in c] for c in cols27] == [["bp_pm", "bp_dpm"], ["supra-omnia"], ["bp_lo", "bp_dlo"]], \
+        f"bp_grid_columns wrong: {[[x.handle for x in c] for c in cols27]}"
+    # 27b) No phantom bp_judge returned by find() when supra-omnia is seated with conf['judge'] override
+    assert b27_mt.find("astra") is None, f"find('astra') returned phantom bp_judge: {b27_mt.find('astra')}"
+    # 27c) Failed earlier BP step does not jump backwards on resume; POI PASS skips rebuttal;
+    #      motion text preserved after directed side question; _bp_paused_noted set on STOP
+    seen_tasks = []
+    orig_sp27 = g["Meeting"].speak
+    def fake_sp27(self, m, task, phase, prompt=None, rnd=None, bp_role=None, poi_by=None, bp_side=None):
+        seen_tasks.append((phase, bp_role or m.handle, task))
+        if phase == "poi":
+            self.add(m, "PASS", phase, bp_role=bp_role, poi_by=poi_by, bp_side=bp_side, poi_pass=True)
+        elif phase == "poi_decision":
+            self.add(m, f"[{bp_role} · ACCEPT {poi_by}] Yes.", phase, bp_role=bp_role, poi_by=poi_by, bp_side=bp_side, poi_accepted=True)
+        else:
+            self.add(m, f"[{bp_role or 'JUDGE'}] {phase}", phase, bp_role=bp_role, poi_by=poi_by, bp_side=bp_side)
+    g["Meeting"].speak = fake_sp27
+    try:
+        # Simulate PM failed -> LO spoke -> directed side question -> resume should start at LO's POI, NOT PM!
+        b27_mt.thread = [
+            {"who": "chair", "name": "Chair", "text": "This house would tax robots", "phase": "chair"},
+            {"who": "bp_pm", "as": "opus", "name": "Claude PM", "text": "(timeout)", "phase": "bp", "problem": True, "bp_role": "PM", "bp_side": "gov"},
+            {"who": "bp_lo", "as": "neon", "name": "Gemini LO", "text": "[LO] opp case", "phase": "bp", "bp_role": "LO", "bp_side": "opp"},
+            {"who": "chair", "name": "Chair", "text": "@neon clarify?", "phase": "chair", "to": ["bp_lo"]},
+        ]
+        g["STOP"].clear()
+        with _cl.redirect_stdout(_io.StringIO()):
+            b27_mt.round(b27_mt.active_members(), fresh=False)
+        phases_ran = [(ph, r) for ph, r, _ in seen_tasks]
+        assert ("bp", "PM") not in phases_ran, f"failed PM replayed out of order: {phases_ran}"
+        assert ("rebuttal", "LO") not in phases_ran, f"POI PASS still triggered rebuttal: {phases_ran}"
+        assert ("bp", "DPM") in phases_ran and ("verdict", "supra-omnia") in phases_ran, f"missing later turns: {phases_ran}"
+        dpm_task = next(t for ph, r, t in seen_tasks if (ph, r) == ("bp", "DPM"))
+        assert "This house would tax robots" in dpm_task, f"DPM prompt lost original motion: {dpm_task}"
+        # Resuming after Judge verdict does not re-run failed PM
+        seen_tasks.clear()
+        buf27 = _io.StringIO()
+        with _cl.redirect_stdout(buf27):
+            b27_mt.round(b27_mt.active_members(), fresh=False)
+        assert seen_tasks == [] and "already complete" in buf27.getvalue(), f"re-ran after verdict: {seen_tasks} {buf27.getvalue()}"
+        # Stopping mid-BP sets _bp_paused_noted so Worker.run/chat won't overwrite the paused prompt
+        b27_mt.thread.append({"who": "chair", "name": "Chair", "text": "Motion C", "phase": "chair"})
+        def stop_after_pm(self, m, task, phase, prompt=None, rnd=None, bp_role=None, poi_by=None, bp_side=None):
+            self.add(m, "[PM] speech", phase, bp_role=bp_role, poi_by=poi_by, bp_side=bp_side)
+            g["STOP"].set()
+        g["Meeting"].speak = stop_after_pm
+        g["STOP"].clear()
+        with _cl.redirect_stdout(_io.StringIO()):
+            b27_mt.round(b27_mt.active_members(), fresh=True)
+        assert getattr(b27_mt, "_bp_paused_noted", False) is True, "_bp_paused_noted not set on BP STOP"
+    finally:
+        g["Meeting"].speak = orig_sp27
+        g["STOP"].clear()
+finally:
+    os.environ.pop("AFC_COUNCIL_FORCE_SUPRA", None)
+
+# 28. llm-usage regressions: null reset_time doesn't raise AttributeError, mtime safe on missing path
+u_path = os.path.join(os.path.dirname(sys.argv[1]), "llm-usage")
+u_ns = {"__file__": u_path, "__name__": "llm_usage_test"}
+with open(u_path) as fh:
+    exec(compile(fh.read(), u_path, "exec"), u_ns)
+assert u_ns["mtime"]("/nonexistent/path/for/test") == 0.0
+u_samples = u_ns["agy_json_samples"](json.dumps({
+    "command": {"data": {"groups": [{"name": "Gemini", "buckets": [
+        {"window": "5h", "remaining_fraction": 0.5, "reset_time": None},
+        {"window": "weekly", "remaining_fraction": 0.8, "reset_time": "2026-11-30T00:00:00Z"},
+    ]}]}}
+}))
+assert len(u_samples) == 1 and u_samples[0][0] == "G" and u_samples[0][1] == "W", f"agy_json_samples wrong: {u_samples}"
+
+# 29. Input validation & error-handling regressions (afc-council & llm-usage)
+assert g["valid_model_id"]("claude-opus-5-5") is True
+assert g["valid_model_id"]("opencode/deepseek-v4.1-flash-free") is True
+assert g["valid_model_id"]("") is False
+assert g["valid_model_id"]("bad model") is False
+assert g["valid_model_id"]("bad;rm") is False
+assert g["valid_model_id"]("a" * 161) is False
+
+v_accts = {"claude": ("main", True, None), "codex": ("main", True, None)}
+v_conf = {"agents": ["bad", {"name": "", "tool": "claude"}, {"name": "BadTool", "tool": "nope"}],
+          "seats": "not-a-dict", "llm": "not-a-dict", "timeout": "not-a-number"}
+v_members = g["build_members"](v_conf, v_accts)
+v_mt = g["Meeting"](T, v_members, v_conf)
+assert v_mt.timeout_secs() == 300
+v_conf["timeout"] = -5
+assert v_mt.timeout_secs() == 1
+v_conf["timeout"] = 99999
+assert v_mt.timeout_secs() == 3600
+v_conf["timeout"] = True
+assert v_mt.timeout_secs() == 300
+
+# /bp rejects invalid model IDs & unsigned providers; /length & /rounds reject non-numbers
+v_out = _io.StringIO()
+with _cl.redirect_stdout(v_out):
+    g["command_line"]("/bp PM claude:bad!model", v_mt, v_conf, v_accts)
+    g["command_line"]("/bp JUDGE claude:bad!model", v_mt, v_conf, v_accts)
+    g["command_line"]("/bp PM copilot:gpt-6.1-sol", v_mt, v_conf, v_accts)
+    g["command_line"]("/length abc", v_mt, v_conf, v_accts)
+    g["command_line"]("/rounds xyz", v_mt, v_conf, v_accts)
+v_txt = v_out.getvalue()
+assert not v_conf.get("bp_cast") and not v_conf.get("judge"), f"invalid bp specs persisted: {v_conf}"
+assert "Invalid model ID" in v_txt and "no signed-in account" in v_txt, f"missing bp validation notes: {v_txt}"
+assert "Invalid length" in v_txt and "Invalid rounds" in v_txt, f"missing length/rounds validation notes: {v_txt}"
+
+# read_meeting survives malformed thread JSON
+bad_dir = tempfile.mkdtemp(dir=T)
+bad_md = os.path.join(bad_dir, "thread.md")
+open(bad_md, "w").close()
+with open(os.path.join(bad_dir, "thread.json"), "w") as fh:
+    json.dump({"topic": "T", "started": "2026-11-24", "thread": ["junk", {"who": "chair", "text": "ok"}]}, fh)
+_, _, clean_th = g["read_meeting"](bad_md)
+assert len(clean_th) == 1 and clean_th[0]["who"] == "chair", f"read_meeting did not filter junk: {clean_th}"
+
+# main() validates CLI flags cleanly instead of raising ValueError/IndexError
+with _cl.redirect_stderr(_io.StringIO()):
+    assert g["main"](["--dir"]) == 2
+    assert g["main"](["--dir", "/nonexistent/council/dir/xyz"]) == 2
+    assert g["main"](["--view", "/tmp/f", "claude", "notapid"]) == 2
+
+# llm-usage validation & corrupt-cache resilience
+assert u_ns["valid_acct"]("main") is True and u_ns["valid_acct"]("acct-1.prod") is True
+assert u_ns["valid_acct"]("../evil") is False and u_ns["valid_acct"]("a/b") is False and u_ns["valid_acct"]("..") is False
+assert u_ns["codex_render"]("not-a-dict") == ""
+assert u_ns["codex_render"]({"primary": {"used_percent": "bad", "resets_at": "bad"}}) == ""
+assert u_ns["agy_render"]("not-a-dict", 0) == ""
+assert u_ns["agy_render"]({"G": {"S": {"used": "bad", "reset": None}}}, 0) == ""
+with _cl.redirect_stderr(_io.StringIO()):
+    assert u_ns["main"](["unknown", "main"]) == 2
+    assert u_ns["main"](["codex", "../evil"]) == 2
+
+# 30. Hard round & total-turn caps (Order, Roast, Win Stake, config init, /rounds, /sim) so LLMs never loop perpetually
+cap_accts = {"claude": ("main", True, None), "codex": ("main", True, None)}
+cap_conf = {"agents": [], "rounds": 99999, "roasts": 99999, "stake_rounds": 99999, "mode": "order"}
+cap_members = [M("Claude", "claude", account="main"), M("Codex", "codex", account="main")]
+cap_mt = g["Meeting"](T, cap_members, cap_conf)
+cap_mt.save = lambda: None
+assert cap_mt.rounds == g["MAX_ORDER_ROUNDS"], f"init did not clamp rounds: {cap_mt.rounds}"
+assert cap_mt.roasts == g["MAX_ROAST_ROUNDS"], f"init did not clamp roasts: {cap_mt.roasts}"
+assert cap_mt.stake_rounds() == g["MAX_STAKE_ROUNDS"], f"stake_rounds not clamped: {cap_mt.stake_rounds()}"
+# Bool values in settings.json do not bypass clamping
+bool_mt = g["Meeting"](T, cap_members, {"agents": [], "rounds": True, "roasts": True, "stake_rounds": True})
+assert bool_mt.stake_rounds() == 3
+# /rounds clamps oversized values and informs user
+cap_out = _io.StringIO()
+with _cl.redirect_stdout(cap_out):
+    g["command_line"]("/rounds 500", cap_mt, cap_conf, cap_accts)
+assert cap_mt.rounds == g["MAX_ORDER_ROUNDS"] and "hard max" in cap_out.getvalue(), f"/rounds did not cap: {cap_mt.rounds} {cap_out.getvalue()}"
+
+# Verify runtime hard cap in Order mode even when rounds=0 (never-passing LLMs) or tampered rounds=999
+orig_sp30 = g["Meeting"].speak
+order_turns = []
+def fake_order_sp(self, m, task, phase, prompt=None, rnd=None, **kw):
+    order_turns.append((m.handle, phase, rnd))
+    self.add(m, f"still arguing {rnd}", phase, rnd=rnd)
+g["Meeting"].speak = fake_order_sp
+try:
+    cap_mt.mode = "order"
+    cap_mt.rounds = 0   # /rounds 0 with members that NEVER pass -> must stop at MAX_ORDER_ROUNDS!
+    cap_mt.thread = [{"who": "chair", "name": "Chair", "text": "Debate forever?", "phase": "chair"}]
+    buf_o = _io.StringIO()
+    with _cl.redirect_stdout(buf_o):
+        cap_mt.round(cap_members, fresh=True)
+    table_passes = max(r for _, ph, r in order_turns if ph == "table")
+    assert table_passes == g["MAX_ORDER_ROUNDS"], f"order /rounds 0 exceeded cap: {table_passes}"
+    assert "hard cap" in buf_o.getvalue(), f"missing order hard cap note: {buf_o.getvalue()}"
+    # Even tampered rounds=999 cannot bypass MAX_ORDER_ROUNDS
+    order_turns.clear()
+    cap_mt.rounds = 999
+    with _cl.redirect_stdout(_io.StringIO()):
+        cap_mt.round(cap_members, fresh=True)
+    assert max(r for _, ph, r in order_turns if ph == "table") == g["MAX_ORDER_ROUNDS"]
+    # Roast mode with tampered roasts=999 and roasts=0 stops hard at MAX_ROAST_ROUNDS per member
+    roast_counts = {}
+    def fake_roast_sp(self, m, task, phase, prompt=None, rnd=None, **kw):
+        if phase == "roast":
+            roast_counts[m.handle] = roast_counts.get(m.handle, 0) + 1
+        self.add(m, f"roast {rnd}", phase, rnd=rnd)
+    g["Meeting"].speak = fake_roast_sp
+    cap_mt.mode = "roast"
+    cap_mt.roasts = 999
+    cap_mt.thread = [{"who": "chair", "name": "Chair", "text": "Roast forever?", "phase": "chair"}]
+    buf_r = _io.StringIO()
+    with _cl.redirect_stdout(buf_r):
+        cap_mt.round(cap_members, fresh=True)
+    assert max(roast_counts.values()) <= g["MAX_ROAST_ROUNDS"], f"roast exceeded cap: {roast_counts}"
+    assert "hard cap" in buf_r.getvalue(), f"missing roast hard cap note: {buf_r.getvalue()}"
+finally:
+    g["Meeting"].speak = orig_sp30
+
+# 31. Strict format guardrails, validators & watchers across BP, Win Stake, and Open Forum
+# 31a. POI rise sanitizer blocks unaccepted argument leaks; POI decision fails closed on ambiguity
+leaked_rise = "[POI Rise LO→PM] Point of Information: Why did PM ignore inflation and contradict their own stats?"
+clean_rise = g["sanitize_poi_rise"](leaked_rise, "LO", "PM")
+assert clean_rise == "[POI Rise LO→PM] Point of Information.", f"POI rise leaked argument: {clean_rise!r}"
+topic_rise = g["sanitize_poi_rise"]("[POI Rise LO→PM] Point of Information on fiscal cost", "LO", "PM")
+assert topic_rise == "[POI Rise LO→PM] Point of Information (on fiscal cost).", f"short topic rise broken: {topic_rise!r}"
+assert g["sanitize_poi_rise"]("PASS", "LO", "PM") == "[POI Rise LO→PM] PASS"
+assert g["parse_poi_accepted"]("Interesting point, let me think about that.") is False, "ambiguous POI decision must fail closed"
+assert g["parse_poi_accepted"]("[PM · ACCEPT LO] Go ahead.") is True
+assert g["parse_poi_accepted"]("[PM · DECLINE LO] Not now.") is False
+long_dec = " ".join(["word"] * 30)
+clean_dec = g["sanitize_poi_decision"](long_dec, "PM", "LO", False)
+assert clean_dec.startswith("[PM · DECLINE LO]") and len(clean_dec.split()) <= 20, f"decision not clamped: {clean_dec!r}"
+
+# 31b. Strict Win Stake vote parser rejects negated phrases and handles markdown bold variants
+assert g["parse_stake_vote"]("Please do not vote for @opus because their math failed.") is None
+assert g["parse_stake_vote"]("I would never vote @codex on this.") is None
+assert g["parse_stake_vote"]("Strong point from @claude.\n**Vote:** **@gemini**") == "gemini"
+assert g["parse_stake_vote"]("Do not vote for @opus.\nVote: @codex") == "codex"
+
+# 31c. BP suppresses conflicting Open Forum /lean in prompts, overrides judge word cap, and guards /rounds
+gr_dir = tempfile.mkdtemp(dir=T)
+gr_accts = {"claude": ("main", True, None), "codex": ("main", True, None), "gemini": ("main", True, None)}
+gr_conf = {"agents": [], "seats": {"claude": True, "codex": True, "gemini": True, "supra-omnia": False},
+           "llm": {"codex": {"lean": "government"}}, "format": "bp", "rounds": 2, "judge": "claude:claude-opus-5-5"}
+gr_members = [m for m in g["build_members"](gr_conf, gr_accts) if m.handle != "supra-omnia"]
+gr_mt = g["Meeting"](gr_dir, gr_members, gr_conf)
+gr_mt.save = lambda: None
+g["TABLE"][0] = gr_mt
+codex_m = gr_mt.find("codex")
+bp_prompt = gr_mt.prompt(codex_m, "Speak as LO")
+assert "Your lean: GOVERNMENT" not in bp_prompt, f"BP prompt leaked conflicting Open Forum lean: {bp_prompt}"
+assert "overrides the default word limit" in gr_mt.bp_judge_task(gr_mt.bp_cast())
+buf_r = _io.StringIO()
+with _cl.redirect_stdout(buf_r):
+    g["command_line"]("/rounds 5", gr_mt, gr_conf, gr_accts)
+assert gr_mt.rounds == 2 and "does not use /rounds" in buf_r.getvalue(), f"/rounds in BP not guarded: {gr_mt.rounds} {buf_r.getvalue()}"
+
+# 31d. Open Forum custom conf['judge'] sits out and speaks LAST as verdict (does not speak as a debater)
+gr_conf["format"] = "forum"
+forum_calls = []
+orig_speak31 = g["Meeting"].speak
+def fake_forum_speak(self, m, task, phase, prompt=None, rnd=None, bp_role=None, poi_by=None, bp_side=None):
+    forum_calls.append((m.handle, phase, rnd))
+    self.add(m, f"reply by {m.handle}", phase, rnd=rnd)
+g["Meeting"].speak = fake_forum_speak
+try:
+    gr_mt.rounds = -1
+    gr_mt.thread.append({"who": "chair", "name": "Chair", "text": "Forum question", "phase": "chair"})
+    with _cl.redirect_stdout(_io.StringIO()):
+        gr_mt.round(gr_mt.active_members(), fresh=True)
+    assert forum_calls[-1][0] == "bp_judge" and forum_calls[-1][1] == "verdict", f"custom judge did not judge forum: {forum_calls}"
+    assert all(h != "bp_judge" for h, _p, _r in forum_calls[:-1]), f"custom judge spoke during forum round: {forum_calls}"
+finally:
+    g["Meeting"].speak = orig_speak31
+
+# 31e. Win Stake stop/resume progress watcher (resumes exact unfinished round & judge, rejects self-votes)
+st_conf = {"agents": [], "seats": {"claude": True, "codex": True, "gemini": True, "supra-omnia": False},
+           "format": "stake", "stake_rounds": 3, "judge": "claude:claude-opus-5-5"}
+st_mt = g["Meeting"](gr_dir, [m for m in g["build_members"](st_conf, gr_accts) if m.handle != "supra-omnia"], st_conf)
+st_mt.save = lambda: None
+st_calls = []
+stop_stake_on = [None]
+def fake_stake_speak(self, m, task, phase, prompt=None, rnd=None, bp_role=None, poi_by=None, bp_side=None):
+    st_calls.append((m.handle, phase, rnd))
+    txt = f"case round {rnd}"
+    if phase == "stake" and rnd == 3:
+        if m.handle == "claude":
+            txt += "\nVote: @claude"
+        elif m.handle == "codex":
+            txt += "\nDo not vote for @claude.\nVote: @gemini"
+        else:
+            txt += "\nVote: @codex"
+    self.add(m, txt, phase, rnd=rnd)
+    if stop_stake_on[0] and (phase, rnd) == stop_stake_on[0]:
+        g["STOP"].set()
+g["Meeting"].speak = fake_stake_speak
+try:
+    st_mt.thread.append({"who": "chair", "name": "Chair", "text": "Stake topic", "phase": "chair"})
+    g["STOP"].clear()
+    stop_stake_on[0] = ("stake", 1)
+    b_st1 = _io.StringIO()
+    with _cl.redirect_stdout(b_st1):
+        st_mt.round(st_mt.active_members(), fresh=True)
+    assert all(r == 1 for _h, p, r in st_calls if p == "stake")
+    assert "Win Stake paused" in b_st1.getvalue(), f"missing stake pause note: {b_st1.getvalue()}"
+    st_calls.clear()
+    g["STOP"].clear()
+    stop_stake_on[0] = None
+    b_st2 = _io.StringIO()
+    with _cl.redirect_stdout(b_st2):
+        st_mt.round(st_mt.active_members(), fresh=False)
+    resumed_rounds = [r for _h, p, r in st_calls if p == "stake"]
+    assert 2 in resumed_rounds and 3 in resumed_rounds, f"did not resume rounds 2 and 3: {st_calls}"
+    assert st_calls[-1] == ("bp_judge", "verdict", None), f"missing stake verdict: {st_calls}"
+    assert "self-vote" in b_st2.getvalue(), f"missing self-vote guardrail note: {b_st2.getvalue()}"
+    st_calls.clear()
+    b_st3 = _io.StringIO()
+    with _cl.redirect_stdout(b_st3):
+        st_mt.round(st_mt.active_members(), fresh=False)
+    assert st_calls == [] and "already complete" in b_st3.getvalue(), f"completed stake re-ran: {st_calls} {b_st3.getvalue()}"
+finally:
+    g["Meeting"].speak = orig_speak31
+    g["STOP"].clear()
 
 print("REGRESSIONS_OK")
 EOF

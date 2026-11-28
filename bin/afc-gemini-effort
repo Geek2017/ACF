@@ -128,18 +128,57 @@ def set_level(home, level):
 
 # ---- which chat a running Gemini is on -------------------------------------------------------
 
+MAC = sys.platform == "darwin"
+_MACPROC = None
+
+
+def _macproc():
+    """Load lib/afc/macproc.py on macOS (never imported on Linux)."""
+    global _MACPROC
+    if _MACPROC is not None:
+        return _MACPROC
+    for d in (os.path.join(os.path.expanduser("~"), ".local", "lib", "afc"),
+              os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "afc")):
+        if os.path.isfile(os.path.join(d, "macproc.py")) and d not in sys.path:
+            sys.path.insert(0, d)
+            break
+    import macproc
+    _MACPROC = macproc
+    return _MACPROC
+
+
 def proc_args(pid):
+    if MAC:
+        argv, _ = _macproc().argv_env(pid)
+        if not argv:
+            raise OSError(f"cannot read argv for pid {pid}")
+        return argv
     with open(f"/proc/{pid}/cmdline", "rb") as f:
         return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
 
 
 def proc_start(pid):
     """When the process started, in seconds since the epoch."""
+    if MAC:
+        info = _macproc().info(pid)
+        if not info:
+            raise OSError(f"cannot read start time for pid {pid}")
+        return float(info[2])
     with open(f"/proc/{pid}/stat") as f:
         fields = f.read().rsplit(")", 1)[1].split()
     with open("/proc/stat") as f:
         btime = next(int(line.split()[1]) for line in f if line.startswith("btime "))
     return btime + int(fields[19]) / os.sysconf("SC_CLK_TCK")
+
+
+def proc_cwd(pid):
+    """Realpath of the process working directory."""
+    if MAC:
+        d = _macproc().cwd(pid)
+        if not d:
+            raise OSError(f"cannot read cwd for pid {pid}")
+        return os.path.realpath(d)
+    return os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
 
 
 def arg_after(args, *names):
@@ -192,7 +231,7 @@ def chat_of(home, pid, said=""):
     that Gemini's own /stats shows, which is exact (it follows /clear and a chat reopened inside
     Gemini); the file is "" when that chat has none yet. Without it, the chat is worked out from the
     process: the id it was started on, else the chat whose file it wrote when it started."""
-    cwd = os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+    cwd = proc_cwd(pid)
     have = chats(home, cwd)
     if said:
         # Taken only with its chat file, written since this Gemini started (a resumed chat is written

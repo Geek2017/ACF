@@ -1,0 +1,10 @@
+[Unit]
+Description=Prune stale agent temp files in ~/.cache/tmp older than 24h
+ConditionPathIsDirectory=%h/.cache/tmp
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/bin/find %h/.cache/tmp -mindepth 1 -not -type d -mmin +1440 -delete
+ExecStart=/usr/bin/find %h/.cache/tmp -mindepth 1 -type d -empty -mmin +1440 -delete

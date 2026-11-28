@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in used by llm-usage: a hidden Antigravity quota read must never open a browser page.
+# It records the attempt and does nothing.
+echo "$(date +%T) kioclient $*" | cut -c1-60 >> "${XDG_RUNTIME_DIR:-/tmp}/llm-usage/nobrowser.log" 2>/dev/null
+exit 0

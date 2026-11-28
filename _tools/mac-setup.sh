@@ -106,6 +106,10 @@ fi
 step "3. The patched tmux"
 T="$HOME/.local/opt/tmux-3.8/bin/tmux"
 if [[ -x "$T" ]]; then echo "  already built: $("$T" -V)"
+elif [[ -x "$HERE/tmux-3.8/bin/tmux" ]] && "$HERE/tmux-3.8/bin/tmux" -V >/dev/null 2>&1; then
+  run mkdir -p "$HOME/.local/opt"
+  run ln -sfn "$HERE/tmux-3.8" "$HOME/.local/opt/tmux-3.8"
+  (( DRY )) || echo "  linked bundled tmux: $("$T" -V)"
 else run env PATH="$BREW/bin:$PATH" "$BREW/bin/bash" "$HERE/_tools/build-tmux.sh"
 fi
 L="$HOME/.local/bin/tmux"
@@ -233,11 +237,15 @@ hplist() {
 </plist>
 EOF
 }
-if ! command -v swiftc >/dev/null 2>&1; then
+if [[ -x "$HERE/bin-mac/agents-hotkey" && ( ! -x "$HK" || "$HERE/bin-mac/agents-hotkey" -nt "$HK" ) ]]; then
+  if (( DRY )); then echo "  would install prebuilt $HK from bundle"
+  else cp -p "$HERE/bin-mac/agents-hotkey" "$HK"; chmod 755 "$HK"; built=1; echo "  installed bundled $HK"; fi
+fi
+if [[ ! -x "$HK" ]] && ! command -v swiftc >/dev/null 2>&1; then
   echo "  !! no swiftc (the Mac's developer tools)"
   left "For the $KEY key: xcode-select --install, then run this again"
 else
-  built=0
+  built=${built:-0}
   if [[ -x "$HK" && ! "$HSRC" -nt "$HK" ]]; then echo "  the helper is built: $HK"
   elif (( DRY )); then echo "  would build $HK from share/mac/agents-hotkey.swift"
   elif swiftc -O -suppress-warnings -o "$HK.new" "$HSRC" && [[ -x "$HK.new" ]]; then
@@ -258,6 +266,81 @@ else
       echo "  !! wrote $HPL but could not load it from this shell (no desktop session?)"
       left "Load the $KEY helper once you are logged in at the Mac:  launchctl bootstrap gui/\$(id -u) $HPL"
     fi
+  fi
+fi
+
+step "9. App icon (ACF.app) and native macOS splash"
+# Copy splash assets into ~/.local/share/acf so afc-splash works even if the repo moves
+if (( DRY )); then
+  echo "  would copy share/acf/* -> ~/.local/share/acf/"
+else
+  mkdir -p "$HOME/.local/share/acf"
+  for sf in "$HERE"/share/acf/*; do [[ -f "$sf" ]] && cp -p "$sf" "$HOME/.local/share/acf/"; done
+fi
+# Build or install native AppKit splash binary (afc-splash-mac)
+SP_BIN="$HOME/.local/bin/afc-splash-mac"; SP_SRC="$HERE/share/mac/afc-splash-mac.swift"
+if [[ -x "$HERE/bin-mac/afc-splash-mac" && ( ! -x "$SP_BIN" || "$HERE/bin-mac/afc-splash-mac" -nt "$SP_BIN" ) ]]; then
+  if (( DRY )); then echo "  would install prebuilt $SP_BIN from bundle"
+  else cp -p "$HERE/bin-mac/afc-splash-mac" "$SP_BIN"; chmod 755 "$SP_BIN"; echo "  installed bundled $SP_BIN"; fi
+elif command -v swiftc >/dev/null 2>&1 && [[ -f "$SP_SRC" ]]; then
+  if [[ -x "$SP_BIN" && ! "$SP_SRC" -nt "$SP_BIN" ]]; then echo "  native splash built: $SP_BIN"
+  elif (( DRY )); then echo "  would build $SP_BIN from share/mac/afc-splash-mac.swift"
+  elif swiftc -O -suppress-warnings -o "$SP_BIN.new" "$SP_SRC" && [[ -x "$SP_BIN.new" ]]; then
+    mv -f "$SP_BIN.new" "$SP_BIN"; echo "  built $SP_BIN"
+  else
+    echo "  !! could not build $SP_BIN"
+  fi
+fi
+# Install ACF.app into /Applications (if writable) else ~/Applications; skip if running from inside ACF.app
+if [[ "$HERE" == *.app/Contents/Resources/fleet ]]; then
+  echo "  app bundle already installed at ${HERE%/Contents/Resources/fleet}"
+else
+  if [[ -w /Applications ]]; then APP="/Applications/ACF.app"; else APP="$HOME/Applications/ACF.app"; fi
+  if (( DRY )); then
+    echo "  would build $APP with acf.icns icon"
+  else
+    mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+    if command -v iconutil >/dev/null 2>&1 && [[ -d "$HERE/share/icons/hicolor" ]]; then
+      ICONSET=$(mktemp -d)/acf.iconset
+      mkdir -p "$ICONSET"
+      cp "$HERE/share/icons/hicolor/16x16/apps/acf.png"   "$ICONSET/icon_16x16.png"      2>/dev/null || true
+      cp "$HERE/share/icons/hicolor/32x32/apps/acf.png"   "$ICONSET/icon_16x16@2x.png"   2>/dev/null || true
+      cp "$HERE/share/icons/hicolor/32x32/apps/acf.png"   "$ICONSET/icon_32x32.png"      2>/dev/null || true
+      cp "$HERE/share/icons/hicolor/64x64/apps/acf.png"   "$ICONSET/icon_32x32@2x.png"   2>/dev/null || true
+      cp "$HERE/share/icons/hicolor/128x128/apps/acf.png" "$ICONSET/icon_128x128.png"    2>/dev/null || true
+      cp "$HERE/share/icons/hicolor/256x256/apps/acf.png" "$ICONSET/icon_128x128@2x.png" 2>/dev/null || true
+      cp "$HERE/share/icons/hicolor/256x256/apps/acf.png" "$ICONSET/icon_256x256.png"    2>/dev/null || true
+      cp "$HERE/share/icons/hicolor/512x512/apps/acf.png" "$ICONSET/icon_256x256@2x.png" 2>/dev/null || true
+      cp "$HERE/share/icons/hicolor/512x512/apps/acf.png" "$ICONSET/icon_512x512.png"    2>/dev/null || true
+      iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/acf.icns" 2>/dev/null || true
+      rm -rf "${ICONSET%/*}"
+    fi
+    cat > "$APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>ACF</string>
+  <key>CFBundleDisplayName</key><string>Agentic CLI Fleet</string>
+  <key>CFBundleIdentifier</key><string>io.github.acf.launcher</string>
+  <key>CFBundleVersion</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleExecutable</key><string>ACF</string>
+  <key>CFBundleIconFile</key><string>acf</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+PLIST
+    cat > "$APP/Contents/MacOS/ACF" <<'LAUNCH'
+#!/bin/bash
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+exec "$HOME/.local/bin/agents" --window
+LAUNCH
+    chmod +x "$APP/Contents/MacOS/ACF"
+    [[ "$APP" == "/Applications/ACF.app" && -d "$HOME/Applications/ACF.app" ]] && rm -rf "$HOME/Applications/ACF.app"
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
+    echo "  installed $APP (Spotlight, Launchpad & Dock ready)"
   fi
 fi
 

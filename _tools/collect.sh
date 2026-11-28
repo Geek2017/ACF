@@ -28,17 +28,19 @@ put() {  # <source file> <path inside the project>
 }
 
 B="$HOME/.local/bin"
-for f in agents afc-agent-info afc-bar afc-chat afc-copy afc-council afc-even afc-gap afc-gemini-effort afc-logs afc-longcopy afc-menu afc-min afc-model-menu afc-move \
+for f in agents afc-agent-info afc-bar afc-chat afc-copy afc-council afc-even afc-gap afc-gemini-effort afc-logs afc-longcopy afc-menu afc-rules afc-select afc-ide afc-splash afc-min afc-model-menu afc-move \
          afc-reflow afc-statusline llm-usage claude-usage autonice jobq keepawake-agents; do
   put "$B/$f" "bin/$f"
 done
-put "$HOME/.local/lib/afc/pb.py" "lib/afc/pb.py"
+for f in "$HOME/.local/lib/afc/"*; do
+  [[ -f "$f" ]] && put "$f" "lib/afc/$(basename "$f")"
+done
 
 put "$HOME/.tmux.conf" "tmux/tmux.conf"
 put "$HOME/.local/opt/tmux-3.8/afc-thin-scrollbar.patch" "tmux/afc-tmux-3.8.patch"
 
 U="$HOME/.config/systemd/user"
-for f in agents.slice agents-pool.service agents-express.slice agents-express-pool.service agents-council.slice autonice.service keepawake-agents.service afc-logs.service afc-logs.timer; do
+for f in agents.slice agents-pool.service agents-express.slice agents-express-pool.service agents-council.slice autonice.service keepawake-agents.service afc-logs.service afc-logs.timer afc-tmp-clean.service afc-tmp-clean.timer app.slice.d/memory.conf; do
   put "$U/$f" "config/systemd/user/$f"
 done
 

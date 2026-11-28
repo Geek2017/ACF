@@ -9,7 +9,8 @@ does nothing there and adds nothing to the prompt.
 Each agent's own hooks call it twice a turn (`afc-rules install` adds them):
   afc-rules hook <tool> prompt   a prompt is sent: a short reminder of this project's rules goes with it
   afc-rules hook <tool> stop     the turn ends: what the agent did is checked against those rules
-  tool: claude, codex, gemini or agy. The hook's JSON comes on stdin, the answer goes to stdout.
+  tool: claude, codex, gemini or agy; copilot has the prompt hook only (no turn-end check).
+  The hook's JSON comes on stdin, the answer goes to stdout.
 
 What is checked, from the agent's own chat file (the tool calls it made; no model is asked):
   hard  index-first   files were changed and _ai/INDEX.md was never read. An entry file with the
@@ -38,6 +39,9 @@ Other commands:
   afc-rules check <tool> <chat file> [--cwd DIR]   the findings of one chat, turn by turn
   afc-rules replay [--days N] [-v]                 every recent chat in a TokenOps project
   afc-rules show [--all] [-n N]                    the latest lines of rules.log
+  afc-rules mode [doctrine|model|ste|do178c|hygiene|summary|sitrep|off|delete]  show, switch, turn off, or delete modes
+  afc-rules verify                                 each fleet pane: its agent, the modes it should get, what its
+                                                   last prompt got (the hook marks the pane: @acf_sent)
   afc-rules install [--dry-run] [--remove]         add (or take out) the hooks in each tool's settings
   afc-rules memory [--dry-run] [FOLDER...]         Claude's auto-memory into each project's _ai/memory
   afc-rules doctor                                 what is in place
@@ -47,10 +51,18 @@ import datetime, fnmatch, glob, importlib.machinery, importlib.util, json, os, r
 HOME = os.path.expanduser("~")
 CFG = f"{HOME}/.config/agents"
 HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(HERE, "..", "lib", "afc"), os.path.join(HOME, ".local", "lib", "afc")):
+    if _lib not in sys.path:
+        sys.path.insert(0, _lib)
+import state as afc_state  # noqa: E402
 MARK = "[ACF rule check]"       # starts every message that sends an agent back
 NUDGE = "[ACF rules]"           # starts every reminder
 TOOLS = ("claude", "codex", "gemini", "agy")
-ENTRY = {"claude": ("CLAUDE.md",), "codex": ("AGENTS.md",), "gemini": ("GEMINI.md",), "agy": ("GEMINI.md", "AGENTS.md")}
+HOOK_TOOLS = TOOLS + ("copilot",)  # Copilot: the prompt hook only (no chat reader for the turn-end check)
+AGENT_NAMES = HOOK_TOOLS + ("opencode",)  # what `afc-rules verify` looks for in a pane
+ENTRY = {"claude": ("CLAUDE.md",), "codex": ("AGENTS.md",), "gemini": ("GEMINI.md",), "agy": ("GEMINI.md", "AGENTS.md"),
+         "copilot": ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")}
+SENT = "@acf_sent"              # pane option: "<epoch> <tool> <tags>" of the last prompt text the hook sent
 IMPORTS = {"claude", "gemini"}  # tools whose entry file can pull a file in with an @path line
 WORK_ONLY = ("_ai/", "logs/")   # the project's memory and logs: not "code"
 GENERATED = re.compile(r"^(CLAUDE\.md|AGENTS\.md|GEMINI\.md|\.clinerules|\.cursor/rules/.+|\.windsurf/rules/.+"
@@ -72,15 +84,218 @@ SOCK = os.environ.get("AGENTS_SOCK") or "agents"
 
 def setting(name, default):
     """A "name value" line of the fleet's settings file, read the way `agents` reads it."""
+    return afc_state.setting(name, default)
+
+
+DOCTRINE_PROMPTS = {
+    "mdmp": "Doctrine [MDMP]: Explore once, lock a clear plan before editing, execute decisively in clean batches, then verify.",
+    "f3ead": "Doctrine [F3EAD]: Execute cleanly, then exploit learnings—record durable gotchas and decisions concisely so future turns stay cheaper.",
+    "ooda": "Doctrine [OODA]: Cycle tight micro-loops—one clear hypothesis, smallest change, immediate test, observe result, pivot fast.",
+}
+
+MENTAL_MODEL_PROMPTS = {
+    "ooda": "Mental Model [OODA Loop]: Observe, Orient, Decide, Act fast; test assumptions immediately.",
+    "first-principles": "Mental Model [First Principles]: Strip assumptions down to base facts and rebuild from the ground up.",
+    "six-hats": "Mental Model [Six Thinking Hats]: Weigh facts, risks, benefits, intuition, creative options, and process before deciding.",
+    "80-20": "Mental Model [80/20 Principle]: Focus on the vital 20% of changes delivering 80% of impact; skip low-value polish.",
+    "rca": "Mental Model [Root Cause Analysis]: State verified root cause with evidence before editing; never apply band-aid retries.",
+    "occam": "Mental Model [Occam's Razor]: Choose the simplest working diff with the fewest abstractions and assumptions.",
+    "5x5": "Mental Model [5x5 / Reversibility]: Separate reversible tweaks from one-way doors; apply extra rigor only where blast radius lasts.",
+}
+
+STYLE_STE_PROMPT = (
+    "Response Style [~80% ASD-STE100 + Visual]: Write short, direct sentences (aim <=20 words), active voice, "
+    "one idea per sentence, consistent terms, exact code identifiers, zero filler. "
+    "For flows, architecture, or multi-step explanations, lead with a compact ASCII diagram (<=70 chars wide) "
+    "instead of walls of text; skip diagrams for trivial 1-2 line answers."
+)
+
+CODE_DO178C_PROMPT = (
+    "Code Standard [DO-178C-Lite]: Trace every edit to the stated requirement (zero dead or unrequested code); "
+    "keep logic deterministic and bounded (validate inputs, cap loops/timeouts, explicit error handling); "
+    "keep functions small with clear branches; verify normal and boundary/failure paths with tests before finishing."
+)
+
+SEARCH_HYGIENE_PROMPT = (
+    "Search Hygiene: Use built-in Grep/glob tools first; in shell use capped ripgrep "
+    "(`rg -l` or `--max-columns=160 | head`) rather than unbounded scans or ad-hoc search scripts; "
+    "promote to a reusable helper only after 3+ repeated lookups (Rule of 3)."
+)
+
+SITREP_PHASES = {
+    "mdmp": "P0 ISR, P1 MISSION ANALYSIS, P2 GO/NO-GO, P3 ZEROING, P4 EXECUTE, P5 ASSESS",
+    "f3ead": "FIND, FIX, FINISH, EXPLOIT, ANALYZE, DISSEMINATE",
+    "ooda": "OBSERVE, ORIENT, DECIDE, ACT",
+}
+
+SITREP_FOOTER_RE = re.compile(r"^\s*[*_>+-]*\s*(?:You:\s|SITREP\b)")
+
+
+def sitrep_prompt(eff):
+    """Build dynamic You:/SITREP diff footer directive (red You:, green SITREP) naming active D & M."""
+    doc = eff["doctrine"]
+    mod = eff["mental-model"]
+    d_lbl = doc.upper() if doc in DOCTRINE_PROMPTS else "off"
+    m_lbl = mod.upper() if mod in MENTAL_MODEL_PROMPTS else "off"
+    phases = SITREP_PHASES.get(doc)
+    if phases:
+        sitrep_line = (
+            f"+ SITREP · D:{d_lbl} · M:{m_lbl} · <phase> · "
+            "Done: <what changed or was found> · Open: <unverified or blocked> · Next: <next action>"
+        )
+        phase_note = f" Phase is one of: {phases}."
+    else:
+        sitrep_line = (
+            f"+ SITREP · D:{d_lbl} · M:{m_lbl} · "
+            "Done: <what changed or was found> · Open: <unverified or blocked> · Next: <next action>"
+        )
+        phase_note = ""
+    return (
+        "SITREP Footer: End every reply with a fenced ```diff block (so You: renders red and SITREP renders green) "
+        "with a blank line between them:\n"
+        "```diff\n"
+        "- You: <user's latest message verbatim; if >20 words, first 20 words then …>\n"
+        "\n"
+        f"{sitrep_line}\n"
+        f"``` (SITREP line <=35 words.{phase_note})"
+    )
+
+
+def project_modes_path():
+    return afc_state.project_modes_path()
+
+
+def project_key_for(cwd):
+    """Canonical project folder for per-project modes: nearest .git root, else realpath(cwd)."""
+    return afc_state.project_key_for(cwd)
+
+
+def load_project_modes():
+    return afc_state.load_project_modes()
+
+
+def pane_mode_overrides(pane_id=""):
+    """Read tmux pane overrides (@doctrine, @mental_model) for pane_id or the current pane."""
+    where = fleet_pane()
+    if pane_id:
+        cmd = where[0] if where else [tmux_cmd(), "-L", SOCK]
+        pane = pane_id
+    elif where:
+        cmd, pane = where
+    else:
+        return "", ""
+    return afc_state.read_pane_modes(cmd, pane)
+
+
+def resolve_modes(cwd, pane_doc=None, pane_mod=None, pane_id=""):
+    """Resolve effective (doctrine, mental_model, style_ste, code_do178c, search_hygiene, memory_summary, sitrep)."""
+    g_doc = setting("doctrine", "off")
+    g_mod = setting("mental-model", "off")
+    ste = setting("style-ste", "on") != "off"
+    do178c = setting("code-do178c", "on") != "off"
+    hygiene = setting("search-hygiene", "off") == "on"
+    mem_sum = setting("memory-summary", "off") == "on"
+    sitrep = setting("sitrep", "off") == "on"
+
+    pkey = project_key_for(cwd)
+    pm = load_project_modes().get(pkey) if pkey else None
+    p_doc = (pm.get("doctrine") or "").strip() if isinstance(pm, dict) else ""
+    p_mod = (pm.get("mental-model") or "").strip() if isinstance(pm, dict) else ""
+
+    if pane_doc is None and pane_mod is None:
+        pane_doc, pane_mod = pane_mode_overrides(pane_id)
+    pane_doc = (pane_doc or "").strip()
+    pane_mod = (pane_mod or "").strip()
+
+    def pick(pane_v, proj_v, glob_v, allowed):
+        for v in (pane_v, proj_v, glob_v):
+            if not v or v == "inherit":
+                continue
+            if v == "off":
+                return "off"
+            if v in allowed:
+                return v
+        return "off"
+
+    return {
+        "project": pkey,
+        "doctrine": pick(pane_doc, p_doc, g_doc, DOCTRINE_PROMPTS),
+        "mental-model": pick(pane_mod, p_mod, g_mod, MENTAL_MODEL_PROMPTS),
+        "style-ste": ste,
+        "code-do178c": do178c,
+        "search-hygiene": hygiene,
+        "memory-summary": mem_sum,
+        "sitrep": sitrep,
+    }
+
+
+def mode_tags(eff):
+    """Short names of the modes the prompt text carries, e.g. ["doctrine=mdmp", "model=occam", "STE", "Hygiene", "SITREP"]."""
+    tags = []
+    if eff["doctrine"] in DOCTRINE_PROMPTS:
+        tags.append("doctrine=" + eff["doctrine"])
+    if eff["mental-model"] in MENTAL_MODEL_PROMPTS:
+        tags.append("model=" + eff["mental-model"])
+    for key, tag in (("style-ste", "STE"), ("code-do178c", "DO-178C"), ("search-hygiene", "Hygiene"), ("sitrep", "SITREP")):
+        if eff[key]:
+            tags.append(tag)
+    return tags
+
+
+def guidance_nudge(cwd, eff=None):
+    """Build compact prompt directive for active Doctrine, Mental Model, STE-Lite, DO-178C-Lite, Search Hygiene & SITREP."""
+    eff = eff or resolve_modes(cwd)
+    parts = []
+    if eff["doctrine"] in DOCTRINE_PROMPTS:
+        parts.append(DOCTRINE_PROMPTS[eff["doctrine"]])
+    if eff["mental-model"] in MENTAL_MODEL_PROMPTS:
+        parts.append(MENTAL_MODEL_PROMPTS[eff["mental-model"]])
+    if eff["style-ste"]:
+        parts.append(STYLE_STE_PROMPT)
+    if eff["code-do178c"]:
+        parts.append(CODE_DO178C_PROMPT)
+    if eff["search-hygiene"]:
+        parts.append(SEARCH_HYGIENE_PROMPT)
+    if eff["sitrep"]:
+        parts.append(sitrep_prompt(eff))
+    if not parts:
+        return ""
+    return "[ACF mode] " + " ".join(parts)
+
+
+def memory_nudge(cwd, st):
+    """Inject compact <=50-line project SUMMARY.md once per session (turn 1) when memory-summary is on."""
+    if setting("memory-summary", "off") != "on" or st.get("mem_sent"):
+        return ""
+    pkey = project_key_for(cwd)
+    if not pkey:
+        return ""
+    log_dir = os.path.join(pkey, "logs", "acf")
+    sum_path = os.path.join(log_dir, "SUMMARY.md")
+    db_path = os.path.join(log_dir, "acf.db")
+    if os.path.isfile(db_path):
+        try:
+            need_refresh = (not os.path.isfile(sum_path)) or (os.path.getmtime(db_path) > os.path.getmtime(sum_path))
+        except OSError:
+            need_refresh = True
+        if need_refresh:
+            try:
+                logs().refresh_project_summary(pkey)
+            except (OSError, ValueError, RuntimeError) as err:
+                sys.stderr.write(f"afc-rules: summary refresh failed: {err}\n")
+    if not os.path.isfile(sum_path):
+        return ""
     try:
-        with open(os.environ.get("AGENTS_SETTINGS") or f"{CFG}/settings", encoding="utf-8") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 2 and parts[0] == name:
-                    return parts[1]
+        with open(sum_path, encoding="utf-8", errors="replace") as f:
+            raw_lines = f.read().splitlines()
     except OSError:
-        pass
-    return default
+        return ""
+    if not raw_lines:
+        return ""
+    clipped = "\n".join(raw_lines[:35])
+    if len(clipped) > 2200:
+        clipped = clipped[:2200].rstrip() + "\n… (trimmed; run `afc-logs show <id>`)"
+    return f"[ACF memory] Cross-provider project summary ({sum_path}):\n{clipped}"
 
 
 def mode():
@@ -186,6 +401,8 @@ def matches_path(changed, recorded):
 
 
 class Project:
+    is_tokenops = True
+
     def __init__(self, root):
         self.root = root
         try:
@@ -283,23 +500,121 @@ def global_md(tool):
     return [p for p in found if os.path.isfile(p)]
 
 
+class PlainProject:
+    """Minimal project view when a folder has no TokenOps files (for core CLS/SAS checks)."""
+    is_tokenops = False
+    index = None
+    fixes = None
+    updates = None
+    records = ()
+    rule_files = ()
+    skills = ()
+    budget = 0
+
+    def __init__(self, root):
+        self.root = os.path.realpath(root)
+
+    def has(self, rel):
+        return os.path.isfile(os.path.join(self.root, rel))
+
+    def entry(self, _tool):
+        return None
+
+    def imports_index(self, _tool):
+        return False
+
+    def covering(self, _rel, _at=""):
+        return []
+
+    def rel(self, path):
+        p = os.path.realpath(path)
+        if p == self.root or p.startswith(self.root + "/"):
+            return os.path.relpath(p, self.root)
+        return None
+
+
+SHELL_TOOLS = {"Bash", "bash", "shell", "shell_command", "exec_command", "local_shell_call",
+               "run_shell_command", "run_command", "execute_command", "exec"}
+CODE_EXTS = {".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+             ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp", ".java", ".kt", ".rb", ".swift", ".pl", ".php"}
+VERIFY_CMD = re.compile(
+    r"(?:^|[;&|(\s])(?:"
+    r"pytest|py\.test|unittest|py_compile|compileall|flake8|ruff|mypy|pylint|bandit|"
+    r"npm\s+(?:test|run\s+(?:test|lint|build|check|typecheck))|"
+    r"pnpm\s+(?:test|lint|build|check)|yarn\s+(?:test|lint|build|check)|bun\s+test|"
+    r"vitest|jest|mocha|tsc|eslint|prettier\s+--check|biome\s+check|"
+    r"cargo\s+(?:test|check|clippy|build)|go\s+(?:test|vet|build)|"
+    r"make\b|cmake\b|ctest\b|ninja\b|gradle\b|mvn\b|dotnet\s+(?:test|build)|"
+    r"rspec\b|phpunit\b|shellcheck\b|shfmt\b|"
+    r"(?:ba|da|z)?sh\s+-[a-z]*n\b|"
+    r"(?:ba|da|z)?sh\s+\S*test\S*\.sh\b|"
+    r"\S*test-[A-Za-z0-9_.-]+\.sh\b|"
+    r"python3?\s+-m\s+(?:pytest|unittest|py_compile|compileall)\b|"
+    r"python3?\s+-c\b|python3?\s+-\s*<<|"
+    r"node\s+--check\b|node\s+--test\b|ruby\s+-c\b|perl\s+-c\b|php\s+-l\b|"
+    r"tmux\b.*list-keys|afc-rules\s+(?:check|doctor|verify)"
+    r")",
+    re.I,
+)
+READONLY_CMD = re.compile(r"^\s*(?:git\s+(?:status|diff|log|show|branch)|ls|ll|cat|head|tail|sed|awk|grep|rg|find|stat|wc|file|pwd|echo|printf|which|command\s+-v)\b")
+DIAGRAM_RE = re.compile(r"[┌┐└┘├┤┬┴┼│─▼▲►◄═║╔╗╚╝]|├──|└──|\+---+|--->|<---")
+DIAGRAM_LANGS = {"", "text", "txt", "ascii", "diagram", "plain"}
+FILLER_RE = re.compile(
+    r"^(?:certainly[!,.]|of course[!,.]|absolutely[!,.]|great question|excellent question|"
+    r"sure[,!]\s+(?:i(?:'d| would) be happy|here)|happy to help|"
+    r"i(?:'d| would) be happy to|here is a (?:comprehensive|detailed)\s)",
+    re.I,
+)
+FLOW_TOPIC_RE = re.compile(r"\b(?:architecture|pipeline|workflow|lifecycle|data\s+flow|state\s+machine|execution\s+flow)\b", re.I)
+BARE_EXCEPT_RE = re.compile(r"^\s*except\s*:\s*(?:#.*)?$")
+BROAD_PASS_RE = re.compile(r"^\s*except\s+(?:Exception|BaseException)\b[^:]*:\s*pass\s*$")
+BROAD_HEAD_RE = re.compile(r"^\s*except\s+(?:Exception|BaseException)\b[^:]*:\s*$")
+UNBOUNDED_CALL_RE = re.compile(
+    r"\b(?:subprocess\.(?:run|check_output|check_call)|urllib\.request\.urlopen|"
+    r"requests\.(?:get|post|put|delete|head|patch))\s*\("
+)
+
+
+def is_code_file(path):
+    """True for source/script files subject to SAS (DO-178C-Lite); excludes docs/config/logs."""
+    if not path:
+        return False
+    norm = path.replace("\\", "/")
+    if "/_ai/" in norm or "/logs/" in norm:
+        return False
+    base = os.path.basename(norm)
+    _, ext = os.path.splitext(base)
+    if ext.lower() in CODE_EXTS:
+        return True
+    if ext == "" and "/bin/" in norm and os.path.isfile(path):
+        try:
+            with open(path, "rb") as f:
+                return f.read(2) == b"#!"
+        except OSError:
+            return False
+    return False
+
+
 # ---------------------------------------------------------------------------------------------
 # what a chat did: built up entry by entry, kept between turns
 
 class Facts:
     def __init__(self, d=None):
         d = d or {}
-        self.seq = d.get("seq", 0)          # entries seen
-        self.turn = d.get("turn", 0)        # seq of this turn's prompt
+        self.seq = d.get("seq", 0)              # entries seen
+        self.turn = d.get("turn", 0)            # seq of this turn's prompt
         self.prompts = d.get("prompts", 0)
-        self.edits = d.get("edits", [])     # [seq, absolute path]
-        self.marks = d.get("marks", {})     # what was read or run -> first seq
-        self.skills = d.get("skills", [])   # [seq, skill name]
-        self.turn_ts = ""                   # when this turn's prompt was sent (replay only)
+        self.edits = d.get("edits", [])         # [seq, absolute path]
+        self.marks = d.get("marks", {})         # what was read or run -> first seq
+        self.skills = d.get("skills", [])       # [seq, skill name]
+        self.last_verify = d.get("last_verify", 0)
+        self.last_reply = d.get("last_reply", "")
+        self.turn_ts = ""                       # when this turn's prompt was sent (replay only)
 
     def dump(self):
         return {"seq": self.seq, "turn": self.turn, "prompts": self.prompts, "edits": self.edits[-2000:],
-                "marks": self.marks, "skills": self.skills[-200:]}
+                "marks": self.marks, "skills": self.skills[-200:],
+                "last_verify": self.last_verify, "last_reply": self.last_reply[:32768]}
 
     def mark(self, name):
         self.marks.setdefault(name, self.seq)
@@ -313,6 +628,9 @@ class Facts:
                 self.turn = self.seq
                 self.turn_ts = ts[0] if ts else ""
                 self.prompts += 1
+                self.last_reply = ""
+            elif kind == "assistant" and text and not text.lstrip().startswith(MARK):
+                self.last_reply = text[:32768]
             elif kind == "tool_call":
                 self.call(who or "", text or "", cwd, P)
 
@@ -335,6 +653,15 @@ class Facts:
         # with its string escapes undone), not the JSON around them
         scan = "\n".join(v for v in args.values() if isinstance(v, str)) if args else text
         scan = scan.replace('\\"', '"').replace("\\'", "'").replace("\\n", "\n").replace("\\t", " ")
+        if name in SHELL_TOOLS or not name:
+            cmd_str = args.get("command") or args.get("cmd") or scan
+            if isinstance(cmd_str, str) and cmd_str.strip():
+                if VERIFY_CMD.search(cmd_str):
+                    self.last_verify = self.seq
+                elif not READONLY_CMD.match(cmd_str):
+                    turn_bases = {os.path.basename(p) for s, p in self.edits if s > self.turn}
+                    if any(b and b in cmd_str for b in turn_bases):
+                        self.last_verify = self.seq
         for tok in TOKEN.findall(scan):
             base = tok.rsplit("/", 1)[-1]
             if base not in READS:
@@ -437,6 +764,195 @@ def evaluate(P, tool, F, at=""):
     return found
 
 
+def evaluate_cls(reply, eff):
+    """Deterministic CLS (~80% ASD-STE100 + Diagram First) check on the turn's final assistant reply."""
+    if not eff.get("style-ste") or not reply or not reply.strip():
+        return []
+    text = reply[:65536]
+    found = []
+
+    def add(rule, hard, what, fix):
+        found.append({"rule": rule, "hard": hard, "new": True, "what": what, "fix": fix})
+
+    # 1. Opening conversational filler check (hard)
+    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    clean_first = re.sub(r"^[*_`>#\-\s]+", "", first_line)
+    if FILLER_RE.match(clean_first):
+        add("cls-filler", True, "CLS response opens with conversational filler",
+            "Remove the filler preamble and lead directly with the answer or diagram.")
+
+    # 2. Fenced ASCII diagram width check (hard, <=70 chars; skip language-tagged code blocks)
+    has_diagram = False
+    worst_width = 0
+    for m in re.finditer(r"^```([^\n]*)\n(.*?)^```", text, re.M | re.S):
+        lang = m.group(1).strip().split()[0].lower() if m.group(1).strip() else ""
+        if lang not in DIAGRAM_LANGS:
+            continue
+        block = m.group(2)
+        if DIAGRAM_RE.search(block):
+            has_diagram = True
+            for ln in block.splitlines():
+                w = len(ln.rstrip())
+                if w > worst_width:
+                    worst_width = w
+    if worst_width > 70:
+        add("cls-diagram-width", True, f"CLS ASCII diagram is {worst_width} chars wide (limit <=70)",
+            "Reflow the ASCII diagram so every line fits within 70 characters.")
+
+    # 3. Prose sentence length (~80% <=20 words; soft note when >35% exceed 24 words)
+    prose = re.sub(r"^```[^\n]*\n.*?^```", " ", text, flags=re.M | re.S)
+    prose = re.sub(r"`[^`\n]+`", "code", prose)
+    prose = re.sub(r"https?://\S+", "url", prose)
+    prose_lines = []
+    for ln in prose.splitlines():
+        s = ln.strip()
+        if not s or s.startswith(("#", "|", ">", "---", "===")) or SITREP_FOOTER_RE.match(s):
+            continue
+        s = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", s)
+        prose_lines.append(s)
+    joined = " ".join(prose_lines)
+    sents = [s.strip() for s in re.split(r"[.!?]+(?:\s+|$)", joined) if len(s.split()) >= 3]
+    if len(sents) >= 4:
+        long_n = sum(1 for s in sents if len(s.split()) > 24)
+        if long_n / len(sents) > 0.35:
+            add("cls-sentence-len", False,
+                f"CLS sentence length: {long_n}/{len(sents)} sentences exceed 24 words (aim <=20)",
+                "Shorten long prose sentences to <=20 words, active voice, one idea per sentence.")
+
+    # 4. Diagram First for long flow/architecture answers (soft note)
+    prose_words = len(joined.split())
+    step_count = len(re.findall(r"(?m)^\s*(?:\d+[.)]|#{2,4}\s)", prose))
+    if not has_diagram and prose_words >= 180 and (step_count >= 4 or FLOW_TOPIC_RE.search(joined)):
+        add("cls-diagram-missing", False,
+            "CLS Diagram First: long multi-step/architecture reply has no ASCII diagram",
+            "Lead flows, architecture, or multi-step answers with a compact ASCII diagram (<=70 chars wide).")
+    return found
+
+
+def _is_python_file(path):
+    if not path or not os.path.isfile(path):
+        return False
+    if path.endswith(".py"):
+        return True
+    if os.path.splitext(path)[1] == "":
+        try:
+            with open(path, "rb") as f:
+                first = f.readline(128)
+            return first.startswith(b"#!") and b"python" in first
+        except OSError:
+            return False
+    return False
+
+
+def _added_python_hunks(root, paths):
+    """Return {label: (file_lines, [added_0based_idx, ...])} for edited Python files (bounded)."""
+    py_paths = [p for p in paths if _is_python_file(p)][:20]
+    if not py_paths:
+        return {}
+    out = {}
+    rels = []
+    for p in py_paths:
+        rp = os.path.realpath(p)
+        if rp == root or rp.startswith(root + "/"):
+            rels.append((os.path.relpath(rp, root), rp))
+    diff_seen = set()
+    if rels and os.path.exists(os.path.join(root, ".git")):
+        try:
+            r = subprocess.run(["git", "-C", root, "diff", "--no-color", "-U0", "--"] + [rel for rel, _ in rels],
+                               capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and r.stdout:
+                cur, cur_line = None, 0
+                for ln in r.stdout[:204800].splitlines():
+                    if ln.startswith("+++ b/"):
+                        cur = ln[6:]
+                        diff_seen.add(cur)
+                        cur_line = 0
+                    elif cur and ln.startswith("@@ "):
+                        m = re.search(r"\+(\d+)", ln)
+                        cur_line = int(m.group(1)) if m else 0
+                    elif cur and ln.startswith("+") and not ln.startswith("+++") and cur_line > 0:
+                        out.setdefault(cur, []).append(cur_line - 1)
+                        cur_line += 1
+        except (OSError, subprocess.SubprocessError):
+            pass
+    result = {}
+    for rel, rp in rels:
+        try:
+            if os.path.getsize(rp) > 262144:
+                continue
+            with open(rp, encoding="utf-8", errors="replace") as f:
+                flines = [ln.rstrip("\r\n") for ln in f.readlines()[:10000]]
+        except OSError:
+            continue
+        if rel in out:
+            result[rel] = (flines, [i for i in out[rel] if 0 <= i < len(flines)])
+            continue
+        if rel in diff_seen:
+            continue
+        # Newly created / untracked Python file
+        try:
+            if os.path.exists(os.path.join(root, ".git")):
+                chk = subprocess.run(["git", "-C", root, "ls-files", "--error-unmatch", "--", rel],
+                                     capture_output=True, text=True, timeout=2)
+                if chk.returncode == 0:
+                    continue
+        except (OSError, subprocess.SubprocessError):
+            continue
+        result[rel] = (flines, list(range(min(len(flines), 500))))
+    return result
+
+
+def evaluate_sas(P, F, eff):
+    """Deterministic SAS (DO-178C-Lite) check when code files were edited in this turn."""
+    if not eff.get("code-do178c"):
+        return []
+    turn_code = [(s, p) for s, p in F.edits if s > F.turn and is_code_file(p)]
+    if not turn_code:
+        return []
+    found = []
+
+    def add(rule, hard, what, fix):
+        found.append({"rule": rule, "hard": hard, "new": True, "what": what, "fix": fix})
+
+    last_code_seq = max(s for s, _ in turn_code)
+    code_paths = sorted({p for _, p in turn_code})
+    labels = [P.rel(p) or os.path.basename(p) for p in code_paths]
+
+    # 1. Post-edit verification required (hard)
+    if F.last_verify <= last_code_seq:
+        add("sas-verify", True,
+            f"SAS unverified code edit: changed {short(labels)} with no test, build, or syntax check after the last edit",
+            "Run a test, syntax check, or verification command covering normal and boundary/failure paths before finishing.")
+
+    # 2. Diff audit on newly added Python lines: silent failures & unbounded calls (hard)
+    silent_files, unbounded_files = [], []
+    for label, (flines, added_idxs) in _added_python_hunks(P.root, code_paths).items():
+        for idx in added_idxs:
+            ln = flines[idx]
+            stripped = ln.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if BARE_EXCEPT_RE.match(ln) or BROAD_PASS_RE.match(ln):
+                if label not in silent_files:
+                    silent_files.append(label)
+            elif BROAD_HEAD_RE.match(ln) and idx + 1 < len(flines) and flines[idx + 1].strip() == "pass":
+                if label not in silent_files:
+                    silent_files.append(label)
+            if UNBOUNDED_CALL_RE.search(ln):
+                window = " ".join(flines[idx:min(idx + 6, len(flines))])
+                if "timeout=" not in window and label not in unbounded_files:
+                    unbounded_files.append(label)
+    if silent_files:
+        add("sas-silent-except", True,
+            f"SAS silent error handling (bare except: or broad except Exception: pass) added in {short(silent_files)}",
+            "Catch explicit exception types and handle or report errors instead of failing silently.")
+    if unbounded_files:
+        add("sas-unbounded", True,
+            f"SAS unbounded subprocess/network call (missing timeout=) added in {short(unbounded_files)}",
+            "Pass an explicit timeout= argument so calls stay deterministic and bounded.")
+    return found
+
+
 def recap(P, tool, F, found, sent):
     """The one line shown under each reply: the verdict, then what this turn did against the rules."""
     files = sorted({r for s, r in ((s, P.rel(p)) for s, p in F.edits if s > F.turn) if r})
@@ -464,6 +980,10 @@ def recap(P, tool, F, found, sent):
             parts.append(f"fix check done for {short(guarded, 2)}")
         if P.updates and any(P.rel(p) == P.updates for _, p in F.edits):
             parts.append(f"{P.updates} written")
+        if not P.is_tokenops and not any(f["rule"].startswith("sas-") for f in hard):
+            code_seqs = [s for s, p in F.edits if s > F.turn and is_code_file(p)]
+            if code_seqs and F.last_verify > max(code_seqs):
+                parts.append("verified")
     if notes:
         parts.append("note: " + "; ".join(notes))
     text = f"ACF rules {head} · " + " · ".join(parts)
@@ -475,9 +995,12 @@ def sends_back(found):
 
 
 def reason(P, tool, back, soft):
-    e = P.entry(tool)
-    lines = [f"{MARK} Before you finish: this turn broke rules of this project's own files"
-             f" ({os.path.join(P.root, e) if e else P.root}, _ai/INDEX.md):"]
+    if P.is_tokenops:
+        e = P.entry(tool)
+        lines = [f"{MARK} Before you finish: this turn broke rules of this project's own files"
+                 f" ({os.path.join(P.root, e) if e else P.root}, _ai/INDEX.md):"]
+    else:
+        lines = [f"{MARK} Before you finish: this turn broke ACF core standards (CLS / SAS):"]
     for i, f in enumerate(back, 1):
         lines.append(f"{i}. {f['what']}. {f['fix']}")
     if soft:
@@ -565,9 +1088,7 @@ def nudge(P, tool, st):
 
 
 def tmux_cmd():
-    exe = shutil.which("tmux") or next((p for p in (f"{HOME}/.local/bin/tmux", "/usr/bin/tmux", "/opt/homebrew/bin/tmux")
-                                        if os.path.exists(p)), "tmux")
-    return exe
+    return afc_state.find_tmux_bin()
 
 
 def ppid(pid):
@@ -620,6 +1141,24 @@ def show_in_pane(found):
         pass
 
 
+def mark_sent(tool, tags, m_msg, t_msg, pane_id=""):
+    """Leave on the pane what this prompt's text carried (pane option @acf_sent), for `afc-rules verify`."""
+    where = fleet_pane()
+    if pane_id:
+        cmd = where[0] if where else [tmux_cmd(), "-L", SOCK]
+        pane = pane_id
+    elif where:
+        cmd, pane = where
+    else:
+        return
+    extra = (["memory"] if m_msg else []) + (["rules"] if t_msg else [])
+    value = f"{int(time.time())} {tool} {','.join(tags + extra) or '-'}"
+    try:
+        subprocess.run(cmd + ["set", "-p", "-t", pane, SENT, value], capture_output=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def log_findings(P, tool, chat, found, sent):
     if not found:
         return
@@ -637,51 +1176,252 @@ def log_findings(P, tool, chat, found, sent):
         pass
 
 
+USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
+
+
+def _agy_transcript_last_user(data):
+    """Return (text, step_index) of the newest USER_INPUT in Antigravity's transcript.jsonl, or (None, None)."""
+    cid = str(data.get("conversationId") or "").strip()
+    if not cid or "/" in cid or "\\" in cid or ".." in cid:
+        return None, None
+    homes = []
+    for h in (os.environ.get("HOME"), HOME):
+        if h and h not in homes:
+            homes.append(h)
+    homes.extend(sorted(glob.glob(f"{HOME}/.agy-homes/*"))[:20])
+    rel = os.path.join(".gemini", "antigravity-cli", "brain", cid, ".system_generated", "logs", "transcript.jsonl")
+    for h in homes:
+        tp = os.path.join(h, rel)
+        if not os.path.isfile(tp):
+            continue
+        try:
+            size = os.path.getsize(tp)
+            with open(tp, "rb") as f:
+                if size > 262144:
+                    f.seek(size - 262144)
+                    f.readline()  # discard partial first line
+                tail = f.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        for raw_ln in reversed(tail[-120:]):
+            try:
+                rec = json.loads(raw_ln)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("type") == "USER_INPUT":
+                content = rec.get("content") or ""
+                m = USER_REQ_RE.search(content)
+                txt = m.group(1).strip() if m else content.strip()
+                return txt, rec.get("step_index")
+        return None, None
+    return None, None
+
+
+def _agy_latest_prompt_meta(data):
+    """Return (prompt_text, prompt_key) for Antigravity PreInvocation.
+
+    Pairs direct lastUserInput with the transcript's matching USER_INPUT step_index when available:
+    - Same turn across tool calls (growing initialNumSteps): same step_index -> deduped.
+    - New turn with identical text (e.g. '/collab status' twice): new step_index -> runs again.
+    """
+    import hashlib
+    direct = None
+    for field in ("lastUserInput", "prompt"):
+        val = data.get(field)
+        if isinstance(val, str) and val.strip():
+            direct = val
+            break
+    tx_txt, tx_step = _agy_transcript_last_user(data)
+    if direct is not None:
+        txt = direct.strip()
+        digest = hashlib.sha256(txt.encode("utf-8", "replace")).hexdigest()[:16]
+        if tx_step is not None and tx_txt == txt:
+            return direct, f"step:{tx_step}:{digest}"
+        return direct, f"direct:{digest}"
+    if tx_txt is not None:
+        digest = hashlib.sha256(tx_txt.encode("utf-8", "replace")).hexdigest()[:16]
+        return tx_txt, f"step:{tx_step}:{digest}"
+    return None, None
+
+
+def _agy_latest_prompt(data):
+    return _agy_latest_prompt_meta(data)[0]
+
+
+def collab_prompt(tool, data, cwd="", handled_key=None):
+    """(resolved pane_id, reply, context, pane_doc, pane_mod, prompt_key) from a single tmux list-panes snapshot."""
+    prompt_key = None
+    if tool == "agy":
+        prompt, prompt_key = _agy_latest_prompt_meta(data)
+        if prompt_key and prompt_key == handled_key:
+            prompt = None
+    else:
+        prompt = data.get("prompt")
+    try:
+        import collab as afc_collab
+        panes = afc_collab.list_panes()
+        pane_id = afc_collab.resolve_pane(tool=tool, cwd=cwd, panes=panes) or ""
+        me = afc_collab.find_pane(panes, pane_id) if pane_id else None
+        pane_doc = me.get("doctrine", "") if me else None
+        pane_mod = me.get("mental_model", "") if me else None
+        reply, ctx = afc_collab.prompt_hook(prompt, pane_id=pane_id, tool=tool, cwd=cwd, panes=panes)
+        return pane_id, reply, ctx, pane_doc, pane_mod, prompt_key
+    except (ImportError, OSError) as e:
+        sys.stderr.write(f"afc-rules: collab skipped: {e}\n")
+        return "", None, "", None, None, prompt_key
+
+
+def collab_stop(tool, cwd=""):
+    """Drain any unread collab.db inbox messages for this pane at turn end."""
+    try:
+        import collab as afc_collab
+        return afc_collab.stop_hook(tool=tool, cwd=cwd)
+    except (ImportError, OSError) as e:
+        sys.stderr.write(f"afc-rules: collab stop skipped: {e}\n")
+        return None
+
+
+def collab_answer(tool, reply):
+    """/collab or direct @peer send ran in the hook: stop the prompt there and show what was done."""
+    if tool in ("claude", "codex"):
+        return emit({"decision": "block", "reason": reply})
+    if tool == "gemini":
+        return emit({"decision": "deny", "reason": reply})
+    note = f"ACF collab already handled this prompt: {reply} Reply with exactly that line, nothing else."
+    if tool == "agy":
+        return emit({"injectSteps": [{"systemMessage": {"systemMessage": note}}]})
+    return emit({"additionalContext": note})
+
+
+AGENTS_BIN = os.path.join(HOME, ".local", "bin", "agents")
+
+
+CHAT_ID_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,80}\Z")
+
+
+def mark_tab(tool, event, data=None):
+    """Antigravity's tab signal: busy before each model call, done when its turn ends.
+
+    agy writes its chat file while idle too, so the fleet's watcher cannot tell; only this hook can.
+    agy runs inside its fleet pane, so TMUX and TMUX_PANE are that pane's. A failure skips the mark.
+    With busy it also notes the pane's own chat (@agy_chat): Shift+Tab to bypass restarts agy on it.
+    """
+    if tool != "agy" or not (os.environ.get("TMUX") and os.environ.get("TMUX_PANE")):
+        return
+    if not os.access(AGENTS_BIN, os.X_OK):
+        return
+    cid = str((data or {}).get("conversationId") or "")
+    try:
+        subprocess.run([AGENTS_BIN, "--mark", "busy" if event == "prompt" else "done"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        if event == "prompt" and CHAT_ID_RE.match(cid):
+            subprocess.run([tmux_cmd(), "set", "-p", "-t", os.environ["TMUX_PANE"], "@agy_chat", cid],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+    except (OSError, subprocess.SubprocessError) as e:
+        sys.stderr.write(f"afc-rules: tab mark skipped: {e}\n")
+
+
 def hook(tool, event):
     raw = sys.stdin.read()
-    if os.environ.get("AFC_RULES_SKIP") == "1" or os.environ.get("AFC_COUNCIL_CHILD") == "1":
-        return allow(tool)
     try:
         data = json.loads(raw) if raw.strip() else {}
     except ValueError:
         data = {}
-    if not isinstance(data, dict) or mode() == "off":
+    mark_tab(tool, event, data if isinstance(data, dict) else None)
+    if os.environ.get("AFC_RULES_SKIP") == "1" or os.environ.get("AFC_COUNCIL_CHILD") == "1":
+        return allow(tool)
+    if not isinstance(data, dict):
         return allow(tool)
     cwd = data.get("cwd") or next(iter(data.get("workspacePaths") or []), None) or os.getcwd()
-    root = find_root(cwd)
-    if not root:
+    root = find_root(cwd) if mode() != "off" else None
+    if event == "prompt":
+        key = state_key(tool, data)
+        st = load_state(key)
+        agy_turn = None
+        if tool == "agy":
+            # PreInvocation runs before every model call of a turn: run collab & mode nudges once per turn.
+            agy_turn = data.get("initialNumSteps")
+            if agy_turn is None and data.get("invocationNum") not in (None, 0, 1):
+                return allow(tool)
+            if agy_turn is not None and st.get("nudged") == agy_turn:
+                return allow(tool)
+        prev_pkey = st.get("collab_prompt_key") if tool == "agy" else None
+        c_pane, c_reply, c_msg, c_doc, c_mod, c_pkey = collab_prompt(tool, data, cwd=cwd, handled_key=prev_pkey)
+        if tool == "agy" and c_pkey:
+            st["collab_prompt_key"] = c_pkey
+        if c_reply:
+            if tool == "agy":
+                st["nudged"] = agy_turn
+                save_state(key, st)
+            return collab_answer(tool, c_reply)
+        eff = resolve_modes(cwd, pane_doc=c_doc, pane_mod=c_mod, pane_id=c_pane)
+        g_msg = guidance_nudge(cwd, eff)
+        t_msg = ""
+        m_msg = memory_nudge(cwd, st)
+        if root:
+            P = Project(root)
+            t_msg = nudge(P, tool, st)
+        combined = "\n".join(x for x in (t_msg, g_msg, m_msg, c_msg) if x)
+        if not combined:
+            if tool == "agy" and c_pkey and c_pkey != prev_pkey:
+                save_state(key, st)
+            return allow(tool)
+        if tool == "agy":
+            st["nudged"] = agy_turn
+            if m_msg:
+                st["mem_sent"] = True
+            save_state(key, st)
+            mark_sent(tool, mode_tags(eff), m_msg, t_msg, pane_id=c_pane)
+            return emit({"injectSteps": [{"systemMessage": {"systemMessage": combined}}]})
+        if m_msg:
+            st["mem_sent"] = True
+            save_state(key, st)
+        mark_sent(tool, mode_tags(eff), m_msg, t_msg, pane_id=c_pane)
+        if tool == "copilot":
+            # Copilot takes a top-level additionalContext; it ignores Claude's hookSpecificOutput
+            return emit({"additionalContext": combined})
+        name = "BeforeAgent" if tool == "gemini" else "UserPromptSubmit"
+        return emit({"hookSpecificOutput": {"hookEventName": name, "additionalContext": combined}})
+    eff = resolve_modes(cwd)
+    core_on = bool(eff.get("style-ste") or eff.get("code-do178c"))
+    if tool not in TOOLS:
         return allow(tool)
-    P = Project(root)
+    active = bool(data.get("stop_hook_active") or data.get("continuationActive"))
+    if tool == "agy" and data.get("terminationReason") not in (None, "", "NO_TOOL_CALL", "TERMINAL_STEP_TYPE"):
+        active = True       # cancelled, failed or out of budget: not the moment to send it back
+    if not root and not core_on:
+        inbox_msg = collab_stop(tool, cwd=cwd) if not active else None
+        if not inbox_msg:
+            return allow(tool)
+        if tool == "gemini":
+            return emit({"decision": "deny", "reason": inbox_msg})
+        if tool == "agy":
+            return emit({"decision": "continue", "reason": inbox_msg})
+        return emit({"decision": "block", "reason": inbox_msg})
+    P = Project(root) if root else PlainProject(project_key_for(cwd) or cwd)
     key = state_key(tool, data)
     st = load_state(key)
-    if event == "prompt":
-        if tool == "agy":
-            # PreInvocation comes before every model call of a turn: remind once, at the turn's first
-            # (initialNumSteps stays the same through a turn and grows with the next one)
-            turn = data.get("initialNumSteps")
-            if turn is None and data.get("invocationNum") not in (None, 0, 1):
-                return allow(tool)
-            if turn is not None and st.get("nudged") == turn:
-                return allow(tool)
-            st["nudged"] = turn
-            save_state(key, st)
-            return emit({"injectSteps": [{"systemMessage": {"systemMessage": nudge(P, tool, st)}}]})
-        name = "BeforeAgent" if tool == "gemini" else "UserPromptSubmit"
-        return emit({"hookSpecificOutput": {"hookEventName": name, "additionalContext": nudge(P, tool, st)}})
     # stop
     path = chat_file(tool, data)
     if not path:
-        return allow(tool)
+        inbox_msg = collab_stop(tool, cwd=cwd) if not active else None
+        if not inbox_msg:
+            return allow(tool)
+        if tool == "gemini":
+            return emit({"decision": "deny", "reason": inbox_msg})
+        if tool == "agy":
+            return emit({"decision": "continue", "reason": inbox_msg})
+        return emit({"decision": "block", "reason": inbox_msg})
     same = st.get("path") == path and tool in logs().APPEND and st.get("offset", 0) <= os.path.getsize(path)
     F = Facts(st.get("facts") if same else None)
     mem, end = read_chat(tool, path, st.get("offset", 0) if same else 0)
     F.feed(mem.entries, cwd, P)
-    found = evaluate(P, tool, F)
+    found = (evaluate(P, tool, F) if root else [])
+    if core_on and F.prompts:
+        found = found + evaluate_cls(F.last_reply, eff) + evaluate_sas(P, F, eff)
     back = sends_back(found)
-    active = bool(data.get("stop_hook_active") or data.get("continuationActive"))
-    if tool == "agy" and data.get("terminationReason") not in (None, "", "NO_TOOL_CALL", "TERMINAL_STEP_TYPE"):
-        active = True       # cancelled, failed or out of budget: not the moment to send it back
-    sent = back if (back and mode() == "enforce" and not active) else []
+    # `rules report` makes all checks non-blocking; `rules off` turns off TokenOps only, while active CLS/SAS still enforce
+    sent = back if (back and mode() != "report" and not active) else []
     # each finding is logged once per turn, however many times the turn ends
     done = set(st.get("logged") or []) if st.get("logged_turn") == F.turn else set()
     fresh = [f for f in found if f["new"] and f["rule"] + f["what"] not in done]
@@ -697,6 +1437,13 @@ def hook(tool, event):
     shown = {"systemMessage": recap(P, tool, F, found, sent)} \
         if setting("rules-recap", "on") != "off" and tool != "agy" and F.prompts else {}
     if not sent:
+        inbox_msg = collab_stop(tool, cwd=cwd) if not active else None
+        if inbox_msg:
+            if tool == "gemini":
+                return emit({"decision": "deny", "reason": inbox_msg, **shown})
+            if tool == "agy":
+                return emit({"decision": "continue", "reason": inbox_msg})
+            return emit({"decision": "block", "reason": inbox_msg, **shown})
         return emit(shown) if shown else allow(tool)
     text = reason(P, tool, sent, [f for f in found if not f["hard"]])
     if tool == "gemini":
@@ -709,23 +1456,26 @@ def hook(tool, event):
 # ---------------------------------------------------------------------------------------------
 # check, replay, show
 
-def check_chat(tool, path, cwd=None, since=""):
+def check_chat(tool, path, cwd=None, since="", include_plain=False):
     """(project, [(turn number, findings)]) for a whole chat, judged at the end of each turn as the
-    stop hook would have; None when the chat ran outside a TokenOps project. since: an ISO time;
-    turns whose prompt came before it are left out (a replay of chats from before TokenOps came
-    into the project would judge them by rules and fix records written later)."""
+    stop hook would have; None when outside TokenOps (unless include_plain=True and CLS/SAS are on)."""
     mem, _ = read_chat(tool, path, 0)
     cwd = cwd or mem.cwd or logs().src_cwd((tool, "", path, None))
     root = find_root(cwd)
-    if not root:
+    eff = resolve_modes(cwd or os.getcwd())
+    core_on = include_plain and (eff.get("style-ste") or eff.get("code-do178c"))
+    if not root and not core_on:
         return None
-    P = Project(root)
+    P = Project(root) if root else PlainProject(project_key_for(cwd) or cwd or os.getcwd())
     F = Facts()
     turns = []
 
     def judge():
         if not since or (F.turn_ts and F.turn_ts >= since):
-            turns.append((F.prompts, evaluate(P, tool, F, F.turn_ts if since else "")))
+            res = evaluate(P, tool, F, F.turn_ts if since else "") if root else []
+            if include_plain and core_on:
+                res = res + evaluate_cls(F.last_reply, eff) + evaluate_sas(P, F, eff)
+            turns.append((F.prompts, res))
     F.feed(mem.entries, cwd, P, on_turn=judge)
     if F.prompts:
         judge()
@@ -748,9 +1498,9 @@ def cmd_check(args):
         print("usage: afc-rules check <claude|codex|gemini|agy> <chat file> [--cwd DIR]", file=sys.stderr)
         return 2
     cwd = args[args.index("--cwd") + 1] if "--cwd" in args else None
-    r = check_chat(args[0], args[1], cwd)
+    r = check_chat(args[0], args[1], cwd, include_plain=True)
     if r is None:
-        print("not in a TokenOps project: nothing to check")
+        print("not in a TokenOps project and CLS/SAS are off: nothing to check")
         return 0
     P, turns = r
     print(f"{args[0]} chat in {P.root}: {len(turns)} turns, {sum(1 for _, f in turns if sends_back(f))} would be sent back")
@@ -1003,6 +1753,68 @@ def codex_block():
                       f'command = "{cmd("codex", "stop")}"', "timeout = 30", CODEX_END, ""])
 
 
+def _unique_paths(candidates):
+    """Deduplicate config paths by realpath so symlinked account copies are handled once."""
+    seen = set()
+    out = []
+    for p in candidates:
+        real = os.path.realpath(p)
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(p)
+    return out
+
+
+def _gemini_settings_paths():
+    cands = [f"{HOME}/.gemini/settings.json"]
+    cands.extend(sorted(glob.glob(f"{HOME}/.gemini-homes/*/.gemini/settings.json")))
+    return _unique_paths([p for p in cands if os.path.exists(p)] or ([cands[0]] if shutil.which("gemini") else []))
+
+
+def _agy_hooks_paths():
+    cands = [f"{HOME}/.gemini/config/hooks.json"]
+    cands.extend(sorted(glob.glob(f"{HOME}/.agy-homes/*/.gemini/config/hooks.json")))
+    existing = [p for p in cands if os.path.exists(p) or os.path.isdir(os.path.dirname(p))]
+    return _unique_paths(existing or ([cands[0]] if shutil.which("agy") else []))
+
+
+def copilot_hook_path():
+    """Copilot runs the hooks of every *.json in ~/.copilot/hooks/ (user level: every folder)."""
+    return f"{HOME}/.copilot/hooks/afc-rules.json"
+
+
+def copilot_hooked():
+    try:
+        d = json_file(copilot_hook_path())
+    except (OSError, ValueError):
+        return False
+    hooks = (d.get("hooks") or {}).get("UserPromptSubmit") if isinstance(d, dict) else None
+    return any(isinstance(h, dict) and "afc-rules hook copilot" in str(h.get("bash") or h.get("command") or "")
+               for h in (hooks if isinstance(hooks, list) else []))
+
+
+def install_copilot(remove, dry, say):
+    """Copilot: the prompt hook only, under Claude's event name (so it gets Claude's field names)."""
+    p = copilot_hook_path()
+    if not (os.path.isdir(os.path.dirname(os.path.dirname(p))) or shutil.which("copilot")):
+        return
+    there = os.path.exists(p)
+    if remove:
+        if there:
+            say(f"remove {p}")
+            if not dry:
+                os.remove(p)
+        else:
+            print(f"Copilot: {p} is not there")
+    elif copilot_hooked():
+        print(f"Copilot: {p} already has the hook")
+    else:
+        say(f"add the UserPromptSubmit hook in {p}")
+        write_json(p, {"version": 1, "hooks": {"UserPromptSubmit": [
+            {"type": "command", "bash": cmd("copilot", "prompt"), "timeoutSec": 10}]}}, dry)
+
+
 def cmd_install(args):
     dry, remove = "--dry-run" in args, "--remove" in args
     say = (lambda m: print(("would " if dry else "") + m))
@@ -1023,9 +1835,8 @@ def cmd_install(args):
             write_json(p, d, dry)
         else:
             print(f"Claude: {p} already {'has no' if remove else 'has the'} hooks")
-    # Gemini: ~/.gemini/settings.json (linked into the other accounts' homes)
-    p = f"{HOME}/.gemini/settings.json"
-    if os.path.exists(p) or shutil.which("gemini"):
+    # Gemini: ~/.gemini/settings.json + any separate account homes in ~/.gemini-homes/*
+    for p in _gemini_settings_paths():
         d = json_file(p); hooks = d.setdefault("hooks", {}); changed = False
         for ev, what, t in (("BeforeAgent", "prompt", 10000), ("AfterAgent", "stop", 30000)):
             if remove:
@@ -1040,9 +1851,8 @@ def cmd_install(args):
             write_json(p, d, dry)
         else:
             print(f"Gemini: {p} already {'has no' if remove else 'has the'} hooks")
-    # Antigravity: ~/.gemini/config/hooks.json (every account's .gemini/config is a link to it)
-    p = f"{HOME}/.gemini/config/hooks.json"
-    if os.path.isdir(f"{HOME}/.gemini/config") or shutil.which("agy"):
+    # Antigravity: ~/.gemini/config/hooks.json + any separate account homes in ~/.agy-homes/*
+    for p in _agy_hooks_paths():
         d = json_file(p)
         if remove:
             if "acf-rules" in d:
@@ -1056,6 +1866,7 @@ def cmd_install(args):
             write_json(p, d, dry)
         else:
             print(f"Antigravity: {p} already has the hook acf-rules")
+    install_copilot(remove, dry, say)
     # Codex: ~/.codex/config.toml (linked into the other accounts' homes)
     p = f"{HOME}/.codex/config.toml"
     if os.path.exists(p):
@@ -1091,14 +1902,22 @@ def cmd_install(args):
 
 def cmd_doctor(_args):
     bad = 0
-    print(f"Mode: {mode()} (rules in ~/.config/agents/settings: off, report, enforce)")
+    ste = "on" if setting("style-ste", "on") != "off" else "off"
+    do178c = "on" if setting("code-do178c", "on") != "off" else "off"
+    core_gate = "report" if mode() == "report" else "enforce"
+    print(f"TokenOps mode: {mode()} (rules in ~/.config/agents/settings: off, report, enforce)")
+    print(f"Core CLS (style-ste): {ste} ({core_gate}) | Core SAS (code-do178c): {do178c} ({core_gate})")
     checks = [
         ("Claude", f"{HOME}/.claude/settings.json", lambda d: has_cmd((d.get("hooks") or {}).get("UserPromptSubmit"), "afc-rules hook")
          and has_cmd((d.get("hooks") or {}).get("Stop"), "afc-rules hook")),
-        ("Gemini", f"{HOME}/.gemini/settings.json", lambda d: has_cmd((d.get("hooks") or {}).get("BeforeAgent"), "afc-rules hook")
-         and has_cmd((d.get("hooks") or {}).get("AfterAgent"), "afc-rules hook")),
-        ("Antigravity", f"{HOME}/.gemini/config/hooks.json", lambda d: "acf-rules" in d),
     ]
+    gem_fn = lambda d: has_cmd((d.get("hooks") or {}).get("BeforeAgent"), "afc-rules hook") \
+        and has_cmd((d.get("hooks") or {}).get("AfterAgent"), "afc-rules hook")
+    for p in (_gemini_settings_paths() or [f"{HOME}/.gemini/settings.json"]):
+        checks.append(("Gemini", p, gem_fn))
+    agy_fn = lambda d: "acf-rules" in d
+    for p in (_agy_hooks_paths() or [f"{HOME}/.gemini/config/hooks.json"]):
+        checks.append(("Antigravity", p, agy_fn))
     for name, p, ok in checks:
         try:
             good = ok(json_file(p))
@@ -1113,6 +1932,12 @@ def cmd_doctor(_args):
         good = False
     print(f"  {'ok' if good else '!!':4}  Codex: {'hooks in' if good else 'no hooks in'} {p}" + ("  (trust them once with /hooks in Codex)" if good else ""))
     bad += not good
+    if os.path.isdir(f"{HOME}/.copilot") or shutil.which("copilot"):
+        good = copilot_hooked()
+        print(f"  {'ok' if good else '!!':4}  Copilot: {'prompt hook in' if good else 'no prompt hook in'} {copilot_hook_path()}")
+        bad += not good
+    if shutil.which("opencode"):
+        print("  note  OpenCode: no hook here, so the modes and rules never reach it")
     if bad:
         print("        afc-rules install adds what is missing")
     print("Global instruction files (they load on top of every project's own)")
@@ -1140,6 +1965,271 @@ def cmd_doctor(_args):
     return 1 if bad else 0
 
 
+def hooked_tools():
+    """Which agents have the afc-rules prompt hook in their settings (what `afc-rules doctor` checks)."""
+    def has(path, test):
+        try:
+            d = json_file(path)
+            return isinstance(d, dict) and bool(test(d))
+        except (OSError, ValueError, AttributeError):
+            return False
+    try:
+        with open(f"{HOME}/.codex/config.toml", encoding="utf-8") as f:
+            codex = CODEX_BEGIN in f.read()
+    except OSError:
+        codex = False
+    return {
+        "claude": has(f"{HOME}/.claude/settings.json", lambda d: has_cmd((d.get("hooks") or {}).get("UserPromptSubmit"), "afc-rules hook")),
+        "gemini": any(has(p, lambda d: has_cmd((d.get("hooks") or {}).get("BeforeAgent"), "afc-rules hook")) for p in _gemini_settings_paths()),
+        "agy": any(has(p, lambda d: "acf-rules" in d) for p in _agy_hooks_paths()),
+        "codex": codex,
+        "copilot": copilot_hooked(),
+        "opencode": False,
+    }
+
+
+def process_table():
+    """({pid: [child pids]}, {pid: command line}) of every process, from one ps call."""
+    kids, argv = {}, {}
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return kids, argv
+    for line in out.splitlines():
+        f = line.split(None, 2)
+        if len(f) >= 2:
+            kids.setdefault(f[1], []).append(f[0])
+            argv[f[0]] = f[2] if len(f) > 2 else ""
+    return kids, argv
+
+
+def pane_agent(pid, kids, argv):
+    """The agent running under a pane's shell (nearest first), or "": "node .../copilot" counts as copilot."""
+    todo, seen = [str(pid)], set()
+    while todo and len(seen) < 256:
+        p = todo.pop(0)
+        if p in seen:
+            continue
+        seen.add(p)
+        for word in argv.get(p, "").split()[:2]:
+            name = os.path.basename(word)
+            name = name[:-3] if name.endswith(".js") else name
+            if name in AGENT_NAMES:
+                return name
+        todo.extend(kids.get(p, []))
+    return ""
+
+
+def judge(agent, wired, want, sent):
+    """(verdict line, 1 if broken) for one pane: what it should get against its @acf_sent receipt."""
+    if not wired:
+        fix = "OpenCode has no hook for this yet" if agent == "opencode" else "afc-rules install adds it, then restart this agent"
+        return f"✗ gets nothing: {agent} has no afc-rules prompt hook ({fix})", 1
+    if not want:
+        return "– nothing to send: every mode is off here", 0
+    parts = sent.split(" ", 2)
+    if len(parts) < 3 or parts[1] != agent or not parts[0].isdigit():
+        hint = "Codex: trust the hooks once with /hooks" if agent == "codex" else "still nothing after that: restart this agent"
+        return f"? no prompt seen since the hook could mark it: send one prompt here, then verify again ({hint})", 0
+    when = time.strftime("%H:%M", time.localtime(int(parts[0])))
+    sent_tags = parts[2].split(",")
+    got = [t for t in sent_tags if t not in ("memory", "rules", "-")]
+    extra = [t for t in sent_tags if t in ("memory", "rules")]
+    more = f" (+ {', '.join(extra)})" if extra else ""
+    if got == want:
+        return f"✓ last prompt ({when}) got: {' '.join(got)}{more}", 0
+    return f"△ last prompt ({when}) got: {' '.join(got) or 'nothing'}{more}; the settings changed since, so the next prompt gets the line above", 0
+
+
+def cmd_verify(_args):
+    """Each fleet pane: its agent, the modes its prompts should carry, and what its last prompt carried."""
+    fmt = "\t".join(("#{pane_id}", "#{pane_pid}", "#{pane_current_path}", "#{@doctrine}", "#{@mental_model}",
+                     "#{" + SENT + "}", "#{window_name}"))
+    try:
+        r = subprocess.run([tmux_cmd(), "-L", SOCK, "list-panes", "-a", "-F", fmt], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        r = None
+    if r is None or r.returncode != 0:
+        print("The fleet is not running: no pane to check.")
+        return 1
+    kids, argv = process_table()
+    wired = hooked_tools()
+    bad = 0
+    for line in r.stdout.splitlines():
+        f = line.split("\t")
+        if len(f) < 7:
+            continue
+        pane, pid, cwd, pdoc, pmod, sent, win = f[:7]
+        agent = pane_agent(pid, kids, argv)
+        print(f"{pane}  {win}: {agent or 'no agent'}")
+        if not agent:
+            continue
+        want = mode_tags(resolve_modes(cwd, pane_doc=pdoc, pane_mod=pmod))
+        verdict, broken = judge(agent, wired.get(agent, False), want, sent)
+        print(f"      should get: {' '.join(want) or 'nothing'}")
+        print(f"      {verdict}")
+        bad += broken
+    print("✓ = the hook ran in that pane and sent exactly those modes with the prompt. memory goes once per chat.")
+    return 1 if bad else 0
+
+
+def save_setting(key, value):
+    afc_state.save_setting(key, value)
+
+
+def save_project_mode(proj_key, field, value):
+    afc_state.save_project_mode(proj_key, field, value)
+
+
+def set_pane_mode(pane_id, field, value):
+    where = fleet_pane()
+    cmd = where[0] if where else [tmux_cmd(), "-L", SOCK]
+    pane = pane_id or (where[1] if where else os.environ.get("TMUX_PANE", ""))
+    return afc_state.write_pane_mode(cmd, pane, field, value)
+
+
+def cmd_modes(args):
+    """Show, switch, turn off, or delete Doctrine, Mental Model, STE-Lite, DO-178C-Lite, Hygiene & Memory modes.
+
+    Usage:
+      afc-rules mode [--pane [ID]]                               show effective modes here
+      afc-rules mode [--pane [ID]|--project|--global] doctrine <mdmp|f3ead|ooda|off|inherit|delete>
+      afc-rules mode [--pane [ID]|--project|--global] model <ooda|first-principles|six-hats|80-20|rca|occam|5x5|off|inherit|delete>
+      afc-rules mode ste <on|off>                                toggle ~80% ASD-STE100 + diagrams
+      afc-rules mode do178c <on|off>                             toggle DO-178C-Lite coding discipline
+      afc-rules mode hygiene <on|off>                            toggle Search Hygiene (Grep + capped rg + Rule of 3)
+      afc-rules mode summary <on|off>                            toggle Hybrid Memory (<=50-line SUMMARY.md turn-1 pickup)
+      afc-rules mode sitrep <on|off>                             toggle You: + SITREP · D/M reply footer
+      afc-rules mode off [doctrine|model|ste|do178c|hygiene|summary|sitrep] [--pane [ID]|--project|--global|--all]
+      afc-rules mode delete [doctrine|model] [--pane [ID]|--project|--global|--all]
+    """
+    cwd = os.getcwd()
+    scope = None
+    pane_id = ""
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--cwd" and i + 1 < len(args):
+            cwd = args[i + 1]; i += 2; continue
+        if a == "--pane":
+            scope = "pane"
+            if i + 1 < len(args) and args[i + 1].startswith("%"):
+                pane_id = args[i + 1]; i += 2; continue
+            i += 1; continue
+        if a == "--project":
+            scope = "project"; i += 1; continue
+        if a == "--global":
+            scope = "global"; i += 1; continue
+        if a == "--all":
+            scope = "all"; i += 1; continue
+        rest.append(a); i += 1
+
+    pkey = project_key_for(cwd)
+    if not rest or rest[0] in ("show", "status"):
+        pd, pm_v = pane_mode_overrides(pane_id)
+        eff = resolve_modes(cwd, pane_doc=pd, pane_mod=pm_v)
+        pm = load_project_modes().get(pkey) if pkey else {}
+        print(f"Project:        {eff['project'] or '(none)'}")
+        print(f"Doctrine:       {eff['doctrine']}  (pane={pd or 'inherit'}, project={(pm or {}).get('doctrine', 'inherit')}, global={setting('doctrine', 'off')})")
+        print(f"Mental model:   {eff['mental-model']}  (pane={pm_v or 'inherit'}, project={(pm or {}).get('mental-model', 'inherit')}, global={setting('mental-model', 'off')})")
+        print(f"STE-Lite:       {'on' if eff['style-ste'] else 'off'}")
+        print(f"DO-178C-Lite:   {'on' if eff['code-do178c'] else 'off'}")
+        print(f"Search hygiene: {'on' if eff['search-hygiene'] else 'off'}")
+        print(f"Memory summary: {'on' if eff['memory-summary'] else 'off'}")
+        print(f"SITREP footer:  {'on' if eff['sitrep'] else 'off'}")
+        return 0
+
+    action = rest[0].lower()
+    toggle_map = {
+        "ste": "style-ste", "style-ste": "style-ste",
+        "do178c": "code-do178c", "code-do178c": "code-do178c",
+        "hygiene": "search-hygiene", "search-hygiene": "search-hygiene", "search": "search-hygiene",
+        "summary": "memory-summary", "memory-summary": "memory-summary", "memory": "memory-summary",
+        "sitrep": "sitrep",
+    }
+    if action in toggle_map:
+        skey = toggle_map[action]
+        val = rest[1].lower() if len(rest) > 1 else ""
+        if val not in ("on", "off"):
+            print(f"usage: afc-rules mode {action} <on|off>", file=sys.stderr); return 2
+        save_setting(skey, val)
+        print(f"{skey} = {val}")
+        return 0
+    if action in ("doctrine", "model", "mental-model"):
+        field = "doctrine" if action == "doctrine" else "mental-model"
+        allowed = set(DOCTRINE_PROMPTS) if field == "doctrine" else set(MENTAL_MODEL_PROMPTS)
+        val = rest[1].lower() if len(rest) > 1 else ""
+        if val in ("delete", "clear", "reset", "none"):
+            val = "inherit" if scope != "global" else "off"
+        if val not in allowed and val not in ("off", "inherit"):
+            print(f"unknown {field}: {val} (valid: {', '.join(sorted(allowed))}, off, inherit, delete)", file=sys.stderr); return 2
+        use_scope = scope or "project"
+        if use_scope == "pane":
+            if not set_pane_mode(pane_id, field, val):
+                print("no tmux pane found (pass --pane %id or run inside tmux)", file=sys.stderr); return 1
+            print(f"pane {pane_id or 'current'} {field} = {val}")
+        elif use_scope == "global":
+            gval = "off" if val == "inherit" else val
+            save_setting(field, gval)
+            print(f"global {field} = {gval}")
+        else:
+            save_project_mode(pkey, field, val)
+            print(f"project {os.path.basename(pkey) or pkey} {field} = {val}")
+        return 0
+    if action in ("off", "delete", "clear", "remove"):
+        is_del = action in ("delete", "clear", "remove")
+        target = rest[1].lower() if len(rest) > 1 else "all"
+        if target in toggle_map:
+            skey = toggle_map[target]
+            save_setting(skey, "off")
+            print(f"{skey} = off")
+            return 0
+        if target == "doctrine":
+            fields = ("doctrine",)
+        elif target in ("model", "mental-model"):
+            fields = ("mental-model",)
+        elif target in ("all", "modes", "both"):
+            fields = ("doctrine", "mental-model")
+        else:
+            print(f"unknown target: {target} (valid: doctrine, model, ste, do178c, hygiene, summary, sitrep, all)", file=sys.stderr); return 2
+
+        val = "inherit" if is_del else "off"
+        if scope == "pane":
+            ok = all(set_pane_mode(pane_id, f, val) for f in fields)
+            if not ok:
+                print("no tmux pane found (pass --pane %id or run inside tmux)", file=sys.stderr); return 1
+            scope_lbl = "pane"
+        elif scope == "project":
+            for f in fields:
+                save_project_mode(pkey, f, val)
+            scope_lbl = "project"
+        elif scope == "global":
+            for f in fields:
+                save_setting(f, "off")
+            scope_lbl = "global"
+        elif scope == "all":
+            for f in fields:
+                set_pane_mode(pane_id, f, val)
+                save_project_mode(pkey, f, val)
+                save_setting(f, "off")
+            if target in ("all", "modes", "both"):
+                for skey in ("style-ste", "code-do178c", "search-hygiene", "memory-summary", "sitrep"):
+                    save_setting(skey, "off")
+            scope_lbl = "all"
+        else:
+            # Default (no explicit scope): clear any current-pane override too so off/delete takes immediate effect here
+            for f in fields:
+                set_pane_mode(pane_id, f, "inherit")
+                save_project_mode(pkey, f, val)
+            scope_lbl = "pane+project"
+        what = "/".join(fields)
+        print(f"{'deleted/cleared' if is_del else 'turned off'} {what} ({scope_lbl})")
+        return 0
+    print(cmd_modes.__doc__.strip(), file=sys.stderr)
+    return 2
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
@@ -1147,7 +2237,7 @@ def main(argv):
     if argv[0] == "hook":
         tool = argv[1] if len(argv) > 1 else ""
         event = argv[2] if len(argv) > 2 else ""
-        if tool not in TOOLS or event not in ("prompt", "stop"):
+        if tool not in HOOK_TOOLS or event not in ("prompt", "stop"):
             return 0
         # a hook must never break or hold up a turn: any failure, or 20 seconds, and the turn goes on
         def too_long(*_):
@@ -1162,11 +2252,11 @@ def main(argv):
             try:
                 sys.stderr.write(f"afc-rules: {type(e).__name__}: {e}\n")
                 allow(tool)
-            except Exception:
+            except (OSError, ValueError):
                 pass
         return 0
     commands = {"check": cmd_check, "replay": cmd_replay, "show": cmd_show, "install": cmd_install, "doctor": cmd_doctor,
-                "memory": cmd_memory}
+                "memory": cmd_memory, "modes": cmd_modes, "mode": cmd_modes, "verify": cmd_verify}
     if argv[0] not in commands:
         print(f"afc-rules: unknown command {argv[0]} (afc-rules --help)", file=sys.stderr)
         return 2

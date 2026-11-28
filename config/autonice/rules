@@ -40,8 +40,8 @@
 # Only background work is gated; anything running in a terminal is left alone.
 # Wait politely instead of being paused:  jobq <command>    (jobq -c dev ...)
 # See who holds what:                      jobq --status
-slots heavy 2
-slots dev   3
+slots heavy 1
+slots dev   2
 
 # tests, e2e, builds, headless browsers
 gate heavy  ^[^ ]*node( -[^ ]+)* --test( |$)
@@ -64,7 +64,7 @@ gate dev    ^[^ ]*node( -[^ ]+)* [^ ]*/vite(\.js)?( (dev|serve)( |$)| --|$)
 #                         after a file change. A server at rest uses none.
 #                         Servers started in a terminal are watched too.
 # Remove the line to turn it off.  See the clocks:  autonice --status
-idle dev 3h
+idle dev 30m
 
 # --- Duplicate stop: one dev server per project folder ---
 #   single <class> <time> [port]   a second job of that gate class started in a

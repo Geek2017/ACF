@@ -21,14 +21,14 @@ done
 
 T=$(mktemp -d /tmp/acf-rules-test.XXXXXX)
 (( KEEP )) || trap 'rm -rf "$T"' EXIT
-export HOME="$T/home" AFC_RULES_STATE="$T/state" AGENTS_SETTINGS="$T/settings" AGENTS_SOCK="acfrules-none-$$"
+export HOME="$T/home" AFC_RULES_STATE="$T/state" AGENTS_SETTINGS="$T/settings" AGENTS_PROJECT_MODES="$T/project-modes.json" AGENTS_SOCK="acfrules-none-$$"
 unset TMUX TMUX_PANE CLAUDE_CONFIG_DIR CODEX_HOME GEMINI_CLI_HOME
 mkdir -p "$HOME" "$AFC_RULES_STATE"
 pass=0; fail=0
 ok()  { pass=$((pass + 1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2" | head -c 600; }
 nodec() { [[ "$1" != *'"decision"'* ]]; }
-setmode() { printf 'rules %s\n' "$1" > "$AGENTS_SETTINGS"; }
+setmode() { printf 'rules %s\nstyle-ste off\ncode-do178c off\n' "$1" > "$AGENTS_SETTINGS"; }
 rules() { python3 -I "$RULES" "$@"; }
 hook() { local tool=$1 ev=$2 json=$3; printf '%s' "$json" | python3 -I "$RULES" hook "$tool" "$ev" 2>"$T/err"; }
 
@@ -108,7 +108,7 @@ out=$(hook claude stop "{\"session_id\":\"c2\",\"transcript_path\":\"$CL2\",\"cw
 nodec "$out" && ok "Claude: check-fixes.py --path before the edit: let through" || bad "blocked although checked" "$out"
 msg=$(j '["systemMessage"]' "$out")
 [[ "$msg" == "ACF rules △ · 1 file changed · index loaded by CLAUDE.md · fix check done for src/app.js · note: work not yet in _ai/UPDATES.md" ]] && ok "the recap under the reply: the verdict, what changed, index, fix check, notes" || bad "recap wording" "$msg"
-printf 'rules enforce\nrules-recap off\n' > "$AGENTS_SETTINGS"
+printf 'rules enforce\nrules-recap off\nstyle-ste off\ncode-do178c off\n' > "$AGENTS_SETTINGS"
 out=$(hook claude stop "{\"session_id\":\"c2b\",\"transcript_path\":\"$CL2\",\"cwd\":\"$P\",\"stop_hook_active\":false}")
 [[ -z "$out" ]] && ok "rules-recap off: no recap line" || bad "recap shown although off" "$out"
 setmode enforce
@@ -151,6 +151,30 @@ out2=$(hook agy prompt "{\"conversationId\":\"a1\",\"cwd\":\"$P\",\"initialNumSt
 out3=$(hook agy prompt "{\"conversationId\":\"a1\",\"cwd\":\"$P\",\"initialNumSteps\":9,\"invocationNum\":1}")
 if [[ "$out" == *injectSteps*"[ACF rules]"* && "$out2" == "{}" && "$out3" == *injectSteps* ]]; then ok "Antigravity: one reminder per turn, not one per model call"
 else bad "agy reminder" "1=$out 2=$out2 3=$out3"; fi
+
+echo "Antigravity's tab signal (agy's chat file is written while idle too, so the hook marks the tab)"
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/sh\necho "$* $TMUX_PANE" >> "%s/marks"\n' "$T" > "$HOME/.local/bin/agents"; chmod +x "$HOME/.local/bin/agents"
+mkdir -p "$T/fakebin"; printf '#!/bin/sh\ncase "$*" in *@agy_chat*) echo "tmux $*" >> "%s/marks" ;; esac\n' "$T" > "$T/fakebin/tmux"; chmod +x "$T/fakebin/tmux"
+PATH="$T/fakebin:$PATH" TMUX="/tmp/x,1,0" TMUX_PANE=%7 hook agy prompt "{\"conversationId\":\"m1\",\"cwd\":\"$P\",\"initialNumSteps\":1,\"invocationNum\":1}" >/dev/null
+PATH="$T/fakebin:$PATH" TMUX="/tmp/x,1,0" TMUX_PANE=%7 hook agy stop "{\"conversationId\":\"m1\",\"cwd\":\"$P\",\"continuationActive\":false}" >/dev/null
+[[ "$(cat "$T/marks" 2>/dev/null)" == $'--mark busy %7\ntmux set -p -t %7 @agy_chat m1\n--mark done %7' ]] \
+  && ok "agy: busy before a model call (and its chat noted on the pane), done at the end of the turn" || bad "agy marks" "$(cat "$T/marks" 2>/dev/null)"
+rm -f "$T/marks"
+PATH="$T/fakebin:$PATH" TMUX="/tmp/x,1,0" TMUX_PANE=%7 hook agy prompt '{"conversationId":"../x;rm","initialNumSteps":1}' >/dev/null
+[[ "$(cat "$T/marks" 2>/dev/null)" == "--mark busy %7" ]] && ok "agy: a malformed chat id is not written to the pane" || bad "agy chat id check" "$(cat "$T/marks" 2>/dev/null)"
+rm -f "$T/marks"
+TMUX="/tmp/x,1,0" TMUX_PANE=%7 AFC_RULES_SKIP=1 hook agy prompt '{}' >/dev/null
+[[ "$(cat "$T/marks" 2>/dev/null)" == "--mark busy %7" ]] && ok "agy: the tab is marked even with the rules hook turned off" || bad "agy mark when skipped" "$(cat "$T/marks" 2>/dev/null)"
+rm -f "$T/marks"
+hook agy prompt '{}' >/dev/null
+TMUX="/tmp/x,1,0" TMUX_PANE=%7 hook claude prompt "{\"session_id\":\"m2\",\"cwd\":\"$P\",\"prompt\":\"hi\"}" >/dev/null
+[[ ! -e "$T/marks" ]] && ok "no mark outside tmux, and none for Claude (its own hooks mark it)" || bad "stray mark" "$(cat "$T/marks")"
+printf '#!/bin/sh\nsleep 9\n' > "$HOME/.local/bin/agents"
+s=$EPOCHSECONDS; out=$(TMUX="/tmp/x,1,0" TMUX_PANE=%7 hook agy prompt "{\"conversationId\":\"m3\",\"cwd\":\"$P\",\"initialNumSteps\":1,\"invocationNum\":1}")
+(( EPOCHSECONDS - s < 8 )) && [[ "$out" == *injectSteps* && "$(cat "$T/err")" == *"tab mark skipped"* ]] \
+  && ok "a hung mark times out after 5 s, says so, and the reminder still goes" || bad "agy mark timeout" "$((EPOCHSECONDS - s))s $out $(cat "$T/err")"
+rm -f "$HOME/.local/bin/agents"
 
 echo "Where it does nothing"
 out=$(hook claude prompt "{\"session_id\":\"n1\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
@@ -218,6 +242,296 @@ jq -e --arg d "$(readlink -f "$P")/_ai/memory" '.autoMemoryDirectory == $d and .
   && ok "memory: autoMemoryDirectory (absolute) set in .claude/settings.local.json; its other settings stay" || bad "settings.local.json" "$(cat "$P/.claude/settings.local.json")"
 out=$(rules memory "$P" 2>&1)
 [[ "$out" == *"already in the project"* ]] && ok "memory again: nothing to do" || bad "memory second run" "$out"
+
+echo "modes (Doctrine, Mental Model, STE-Lite, DO-178C-Lite, Search Hygiene, Memory Summary, SITREP)"
+rm -f "$AGENTS_SETTINGS"
+out=$(rules mode --cwd "$N" 2>&1)
+[[ "$out" == *"Doctrine:"*"off"* && "$out" == *"Mental model:"*"off"* && "$out" == *"STE-Lite:"*"on"* && "$out" == *"DO-178C-Lite:"*"on"* && "$out" == *"Search hygiene:"*"off"* && "$out" == *"Memory summary:"*"off"* && "$out" == *"SITREP footer:"*"off"* ]] \
+  && ok "afc-rules mode defaults CLS (STE-Lite) and SAS (DO-178C-Lite) ON and the other 5 modes OFF" || bad "mode default status" "$out"
+
+rules mode --global doctrine mdmp >/dev/null
+rules mode --global model rca >/dev/null
+rules mode ste on >/dev/null
+rules mode do178c on >/dev/null
+rules mode hygiene on >/dev/null
+out=$(hook claude prompt "{\"session_id\":\"m1\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+ctx=$(j '["hookSpecificOutput"]["additionalContext"]' "$out")
+if [[ "$ctx" == *"[ACF mode]"* && "$ctx" == *"Doctrine [MDMP]"* && "$ctx" == *"Root Cause Analysis"* && "$ctx" == *"ASD-STE100"* && "$ctx" == *"DO-178C-Lite"* && "$ctx" == *"Search Hygiene:"* ]]; then
+  ok "prompt hook injects Doctrine, Mental Model, STE-Lite, DO-178C-Lite & Search Hygiene outside TokenOps"
+else bad "guidance nudge missing parts" "$ctx"; fi
+
+# Hybrid memory: SUMMARY.md injected once on turn 1 when memory-summary is on, skipped on turn 2+
+mkdir -p "$N/logs/acf"
+printf '# Project Memory Summary: plain\n- [11-25 14:00] `agy/others` `agy:abc123` — Fix login bug (3u/5t)\n' > "$N/logs/acf/SUMMARY.md"
+rules mode summary on >/dev/null
+out=$(hook claude prompt "{\"session_id\":\"mem1\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+ctx=$(j '["hookSpecificOutput"]["additionalContext"]' "$out")
+out2=$(hook claude prompt "{\"session_id\":\"mem1\",\"cwd\":\"$N\",\"prompt\":\"next\"}")
+ctx2=$(j '["hookSpecificOutput"]["additionalContext"]' "$out2")
+[[ "$ctx" == *"[ACF memory]"* && "$ctx" == *"agy:abc123"* && "$ctx2" != *"[ACF memory]"* ]] \
+  && ok "memory-summary injects SUMMARY.md once on turn 1 across providers and skips turn 2+" || bad "memory-summary turn-1/2" "$ctx || $ctx2"
+rules mode summary off >/dev/null
+rules mode hygiene off >/dev/null
+
+# SITREP footer: dynamically includes active Doctrine (D), Mental Model (M), and doctrine phases in red/green diff fence
+rules mode sitrep on >/dev/null
+out=$(hook claude prompt "{\"session_id\":\"sit1\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+ctx=$(j '["hookSpecificOutput"]["additionalContext"]' "$out")
+[[ "$ctx" == *"SITREP Footer:"* && "$ctx" == *"\`\`\`diff"* && "$ctx" != *"┌───"* && "$ctx" == *"- You:"* && "$ctx" == *"+ SITREP · D:MDMP · M:RCA · <phase>"* && "$ctx" == *"P5 ASSESS"* ]] \
+  && ok "sitrep mode injects red/green diff You:/SITREP footer with blank line naming active D & M and MDMP phases" || bad "sitrep mdmp+rca" "$ctx"
+
+rules mode --cwd "$N" --project doctrine f3ead >/dev/null
+out=$(hook claude prompt "{\"session_id\":\"sit2\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+ctx=$(j '["hookSpecificOutput"]["additionalContext"]' "$out")
+[[ "$ctx" == *"+ SITREP · D:F3EAD · M:RCA · <phase>"* && "$ctx" == *"EXPLOIT"* ]] \
+  && ok "sitrep mode switches phases dynamically when project Doctrine changes to F3EAD" || bad "sitrep f3ead" "$ctx"
+
+rules mode --cwd "$N" --project off doctrine >/dev/null
+out=$(hook claude prompt "{\"session_id\":\"sit3\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+ctx=$(j '["hookSpecificOutput"]["additionalContext"]' "$out")
+[[ "$ctx" == *"+ SITREP · D:off · M:RCA · Done:"* && "$ctx" != *"<phase>"* ]] \
+  && ok "sitrep mode omits <phase> and shows D:off when Doctrine is off" || bad "sitrep d-off" "$ctx"
+rules mode --cwd "$N" --project delete doctrine >/dev/null
+rules mode sitrep off >/dev/null
+
+rules mode --cwd "$N" --project doctrine ooda >/dev/null
+out=$(hook claude prompt "{\"session_id\":\"m3\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+ctx=$(j '["hookSpecificOutput"]["additionalContext"]' "$out")
+[[ "$ctx" == *"Doctrine [OODA]"* && "$ctx" != *"Doctrine [MDMP]"* ]] \
+  && ok "project Doctrine overrides global Doctrine" || bad "project override" "$ctx"
+
+rules mode --cwd "$N" --project off doctrine >/dev/null
+out=$(hook claude prompt "{\"session_id\":\"m4\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+ctx=$(j '["hookSpecificOutput"]["additionalContext"]' "$out")
+[[ "$ctx" != *"Doctrine ["* && "$ctx" == *"Root Cause Analysis"* ]] \
+  && ok "afc-rules mode off doctrine switches off Doctrine in project while keeping Mental Model" || bad "off doctrine" "$ctx"
+
+rules mode --cwd "$N" --project delete doctrine >/dev/null
+out=$(hook claude prompt "{\"session_id\":\"m5\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+ctx=$(j '["hookSpecificOutput"]["additionalContext"]' "$out")
+[[ "$ctx" == *"Doctrine [MDMP]"* ]] \
+  && ok "afc-rules mode delete doctrine removes project override and falls back to global" || bad "delete doctrine" "$ctx"
+
+out=$(hook claude prompt "{\"session_id\":\"m6\",\"cwd\":\"$P\",\"prompt\":\"hi\"}")
+ctx=$(j '["hookSpecificOutput"]["additionalContext"]' "$out")
+[[ "$ctx" == *"[ACF rules]"* && "$ctx" == *"[ACF mode]"* ]] \
+  && ok "inside TokenOps project, [ACF rules] and [ACF mode] combine cleanly" || bad "combined nudge" "$ctx"
+
+setmode off
+rules mode --global doctrine mdmp >/dev/null
+out=$(hook claude prompt "{\"session_id\":\"m2\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+ctx=$(j '["hookSpecificOutput"]["additionalContext"]' "$out")
+[[ "$ctx" == *"Doctrine [MDMP]"* && "$ctx" != *"[ACF rules]"* ]] \
+  && ok "rules off still injects active Doctrine/Model/style modes without TokenOps rules" || bad "modes with rules off" "$ctx"
+setmode enforce
+
+rules mode --cwd "$N" off --all >/dev/null
+out=$(hook claude prompt "{\"session_id\":\"m7\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+[[ -z "$out" ]] && ok "afc-rules mode off --all silences all guidance modes cleanly" || bad "off --all left output" "$out"
+
+echo "Copilot, and afc-rules verify (is each pane's agent really sent the modes?)"
+rules mode --global doctrine mdmp >/dev/null; rules mode ste on >/dev/null
+rules mode --cwd "$N" --project delete doctrine >/dev/null   # "off --all" above left the project's own "off"
+out=$(hook copilot prompt "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"cp1\",\"cwd\":\"$N\",\"prompt\":\"hi\"}")
+ctx=$(j '["additionalContext"]' "$out")
+[[ "$ctx" == *"Doctrine [MDMP]"* && "$ctx" == *"ASD-STE100"* && "$out" != *hookSpecificOutput* ]] \
+  && ok "copilot prompt hook: a top-level additionalContext (the form Copilot reads; it ignores hookSpecificOutput)" || bad "copilot prompt" "$out"
+out=$(hook copilot stop "{\"session_id\":\"cp1\",\"cwd\":\"$P\"}")
+[[ -z "$out" ]] && ok "copilot stop: prints nothing (Copilot has no turn-end check)" || bad "copilot stop" "$out"
+mkdir -p "$HOME/.copilot"; rm -f "$HOME/.copilot/hooks/afc-rules.json"
+rules install >/dev/null 2>&1
+jq -e '.hooks.UserPromptSubmit[0].bash | test("afc-rules hook copilot prompt")' "$HOME/.copilot/hooks/afc-rules.json" >/dev/null \
+  && [[ "$(rules install 2>&1)" == *"Copilot: "*"already has the hook"* ]] \
+  && ok "install: Copilot gets ~/.copilot/hooks/afc-rules.json, once" || bad "copilot install" "$(cat "$HOME/.copilot/hooks/afc-rules.json" 2>&1)"
+rules install --remove >/dev/null 2>&1
+[[ ! -e "$HOME/.copilot/hooks/afc-rules.json" ]] && ok "install --remove: Copilot's hook file goes" || bad "copilot remove"
+rules install >/dev/null 2>&1; rm -f "$HOME/.copilot/hooks/afc-rules.json"   # Claude hooked, Copilot not
+
+if ! command -v tmux >/dev/null; then echo "  skip  verify: no tmux on the PATH"; else
+  mkdir -p "$T/bin"
+  for a in copilot claude; do printf '#!/bin/sh\nsleep 120\n' > "$T/bin/$a"; chmod +x "$T/bin/$a"; done
+  tm() { tmux -L "$AGENTS_SOCK" -f /dev/null "$@"; }
+  tm new-session -d -s v -n fleet -c "$N" "$T/bin/copilot"
+  tm split-window -t v -c "$N" "$T/bin/claude"
+  cp_pane=$(tm list-panes -t v -F '#{pane_id}' | head -1); sock=$(tm display -p '#{socket_path}')
+  tm set -p -t "$cp_pane" @doctrine ooda
+  out=$(rules verify 2>&1); rc=$?
+  [[ $rc == 1 && "$out" == *"$cp_pane"*": copilot"*"should get: doctrine=ooda STE"*"✗ gets nothing: copilot has no afc-rules prompt hook"* \
+     && "$out" == *": claude"*"should get: doctrine=mdmp STE"$'\n'*"? no prompt seen"* ]] \
+    && ok "verify: finds each pane's agent, its own modes (pane doctrine wins), ✗ for an agent without the hook" || bad "verify before" "$out"
+  rules install >/dev/null 2>&1
+  printf '{"session_id":"cp2","cwd":"%s","prompt":"hi"}' "$N" | TMUX="$sock,1,0" TMUX_PANE="$cp_pane" python3 -I "$RULES" hook copilot prompt >/dev/null
+  out=$(rules verify 2>&1); rc=$?
+  [[ $rc == 0 && "$out" == *": copilot"*"✓ last prompt ("*") got: doctrine=ooda STE"* ]] \
+    && ok "verify: ✓ once a prompt in that pane really carried those modes (the hook marks the pane)" || bad "verify after" "$out"
+  rules mode ste off >/dev/null
+  out=$(rules verify 2>&1)
+  [[ "$out" == *": copilot"*"should get: doctrine=ooda"$'\n'*"△ last prompt ("*") got: doctrine=ooda STE;"* ]] \
+    && ok "verify: △ when the settings changed after the last prompt" || bad "verify changed" "$out"
+  tm kill-server 2>/dev/null
+fi
+
+echo "Core CLS & SAS Stop-hook enforcement (plain repo, no TokenOps)"
+rm -f "$AGENTS_SETTINGS"    # empty settings -> core defaults: rules=enforce, style-ste=on, code-do178c=on
+G="$T/plain-git"; mkdir -p "$G"
+git -C "$G" init -q
+git -C "$G" config user.email test@example.com
+git -C "$G" config user.name test
+printf 'def ok():\n    return 1\n' > "$G/app.py"
+git -C "$G" add app.py && git -C "$G" commit -q -m init
+
+mk_chat() {
+  python3 - "$1" "$G" "$2" "$3" "$4" <<'PY'
+import json, sys
+path, cwd, reply, edit_file, verify_cmd = sys.argv[1:]
+lines = [
+    {"type": "user", "cwd": cwd, "timestamp": "2026-11-25T12:00:00.000Z", "message": {"role": "user", "content": "implement change"}},
+]
+if edit_file:
+    lines.append({"type": "assistant", "timestamp": "2026-11-25T12:00:01.000Z", "message": {"role": "assistant", "model": "m", "content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": edit_file, "old_string": "a", "new_string": "b"}}]}})
+if verify_cmd:
+    lines.append({"type": "assistant", "timestamp": "2026-11-25T12:00:02.000Z", "message": {"role": "assistant", "model": "m", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": verify_cmd}}]}})
+if reply:
+    lines.append({"type": "assistant", "timestamp": "2026-11-25T12:00:03.000Z", "message": {"role": "assistant", "model": "m", "content": [{"type": "text", "text": reply}]}})
+with open(path, "w") as f:
+    for rec in lines:
+        f.write(json.dumps(rec) + "\n")
+PY
+}
+
+# 1. CLS filler preamble -> blocked
+C_FILL="$T/cls-filler.jsonl"
+mk_chat "$C_FILL" "Certainly! Here is what you asked for." "" ""
+out=$(hook claude stop "{\"session_id\":\"cls1\",\"transcript_path\":\"$C_FILL\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+[[ "$(j '["decision"]' "$out")" == block && "$out" == *"CLS response opens with conversational filler"* ]] \
+  && ok "CLS hard gate: filler preamble is sent back on plain repo" || bad "cls-filler" "$out"
+
+# 2. CLS wide ASCII diagram (>70 chars) -> blocked once, let through on stop_hook_active=true
+C_WIDE="$T/cls-wide.jsonl"
+WIDE_DIAG=$(printf '```\n+--------------------------------------------------------------------------+\n| too wide                                                                 |\n+--------------------------------------------------------------------------+\n```\nDone.')
+mk_chat "$C_WIDE" "$WIDE_DIAG" "" ""
+out=$(hook claude stop "{\"session_id\":\"cls2\",\"transcript_path\":\"$C_WIDE\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+[[ "$(j '["decision"]' "$out")" == block && "$out" == *"limit <=70"* ]] \
+  && ok "CLS hard gate: ASCII diagram >70 chars is sent back" || bad "cls-diagram-width" "$out"
+out2=$(hook claude stop "{\"session_id\":\"cls2\",\"transcript_path\":\"$C_WIDE\",\"cwd\":\"$G\",\"stop_hook_active\":true}")
+nodec "$out2" && [[ "$out2" == *"still open"* ]] \
+  && ok "CLS hard gate: second stop (stop_hook_active) is let through once per turn" || bad "cls2 retry" "$out2"
+
+# 3. CLS clean diagram (<=70 chars) + direct short sentences -> allowed with checkmark
+C_OK="$T/cls-ok.jsonl"
+OK_DIAG=$(printf '```\nClient --> Hook --> Check\n```\nHook validates edits. Check runs on stop.')
+mk_chat "$C_OK" "$OK_DIAG" "" ""
+out=$(hook claude stop "{\"session_id\":\"cls3\",\"transcript_path\":\"$C_OK\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+nodec "$out" && [[ "$out" == *"ACF rules ✓"* ]] \
+  && ok "CLS clean reply with <=70-char diagram passes with ✓" || bad "cls-ok" "$out"
+
+# 3b. CLS no false positives: ```python code block with box chars >70 cols & "Absolutely not" opening
+C_NOFP="$T/cls-nofp.jsonl"
+NOFP_TXT=$(printf 'Absolutely not — code blocks are not diagrams.\n```python\nDIAGRAM_RE = re.compile(r"[┌┐└┘├┤┬┴┼│─▼▲►◄═║╔╗╚╝]|├──|└──|some_very_long_identifier_past_seventy_cols")\n```')
+mk_chat "$C_NOFP" "$NOFP_TXT" "" ""
+out=$(hook claude stop "{\"session_id\":\"cls3b\",\"transcript_path\":\"$C_NOFP\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+nodec "$out" && [[ "$out" == *"ACF rules ✓"* ]] \
+  && ok "CLS avoids false positives on \`\`\`python blocks >70 cols and 'Absolutely not'" || bad "cls-nofp" "$out"
+
+# 3c. CLS ignores You:/SITREP footer lines (plain and fenced ```diff) when measuring prose sentence length
+C_SIT="$T/cls-sitrep.jsonl"
+SIT_TXT=$(printf 'Done here. All checks passed. Zero errors found. Ready now.\n\n```diff\n- You: verify that a very long user prompt echo and sitrep footer do not trigger the CLS sentence length warning\n+ SITREP · D:MDMP · M:OODA · P5 ASSESS · Done: sandbox main = 29be943 deployed nothing unpushed and every single test case passed cleanly · Open: reorder/live need cart+catalog migration · Next: your call\n```')
+mk_chat "$C_SIT" "$SIT_TXT" "" ""
+out=$(hook claude stop "{\"session_id\":\"cls3c\",\"transcript_path\":\"$C_SIT\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+nodec "$out" && [[ "$out" == *"ACF rules ✓"* ]] \
+  && ok "CLS ignores You:/SITREP diff footer during prose sentence-length & diagram checks" || bad "cls-sitrep" "$out"
+
+# 4. CLS soft note: long prose sentences -> allowed with △ note
+C_LONG="$T/cls-long.jsonl"
+LONG_PROSE="This particular sentence deliberately contains far more than twenty four separate words in order to verify that the soft sentence length detector notices overly verbose technical prose cleanly. Another very long sentence also stretches well beyond twenty four words to ensure that the ratio crosses thirty five percent across the whole sample reply cleanly. Here is a third overly long sentence with plenty of extra words added so that more than half of the sentences in this paragraph exceed the threshold. Short end here."
+mk_chat "$C_LONG" "$LONG_PROSE" "" ""
+out=$(hook claude stop "{\"session_id\":\"cls4\",\"transcript_path\":\"$C_LONG\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+nodec "$out" && [[ "$out" == *"ACF rules △"* && "$out" == *"CLS sentence length"* ]] \
+  && ok "CLS soft gate: verbose prose emits △ note without blocking" || bad "cls-sentence-len" "$out"
+
+# 5. SAS hard gate: edited app.py without running any verification command -> blocked
+C_UNVER="$T/sas-unverified.jsonl"
+mk_chat "$C_UNVER" "Updated app.py." "$G/app.py" ""
+out=$(hook claude stop "{\"session_id\":\"sas1\",\"transcript_path\":\"$C_UNVER\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+[[ "$(j '["decision"]' "$out")" == block && "$out" == *"SAS unverified code edit"* ]] \
+  && ok "SAS hard gate: code edit without post-edit test/syntax check is sent back" || bad "sas-verify" "$out"
+
+# 6. SAS hard gate: added bare except: and subprocess.run without timeout= -> blocked even with test cmd
+cat > "$G/app.py" <<'EOF'
+import subprocess
+def ok():
+    try:
+        subprocess.run(["echo", "hi"])
+    except:
+        pass
+    return 1
+EOF
+C_BADDIFF="$T/sas-baddiff.jsonl"
+mk_chat "$C_BADDIFF" "Updated and tested app.py." "$G/app.py" "python3 -m py_compile app.py"
+out=$(hook claude stop "{\"session_id\":\"sas2\",\"transcript_path\":\"$C_BADDIFF\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+[[ "$(j '["decision"]' "$out")" == block && "$out" == *"SAS silent error handling"* && "$out" == *"missing timeout="* ]] \
+  && ok "SAS hard gate: diff catches bare except: and subprocess.run missing timeout=" || bad "sas-diff" "$out"
+
+# 7. SAS clean diff + explicit verification command -> passes with ✓ and verified
+cat > "$G/app.py" <<'EOF'
+import subprocess
+def ok():
+    try:
+        subprocess.run(["echo", "hi"], timeout=5, check=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(str(e))
+    return 1
+EOF
+C_GOODSAS="$T/sas-good.jsonl"
+mk_chat "$C_GOODSAS" "Updated app.py with timeout and explicit error handling." "$G/app.py" "python3 -m py_compile app.py"
+out=$(hook claude stop "{\"session_id\":\"sas3\",\"transcript_path\":\"$C_GOODSAS\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+nodec "$out" && [[ "$out" == *"ACF rules ✓"* && "$out" == *"verified"* ]] \
+  && ok "SAS clean diff + py_compile verification passes with ✓" || bad "sas-good" "$out"
+
+# 7b. Multi-line subprocess.run where only line 1 changes and timeout=5 is on an unchanged next line -> no false positive
+cat > "$G/multi.py" <<'EOF'
+import subprocess
+def run():
+    return subprocess.run(["echo", "a"],
+                          capture_output=True, timeout=5)
+EOF
+git -C "$G" add multi.py && git -C "$G" commit -q -m multi
+sed -i 's/"a"/"b"/' "$G/multi.py"
+C_MULTI="$T/sas-multi.jsonl"
+mk_chat "$C_MULTI" "Updated multi.py arg." "$G/multi.py" "python3 -m py_compile multi.py"
+out=$(hook claude stop "{\"session_id\":\"sas3b\",\"transcript_path\":\"$C_MULTI\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+nodec "$out" && [[ "$out" == *"ACF rules ✓"* ]] \
+  && ok "SAS multi-line diff reads unchanged continuation lines for timeout= (no false positive)" || bad "sas-multi" "$out"
+
+# 8. Cross-provider (Gemini) deny on plain repo + offline afc-rules check
+GM_PLAIN="$T/gem-plain.json"
+python3 - "$GM_PLAIN" "$G/app.py" <<'PY'
+import json, sys
+out_path, target = sys.argv[1:]
+doc = {"sessionId": "gp1", "startTime": "2026-11-25T12:00:00Z", "messages": [
+    {"id": "1", "type": "user", "timestamp": "2026-11-25T12:01:00Z", "content": [{"text": "edit app"}]},
+    {"id": "2", "type": "gemini", "timestamp": "2026-11-25T12:01:05Z", "content": [{"text": "Certainly! Done."}],
+     "toolCalls": [{"name": "replace", "args": {"file_path": target, "old_string": "1", "new_string": "2"}}]},
+]}
+open(out_path, "w").write(json.dumps(doc))
+PY
+out=$(hook gemini stop "{\"session_id\":\"gp1\",\"transcript_path\":\"$GM_PLAIN\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+[[ "$(j '["decision"]' "$out")" == deny && "$out" == *"SAS unverified code edit"* && "$out" == *"CLS response opens with conversational filler"* ]] \
+  && ok "Gemini Stop hook enforces both CLS and SAS with decision=deny on plain repo" || bad "gemini-plain" "$out"
+
+chk_out=$(rules check claude "$C_UNVER" --cwd "$G" 2>&1)
+[[ "$chk_out" == *"1 would be sent back"* && "$chk_out" == *"sas-verify"* ]] \
+  && ok "afc-rules check audits CLS/SAS on plain non-TokenOps repos too" || bad "check-plain" "$chk_out"
+
+# 9. Decoupled from TokenOps `rules off`: active CLS/SAS still enforce when `rules off`, non-blocking under `rules report`
+printf 'rules off\nstyle-ste on\ncode-do178c on\n' > "$AGENTS_SETTINGS"
+out=$(hook claude stop "{\"session_id\":\"dec1\",\"transcript_path\":\"$C_UNVER\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+[[ "$(j '["decision"]' "$out")" == block && "$out" == *"SAS unverified code edit"* ]] \
+  && ok "rules off (TokenOps off) still enforces active CLS/SAS on Stop" || bad "decoupled rules off" "$out"
+printf 'rules report\nstyle-ste on\ncode-do178c on\n' > "$AGENTS_SETTINGS"
+out=$(hook claude stop "{\"session_id\":\"dec2\",\"transcript_path\":\"$C_UNVER\",\"cwd\":\"$G\",\"stop_hook_active\":false}")
+nodec "$out" && [[ "$out" == *"still open"* ]] \
+  && ok "rules report makes CLS/SAS non-blocking (report-only)" || bad "decoupled rules report" "$out"
 
 echo
 echo "$pass passed, $fail failed"
